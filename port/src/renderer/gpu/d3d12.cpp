@@ -1241,6 +1241,11 @@ private:
     // async shaders: a pipeline that needs a compiler is built on the build threads, its draws skipped until it is back
     bool async_ = false;
     bool skipped_frame_ = false;
+    // xboxrecomp: this frame's vertices drawn and left out for pipelines being built, and whether a quad was among them:
+    // mid-play a frame is only held when what was left out matters (the present's hold)
+    uint64_t frame_verts_ = 0, frame_skip_verts_ = 0;
+    bool frame_skip_quad_ = false;
+    bool pending_last_ = false;  // the last EnsurePipeline returned null because the pipeline is being built
     bool shown_ = false;
     std::chrono::steady_clock::time_point shown_t_;
     std::unordered_set<uint64_t> building_;
@@ -2633,13 +2638,21 @@ void D3D12Backend::TakeBuilt() {
 }
 
 ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, bool wait) {
+    pending_last_ = false;
     if (built_ready_.load(std::memory_order_acquire)) TakeBuilt();
     uint64_t h = Hash(&k, sizeof(k));
     auto it = psos_.find(h);
     if (it != psos_.end()) return it->second.Get();
+    // xboxrecomp: a draw that waits (a quad: left out, what lies under it would show) only waits when its frame could
+    // not be held. A skipped draw holds the frame (the last whole frame stays up, up to kHoldMax), so the quad left out
+    // never shows; waiting there froze the game while its shaders compiled (2026-11-02, a GTX 1060 on the new per
+    // pixel shaders: a 170 ms Draw, the title 337 ms on the render thread at a level start). The first frames, and
+    // a capture, still wait
+    if (wait && shown_ && std::chrono::steady_clock::now() - shown_t_ < kHoldMax) wait = false;
     bool async = async_ && !cap_ && !wait;
     if (async && building_.count(h)) {
         skipped_frame_ = true;
+        pending_last_ = true;
         return nullptr;
     }
     bool pending = false;
@@ -2653,6 +2666,7 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, bool wait) {
     if (pending) {
         building_.insert(h);
         skipped_frame_ = true;
+        pending_last_ = true;
         cache::Post([this, k, h, gh] {
             bool unused = false;
             ID3DBlob* vs = EnsureShaderCode(k.vs, true, unused);
@@ -4434,7 +4448,7 @@ namespace {
 enum DropReason { kDropAssemble, kDropTargets, kDropHdr, kDropTextures, kDropPipeline, kDropReasons };
 uint64_t g_drops[kDropReasons], g_draws;
 // xboxrecomp: [LEVELSTART] per frame for 3 s after a loading pause: draws asked, dropped, the last colour clear
-uint32_t g_ls_draws, g_ls_drops, g_ls_clears, g_ls_clear_color, g_ls_clear_rt;
+uint32_t g_ls_draws, g_ls_drops, g_ls_clears, g_ls_clear_color, g_ls_clear_rt, g_ls_ppl_fallbacks;
 
 void CountDrop(int why) {
     static auto t0 = std::chrono::steady_clock::now();
@@ -4497,8 +4511,38 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     BuildPipelineKey(s, a, sh.vh, sh.ph, k);
     if (FaceTwoSided(s, a)) k.cull = false;
     // a quad is a picture or a pass over the screen: left out it shows what lies under it, so it waits for its pipeline
+    const bool skipped_before = skipped_frame_;
+    frame_verts_ += count;
     ID3D12PipelineState* pso = EnsurePipeline(k, count <= kQuadVertices);
-    if (!pso) return CountDrop(kDropPipeline);
+    if (!pso && sh.ppl) {
+        // xboxrecomp: the per pixel variant is still being built: draw with the per vertex one meanwhile (the
+        // console's own lighting, in the shipped base cache) instead of leaving the draw out and holding the frame.
+        // The per pixel build goes on in the background and takes over when it is ready (2026-11-02: per pixel
+        // shaders new to a player's cache held frames for up to 340 ms at level starts)
+        DrawShaders fb = sh;
+        fb.ppl = false;
+        fb.vkey = VertexKey(s, a, fb);
+        fb.vh = EnsureVertexShader(s, a, fb);
+        fb.pkey = Hash(&pk, sizeof(pk));
+        fb.ph = EnsurePixelShader(pk, fb.pkey, nullptr);
+        PsoKey fk;
+        BuildPipelineKey(s, a, fb.vh, fb.ph, fk);
+        if (FaceTwoSided(s, a)) fk.cull = false;
+        if (ID3D12PipelineState* f = EnsurePipeline(fk, false)) {
+            pso = f;
+            sh = fb;
+            k = fk;
+            skipped_frame_ = skipped_before;  // drawn after all: no reason to hold the frame for it
+            g_ls_ppl_fallbacks++;
+        }
+    }
+    if (!pso) {
+        if (pending_last_) {  // left out while it builds (not a pipeline the driver refused)
+            frame_skip_verts_ += count;
+            if (count <= kQuadVertices) frame_skip_quad_ = true;
+        }
+        return CountDrop(kDropPipeline);
+    }
     CountDrop(-1);
     cl_->SetPipelineState(pso);
 
@@ -5251,7 +5295,22 @@ void D3D12Backend::Present(const Surface& front, bool pillarbox) {
     xbox_FramebufferWindowOverlayRead(
         [](const XboxPresentInfo* pi, void* on) { *static_cast<bool*>(on) = pi->ov_on != 0; }, &movie);
     bool empty_frame = g_ls_draws == 0 && !movie && now_t < ls_until;
-    bool hold = (skipped_frame_ || empty_frame) && shown_ && now_t - shown_t_ < kHoldMax;
+    // xboxrecomp: mid-play (past the level-start window) a frame is held only when what it left out matters: a quad (a
+    // picture or a pass over the screen) or a twentieth of its vertices. A few objects whose shaders are still being
+    // built (none of their variants cached) appear a moment later instead of the whole picture stopping: a GTX 1060
+    // held 11 frames (200 ms) mid-play for 4 small draws (2026-11-02). Level starts hold as before
+    const bool level_start = now_t < ls_until;
+    const bool skip_matters =
+        skipped_frame_ && (level_start || frame_skip_quad_ || frame_skip_verts_ * 20 > frame_verts_);
+    if (skipped_frame_ && !skip_matters) {
+        static uint32_t told;
+        if (told++ < 50)
+            LOGI("d3d12: frame shown with %llu of %llu vertices left out while their shaders build (not held)",
+                 (unsigned long long)frame_skip_verts_, (unsigned long long)frame_verts_);
+    }
+    frame_verts_ = frame_skip_verts_ = 0;
+    frame_skip_quad_ = false;
+    bool hold = (skip_matters || empty_frame) && shown_ && now_t - shown_t_ < kHoldMax;
     {   // xboxrecomp: [LEVELSTART] what each frame held in the level-start window: a frame showing only the clear
         // colour has few draws, one with draws skipped for pipelines says so
         static uint32_t last_draws = 0xFFFFFFFFu;
@@ -5259,11 +5318,12 @@ void D3D12Backend::Present(const Surface& front, bool pillarbox) {
         bool changed = last_draws == 0xFFFFFFFFu || g_ls_draws * 10 > last_draws * 11 || g_ls_draws * 11 < last_draws * 10;
         if (now_t < ls_until && ls_n++ < 2000 && (changed || skipped_frame_ || hold))
             LOGI("[LEVELSTART] frame %u: front %08X, draws %u (dropped %u), colour clears %u, last %08X on %08X, "
-                 "skipped for pipelines %s, %s", ls_n, front.data, g_ls_draws, g_ls_drops, g_ls_clears, g_ls_clear_color,
-                 g_ls_clear_rt, skipped_frame_ ? "yes" : empty_frame ? "no (empty frame)" : "no",
-                 hold ? "held (last whole frame shown)" : "shown");
+                 "skipped for pipelines %s, %s, %u drawn per vertex while their per pixel shaders build", ls_n, front.data,
+                 g_ls_draws, g_ls_drops, g_ls_clears, g_ls_clear_color, g_ls_clear_rt,
+                 skipped_frame_ ? "yes" : empty_frame ? "no (empty frame)" : "no",
+                 hold ? "held (last whole frame shown)" : "shown", g_ls_ppl_fallbacks);
         last_draws = g_ls_draws;
-        g_ls_draws = g_ls_drops = g_ls_clears = 0;
+        g_ls_draws = g_ls_drops = g_ls_clears = g_ls_ppl_fallbacks = 0;
         ls_last = now_t;
     }
     skipped_frame_ = false;

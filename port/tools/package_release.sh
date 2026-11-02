@@ -19,7 +19,7 @@ objdump=x86_64-w64-mingw32-objdump
 nm=x86_64-w64-mingw32-nm
 mkdir -p logs
 cmake -S . -B build-release "${cross[@]}" -DCMAKE_BUILD_TYPE=Release -DHPCOS_RELEASE=ON \
-      -DHPCOS_VERSION="${VERSION:-0.3.0}" > logs/build-release-config.log
+      -DHPCOS_VERSION="${VERSION:-0.3.1}" > logs/build-release-config.log
 nice -n 10 cmake --build build-release -j"$(nproc)" --target hpcos hpcos_launcher > logs/build-release.log 2>&1 ||
     { tail -30 logs/build-release.log; exit 1; }
 

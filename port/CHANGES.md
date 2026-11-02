@@ -1,5 +1,11 @@
 # Changes
 
+## v0.3.1 (2026-11-02), compared with v0.3.0
+
+### Smoother play
+- **No more freezes while new shaders are prepared.** Entering an area for the first time, the game could stop for up to a third of a second while the shaders for its per-pixel lighting were compiled. Surfaces are now drawn with the console's per-vertex lighting until their per-pixel shaders are ready, so the lighting may look like the console's for a moment and then turn smooth, without a pause.
+- **The picture no longer stops mid-play for a few objects whose shaders are still being prepared.** They appear a moment later instead; level starts still keep the loading picture up until the level is ready.
+
 ## v0.3.0 (2026-11-02), compared with v0.2.0
 
 ### Languages
