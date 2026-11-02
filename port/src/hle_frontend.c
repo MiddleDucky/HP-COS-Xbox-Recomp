@@ -30,6 +30,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define RECOMP_GENERATED_CODE
 #include "recomp/gen/recomp_types.h"
@@ -44,6 +45,7 @@ enum {
     kUp = 0x000001 | 0x100000, kDown = 0x000002 | 0x200000, kConfirm = 0x40400, kBtnA = 0x40000, kBtnB = 0x80800,
     kStart = 0x400,
     kText = 0x53E754, kTxtSure = 0xDDB,  /* "Are you sure?" */
+    kTxtYes = 0xE06, kTxtNo = 0xE07, kLanguage = 0x52FDA4,
     kPausePage = 0x52FF40, kPauseSub = 0x52FF44, kPauseRow = 0x52FF48, kPauseOpts = 0x527F26, kPauseFont = 0x540128,
     kPauseY = 0xD7, kPauseStep = 0x1E, kPauseTitleY = 0xC3, kBlink = 0x51D130,
 };
@@ -142,22 +144,33 @@ static uint32_t guest_text(const char *s, uint32_t *va)
     return *va;
 }
 
+/* a line of the game's text table (thiscall on 0x53E754) */
+static uint32_t game_text(uint32_t id);
+
+/* "Quit To Desktop" in the language chosen in Options: [0x52FDA4] indexes the title's language table (0x1F7A68,
+ * 0x14 a language: USA, UK, French, German, Spanish, Italian), read at each draw so a change of language follows.
+ * Worded as the game words "Quit To Dashboard" (text 0x1091); Latin-1, as the text tables hold their letters */
 static uint32_t quit_text(void)
 {
-    static uint32_t va;
-    return guest_text("Quit To Desktop", &va);
+    static const char *const k_quit[] = {
+        "Quit To Desktop", "Quit To Desktop", "Quitter vers le bureau", "Zur\374ck zum Desktop",
+        "Salir al escritorio", "Esci al desktop",
+    };
+    static uint32_t va[6];
+    uint32_t lang = MEM32(kLanguage);
+    if (lang >= 6) lang = 0;
+    return guest_text(k_quit[lang], &va[lang]);
 }
 
+/* the game's own Yes and No, in its language */
 static uint32_t yes_text(void)
 {
-    static uint32_t va;
-    return guest_text("Yes", &va);
+    return game_text(kTxtYes);
 }
 
 static uint32_t no_text(void)
 {
-    static uint32_t va;
-    return guest_text("No", &va);
+    return game_text(kTxtNo);
 }
 
 static uint32_t empty_text(void)
@@ -370,4 +383,92 @@ void sub_0004E9B0(void)
     g_pause_draw = enabled() && MEM32(kPausePage) == 0;
     sub_0004E9B0_gen();
     g_pause_draw = 0;
+}
+
+/* ── UK English ─────────────────────────────────────────────────────────────────────────────────────────────────
+ *
+ * sub_00011290 turns the console's language into the title's language mask [0x51E06C] (1 UK English, 2 USA English,
+ * 4 French, 8 German, 0x10 Spanish, 0x20 Italian; sub_0004A4B0 picks the language index from it): English is UK, made
+ * USA when the game's region is North America, as this disc's is. The launcher's "English (UK)" (RECOMP_LANGUAGE
+ * english_uk; the kernel answers English for it) keeps UK: the _UK folder's text and speech.
+ * Built with --exclude-manual like the rest of this file; gen's sub_00011290 renamed _gen by hand until then. */
+extern void sub_00011290_gen(void);
+void sub_00011290(void)
+{
+    sub_00011290_gen();
+    const char *e = getenv("RECOMP_LANGUAGE");
+    if (e && !strcmp(e, "english_uk") && MEM32(0x51E06C) == 2) {
+        MEM32(0x51E06C) = 1;
+        fprintf(stderr, "[PORT] language: UK English\n");
+    }
+}
+
+/* ── Key names in the game's prompts ────────────────────────────────────────────────────────────────────────────
+ *
+ * The text tables write a button as a character of its own, drawn from the font's picture of it (panel.geo's glyph
+ * table at 0x6CAC4): 0x1701 A, 0x1702 X, 0x1703 B, 0x1704 Y, 0x1705 the left trigger, 0x1706 the right trigger,
+ * 0x1707 BACK ("... by pressing BACK": the Remembrall); 0x1710 is a hand, not a button. With key prompts on
+ * (app_KeyboardPrompts: F10 Controls, Button prompts) the text lookup's string comes back with the bound key's name
+ * in their place - "PRESS Space TO CONTINUE", "equip to Mouse 5, E or Right Click". Each changed string is copied
+ * once per set of key names to the game's heap; the game's own tables are left as they are. */
+extern int app_KeyboardPrompts(void);
+extern const char *app_ButtonKeyLabel(int pad_input);
+
+static int prompt_button(uint16_t c)
+{
+    switch (c) {
+        case 0x1701: return 0;   /* A */
+        case 0x1702: return 2;   /* X */
+        case 0x1703: return 1;   /* B */
+        case 0x1704: return 3;   /* Y */
+        case 0x1705: return 6;   /* left trigger */
+        case 0x1706: return 7;   /* right trigger */
+        case 0x1707: return 13;  /* BACK */
+        default: return -1;
+    }
+}
+
+uint32_t hpcos_PromptText(uint32_t text)
+{
+    if (!text || !app_KeyboardPrompts()) return text;
+    uint32_t n = 0;
+    int any = 0;
+    for (; n < 4096 && MEM16(text + 2 * n); n++) any |= prompt_button(MEM16(text + 2 * n)) >= 0;
+    if (!any) return text;
+    /* the key names now, as one string: a rebinding makes new copies */
+    char sig[256];
+    int sl = 0;
+    static const int kButtons[] = {0, 1, 2, 3, 6, 7, 13};
+    for (unsigned b = 0; b < sizeof(kButtons) / sizeof(kButtons[0]); b++)
+        sl += snprintf(sig + sl, sizeof(sig) - (size_t)sl, "%s|", app_ButtonKeyLabel(kButtons[b]));
+    enum { kCache = 128 };
+    static struct { uint32_t src, copy; char sig[256]; } cache[kCache];
+    static int next;
+    for (int i = 0; i < kCache; i++)
+        if (cache[i].src == text && !strcmp(cache[i].sig, sig)) return cache[i].copy;
+    uint16_t out[4096 + 512];
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < n && m < sizeof(out) / 2 - 40; i++) {
+        uint16_t c = MEM16(text + 2 * i);
+        int b = prompt_button(c);
+        if (b < 0) {
+            out[m++] = c;
+            continue;
+        }
+        const char *name = app_ButtonKeyLabel(b);
+        if (!*name) {
+            out[m++] = c;  /* unbound: the button's picture */
+            continue;
+        }
+        for (const char *p = name; *p && m < sizeof(out) / 2 - 2; p++) out[m++] = (uint8_t)*p;
+    }
+    out[m++] = 0;
+    uint32_t copy = xbox_HeapAlloc(m * 2, 16);
+    if (!copy) return text;
+    for (uint32_t i = 0; i < m; i++) MEM16(copy + 2 * i) = out[i];
+    cache[next].src = text;
+    cache[next].copy = copy;
+    snprintf(cache[next].sig, sizeof(cache[next].sig), "%s", sig);
+    next = (next + 1) % kCache;
+    return copy;
 }

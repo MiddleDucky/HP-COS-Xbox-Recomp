@@ -40,6 +40,7 @@
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
+#include <xbox/host_unwind.h>
 #include "single_instance.h"
 
 /*
@@ -397,7 +398,7 @@ static DWORD WINAPI prof_thread(LPVOID arg)
         for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
             if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
             if (split && te.th32ThreadID != g_prof_game_tid && !prof_is_render(te.th32ThreadID)) continue;
-            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
             if (!t) continue;
             if (SuspendThread(t) != (DWORD)-1) {
                 CONTEXT c;
@@ -467,29 +468,21 @@ enum { kStallHost = 28, kStallGuest = 16, kStallFast = 50, kStallMax = 120, kSta
 
 /* the suspended thread's host frames: RIP, then each caller by its unwind data. Nothing here allocates or locks:
  * the thread being looked at may hold the heap lock */
+/* RIP, then each caller by its unwind data, inside the thread's stack [lo, hi) only: xbox/host_unwind.h (an unchecked
+ * walk read address 0 in Wine's ntdll and crashed the game from the sampler) */
+static int host_unwind(CONTEXT *c, DWORD64 lo, DWORD64 hi, DWORD64 *out, int max)
+{
+    return xbox_host_unwind(c, lo, hi, out, max);
+}
+
 static int stall_host_stack(HANDLE t, DWORD64 *out, int max)
 {
     CONTEXT c;
-    int n = 0;
     memset(&c, 0, sizeof c);
     c.ContextFlags = CONTEXT_FULL;
-    if (!GetThreadContext(t, &c)) return 0;
-    while (n < max && c.Rip) {
-        DWORD64 base = 0;
-        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &base, NULL);
-        out[n++] = c.Rip;
-        if (f) {
-            void *data;
-            DWORD64 frame;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &data, &frame, NULL);
-        } else if (n == 1 && c.Rsp) {  /* a leaf: its return address is on top of the stack */
-            c.Rip = *(const DWORD64 *)c.Rsp;
-            c.Rsp += 8;
-        } else {
-            break;
-        }
-    }
-    return n;
+    DWORD64 lo, hi;
+    if (!xbox_thread_stack_bounds(t, &lo, &hi) || !GetThreadContext(t, &c)) return 0;
+    return host_unwind(&c, lo, hi, out, max);
 }
 
 /* " module+offset" for each frame, appended to buf */
@@ -537,7 +530,7 @@ static void stall_threads(unsigned stall, const char *when)
     te.dwSize = sizeof te;
     for (BOOL ok = Thread32First(snap, &te); ok && count < 512; ok = Thread32Next(snap, &te)) {
         if (te.th32OwnerProcessID != pid || te.th32ThreadID == self || te.th32ThreadID == g_stall_tid) continue;
-        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
         if (!t) continue;
         stall_snap *sn = &g_stall_snaps[count];
         sn->tid = te.th32ThreadID, sn->n = 0;
@@ -609,7 +602,7 @@ static DWORD WINAPI stall_thread(LPVOID unused)
     (void)unused;
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
-    HANDLE game = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, g_stall_tid);
+    HANDLE game = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, g_stall_tid);
     if (!game) return 0;
     const DWORD64 exe = (DWORD64)(uintptr_t)GetModuleHandleA(NULL);
     unsigned stalls = 0, samples = 0;
@@ -900,15 +893,55 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
          *   fprintf(stderr, "  Game state: %u\n", state);
          */
 
-        /* Print native stack return addresses for debugging */
+        /* Host side: which thread, which module, the registers and the unwound stack. A fault in a Wine/Proton DLL
+         * on a thread of its own (guest regs all zero) is named only by these: Proton relocates its DLLs near
+         * 0x6FFFFFF00000, so a bare RIP can't be matched to a module afterwards. */
         {
-            uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
-            fprintf(stderr, "  Native stack (first 8 return addrs):\n");
-            for (int i = 0; i < 64 && sp[i]; i++) {
-                if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
-                    fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
-                }
+            const CONTEXT *r = ep->ContextRecord;
+            char line[1600], label[64] = "";
+            typedef HRESULT (WINAPI *get_desc_fn)(HANDLE, PWSTR *);
+            get_desc_fn get_desc =
+                (get_desc_fn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+            PWSTR desc = NULL;
+            if (get_desc && SUCCEEDED(get_desc(GetCurrentThread(), &desc)) && desc) {
+                if (*desc) snprintf(label, sizeof label, " \"%ls\"", desc);
+                LocalFree(desc);
             }
+            snprintf(line, sizeof line, "  Host thread %lu%s%s, at:", (unsigned long)GetCurrentThreadId(), label,
+                     GetCurrentThreadId() == g_stall_tid ? " (the game thread)" : "");
+            DWORD64 rip = r->Rip;
+            stall_fmt_host(line, sizeof line, &rip, 1);
+            fprintf(stderr, "%s\n", line);
+            fprintf(stderr, "  rax=%016llX rbx=%016llX rcx=%016llX rdx=%016llX\n", r->Rax, r->Rbx, r->Rcx, r->Rdx);
+            fprintf(stderr, "  rsi=%016llX rdi=%016llX rbp=%016llX rsp=%016llX\n", r->Rsi, r->Rdi, r->Rbp, r->Rsp);
+            fprintf(stderr, "  r8 =%016llX r9 =%016llX r10=%016llX r11=%016llX\n", r->R8, r->R9, r->R10, r->R11);
+            fprintf(stderr, "  r12=%016llX r13=%016llX r14=%016llX r15=%016llX\n", r->R12, r->R13, r->R14, r->R15);
+
+            CONTEXT c = *r;
+            DWORD64 pc[kStallHost];
+            DWORD64 lo, hi;
+    xbox_own_stack_bounds(&lo, &hi);
+    int n = host_unwind(&c, lo, hi, pc, kStallHost);
+            strcpy(line, "  Host stack:");
+            stall_fmt_host(line, sizeof line, pc, n);
+            fprintf(stderr, "%s\n", line);
+
+            /* where the unwind data runs out (code without it, or a broken frame): every value on the stack that
+             * lands in a module, zeros skipped */
+            const DWORD64 *sp = (const DWORD64 *)r->Rsp;
+            DWORD64 scan[24];
+            int m = 0;
+            const DWORD64 *top = (const DWORD64 *)((NT_TIB *)NtCurrentTeb())->StackBase;
+            for (int i = 0; i < 256 && m < 24 && sp + i < top; i++) {
+                HMODULE mod = NULL;
+                if (sp[i] && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                (LPCSTR)(uintptr_t)sp[i], &mod) && mod)
+                    scan[m++] = sp[i];
+            }
+            strcpy(line, "  Stack scan:");
+            stall_fmt_host(line, sizeof line, scan, m);
+            fprintf(stderr, "%s\n", line);
         }
         fflush(stderr);
     }

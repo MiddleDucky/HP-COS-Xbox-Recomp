@@ -51,10 +51,14 @@ struct Settings {
     uint32_t mouse_sens = 50;
     bool vibration = true, invert_x = false, invert_y = false;
     bool controller = true;  // the in-game F10 option of the same name
+    int language = 0;        // 'english' (US), 'english_uk', 'french', 'german', 'spanish', 'italian': the language the game starts in
 };
 
 const char* const kColorBlindKeys[] = {"off", "protanopia", "deuteranopia", "tritanopia"};
 const char* const kColorBlindNames[] = {"Off", "Protanopia (red-weak)", "Deuteranopia (green-weak)", "Tritanopia (blue-weak)"};
+
+const char* const kLanguageKeys[] = {"english", "english_uk", "french", "german", "spanish", "italian"};
+const char* const kLanguageNames[] = {"English (US)", "English (UK)", "Fran\xC3\xA7" "ais", "Deutsch", "Espa\xC3\xB1ol", "Italiano"};
 
 const char* const kDisplayKeys[] = {"windowed", "borderless", "fullscreen"};
 const char* const kDisplayNames[] = {"Windowed", "Borderless", "Fullscreen"};
@@ -146,6 +150,9 @@ Settings Load() {
     s.controller = Value("controller") != "false";
     s.invert_x = Value("invert_camera_x") == "true";
     s.invert_y = Value("invert_camera_y") == "true";
+    std::string lang = Value("language");
+    for (int i = 0; i < 6; i++)
+        if (lang == kLanguageKeys[i]) s.language = i;
     return s;
 }
 
@@ -171,6 +178,7 @@ void Save(const Settings& s) {
     SetValue("controller", s.controller ? "true" : "false");
     SetValue("invert_camera_x", s.invert_x ? "true" : "false");
     SetValue("invert_camera_y", s.invert_y ? "true" : "false");
+    SetValue("language", q(kLanguageKeys[s.language]));
     std::ofstream f(TomlPath(), std::ios::trunc);
     for (const auto& l : g_lines) f << l << "\n";
 }
@@ -706,6 +714,7 @@ bool DrawPage(Settings& s, std::string& error, FilesAction& files) {
     ImGui::Checkbox("SMAA", &s.smaa);
     ImGui::SameLine(0, 30 * sc);
     ImGui::Checkbox("Vsync", &s.vsync);
+    ImGui::Combo("Language", &s.language, kLanguageNames, 6);
     ImGui::Combo("Colour-blind filter", &s.colorblind, kColorBlindNames, 4);
     if (s.colorblind) {
         int st = int(s.cb_strength);

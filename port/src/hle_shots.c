@@ -152,9 +152,11 @@ static void geo_path_hook(const char *path)
     char line[512];
     int n = snprintf(line, sizeof line, "[GEO] open %s from", strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path);
     int k = 0;
-    for (uint32_t i = 0; i < 1024 && k < 16 && n < (int)sizeof line - 12; i++) {
+    /* the game's own code only (below the XDK's libraries from 0x10C000): the file system's own frames filled the
+     * list before the caller that asked (2026-11-01: which code loads a spell's harryXXX.geo) */
+    for (uint32_t i = 0; i < 4096 && k < 16 && n < (int)sizeof line - 12; i++) {
         uint32_t v = MEM32(g_esp + 4 * i);
-        if (v < 0x11005 || v >= 0x130620) continue;
+        if (v < 0x11005 || v >= 0x10C000) continue;
         if (MEM8(v - 5) == 0xE8 || MEM8(v - 2) == 0xFF || MEM8(v - 3) == 0xFF || MEM8(v - 6) == 0xFF)
             n += snprintf(line + n, sizeof line - n, " %08X", v), k++;
     }

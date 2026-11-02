@@ -2604,14 +2604,82 @@ static void bridge_KeInitializeTimerEx(void)
  */
 #define XBOX_MAX_TIMERS 32
 typedef struct {
-    uint32_t timer_va;      /* the guest KTIMER, 0 for a free slot */
-    uint32_t dpc_va;
+    uint32_t  timer_va;     /* the guest KTIMER, 0 for a slot never used */
+    uint32_t  dpc_va;
     long long due_ms;       /* host tick when it fires */
     long      period_ms;    /* 0 for one-shot */
+    int       armed;        /* in the table and due to fire */
+    /* [TIMER] log */
+    uint32_t  caller;       /* guest code that set it last */
+    uint32_t  sets, fires;  /* in the current 10 s window */
+    uint32_t  late_max_ms;  /* fired this long after its due time, at worst */
+    uint32_t  total_sets;
+    long long first_set_ms, last_set_ms, last_fire_ms;
+    int       stall_told;   /* the watchdog line was written for this lull */
 } XboxTimer;
 static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
+
+/* Firing and setting are ordered by g_timer_lock, signal included.
+ *
+ * A timer is signalled (SetEvent + SignalState) inside the lock at the moment
+ * it fires, and KeSetTimer resets it inside the same lock, so between the two
+ * there is no window left: a firing either happened before the set (and the
+ * set clears it, as the real KeSetTimer does) or after it (and stands).
+ *
+ * 2026-10-30: the reset used to come after the lock was let go. The XDK's
+ * timeSetEvent thread re-arms a one-shot timer with due 0 when its callback ran
+ * late; the timer thread fired it in that gap, the reset then wiped the signal
+ * of a timer already gone from the table, and the waiter slept for good. In
+ * CoS that stopped the title's 10 ms task clock now and then, and the level
+ * music with it. Signalling before the DPC runs is also the real kernel's
+ * order (a timer's waiters are satisfied at expiry, its DPC queued after).
+ *
+ * [TIMER] lines: each timer the first time it is set (who set it, due, period,
+ * DPC), every 10 s the timers that were set or fired (counts, worst lateness),
+ * and a watchdog: a timer that was being set again and again and has gone
+ * quiet for 2 s after firing - whoever waits on it may be stuck. */
+static void timer_log_window(long long now)
+{
+    static long long last;
+    int i, any = 0;
+
+    if (!last) last = now;
+    if (now - last < 10000)
+        return;
+    for (i = 0; i < XBOX_MAX_TIMERS; i++) {
+        XboxTimer *t = &g_timers[i];
+        if (!t->timer_va || (!t->sets && !t->fires))
+            continue;
+        if (!any++)
+            fprintf(stderr, "[TIMER] %lld ms last %llds:\n", now, (now - last) / 1000);
+        fprintf(stderr, "[TIMER]   %08X set by %08X: set %u, fired %u, latest %u ms late, period %ld ms, dpc %08X, %s\n",
+                t->timer_va, t->caller, t->sets, t->fires, t->late_max_ms, t->period_ms, t->dpc_va,
+                t->armed ? "armed" : "idle");
+        t->sets = t->fires = t->late_max_ms = 0;
+    }
+    last = now;
+}
+
+static void timer_watchdog(long long now)
+{
+    int i;
+
+    for (i = 0; i < XBOX_MAX_TIMERS; i++) {
+        XboxTimer *t = &g_timers[i];
+        long long gap;
+        if (!t->timer_va || t->armed || t->stall_told || t->total_sets < 20 || !t->last_fire_ms)
+            continue;
+        gap = (t->last_set_ms - t->first_set_ms) / (long long)(t->total_sets - 1);  /* its usual interval */
+        if (gap > 500 || now - t->last_fire_ms < 2000)
+            continue;
+        t->stall_told = 1;
+        fprintf(stderr, "[TIMER] %lld ms: timer %08X (set by %08X, every ~%lld ms, %u times) fired %lld ms ago and "
+                "has not been set again - a thread waiting on it may be stuck\n", now, t->timer_va, t->caller, gap,
+                t->total_sets, now - t->last_fire_ms);
+    }
+}
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
@@ -2657,35 +2725,50 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-            uint32_t dpc, fired_va;
+            XboxTimer *t = &g_timers[i];
+            uint32_t dpc, va;
+            HANDLE ev;
 
             EnterCriticalSection(&g_timer_lock);
-            if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
+            va = t->armed && now >= t->due_ms ? t->timer_va : 0;
+            LeaveCriticalSection(&g_timer_lock);
+            if (!va)
+                continue;
+            /* The event looked up afresh (outside the lock: the shadow table
+             * has its own), then the row checked again under the lock: it may
+             * have been set or cancelled meanwhile. */
+            ev = ke_shadow_lookup(va);
+            EnterCriticalSection(&g_timer_lock);
+            if (t->timer_va != va || !t->armed || now < t->due_ms) {
                 LeaveCriticalSection(&g_timer_lock);
                 continue;
             }
-            fired_va = g_timers[i].timer_va;
-            dpc = g_timers[i].dpc_va;
-            if (g_timers[i].period_ms > 0)
-                g_timers[i].due_ms = now + g_timers[i].period_ms;
+            dpc = t->dpc_va;
+            if ((uint32_t)(now - t->due_ms) > t->late_max_ms)
+                t->late_max_ms = (uint32_t)(now - t->due_ms);
+            if (t->period_ms > 0)
+                t->due_ms = now + t->period_ms;
             else
-                g_timers[i].timer_va = 0;      /* one-shot, done */
+                t->armed = 0;                  /* one-shot, done */
+            t->fires++;
+            t->last_fire_ms = now;
+            /* Signalled inside the lock: a KeSetTimer on another thread resets
+             * it either before this (and it stands) or after (as it should). */
+            if (ev) {
+                SetEvent(ev);
+                BRIDGE_MEM32(va + 4) = 1;   /* SignalState */
+            }
             LeaveCriticalSection(&g_timer_lock);
 
             /* Outside the lock: the routine can set or cancel timers. */
             if (dpc)
                 kernel_run_dpc(dpc, 0, 0);
-
-            /* Wake anyone parked on the timer's shadow event; a timer with no
-             * DPC is just a kernel sleep. */
-            {
-                HANDLE ev = ke_shadow_lookup(fired_va);
-                if (ev) {
-                    SetEvent(ev);
-                    BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
-                }
-            }
         }
+
+        EnterCriticalSection(&g_timer_lock);
+        timer_watchdog(now);
+        timer_log_window(now);
+        LeaveCriticalSection(&g_timer_lock);
     }
 }
 
@@ -2694,7 +2777,9 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
 {
     long long delay_ms = (due_100ns < 0) ? (-due_100ns) / 10000 : 0;
-    int i, free_slot = -1;
+    long long now;
+    HANDLE ev = ke_shadow_lookup(timer_va);   /* outside the timer lock: it takes its own */
+    int i, slot = -1, unused = -1, idle = -1;
     uint32_t was_set = 0;
 
     if (!g_timer_started) {
@@ -2704,24 +2789,47 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     }
 
     EnterCriticalSection(&g_timer_lock);
+    now = (long long)GetTickCount64();
     for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-        if (g_timers[i].timer_va == timer_va) { free_slot = i; was_set = 1; break; }
-        if (!g_timers[i].timer_va && free_slot < 0) free_slot = i;
+        if (g_timers[i].timer_va == timer_va) { slot = i; break; }
+        if (!g_timers[i].timer_va && unused < 0) unused = i;
+        if (g_timers[i].timer_va && !g_timers[i].armed && idle < 0) idle = i;
     }
-    if (free_slot >= 0) {
-        g_timers[free_slot].timer_va  = timer_va;
-        g_timers[free_slot].dpc_va    = dpc_va;
-        g_timers[free_slot].due_ms    = (long long)GetTickCount64() + delay_ms;
-        g_timers[free_slot].period_ms = period_ms;
+    if (slot < 0) {   /* a timer not seen before: a never-used slot, else an idle one */
+        slot = unused >= 0 ? unused : idle;
+        if (slot >= 0) {
+            memset(&g_timers[slot], 0, sizeof g_timers[slot]);
+            g_timers[slot].timer_va = timer_va;
+            g_timers[slot].first_set_ms = now;
+            fprintf(stderr, "[TIMER] %lld ms: new timer %08X set by %08X: due in %lld ms, period %ld ms, dpc %08X%s\n",
+                    now, timer_va, g_xbox_kernel_caller, delay_ms, period_ms, dpc_va,
+                    ev ? "" : " (no event: KeInitializeTimerEx not seen)");
+        } else {
+            static int told;
+            if (!told++)
+                fprintf(stderr, "[TIMER] %lld ms: the table is full (%d armed timers); timer %08X set by %08X "
+                        "will never fire\n", now, XBOX_MAX_TIMERS, timer_va, g_xbox_kernel_caller);
+        }
     }
-    LeaveCriticalSection(&g_timer_lock);
-
-    /* A freshly set timer starts unsignaled, like the real KeSetTimer. */
-    {
-        HANDLE ev = ke_shadow_lookup(timer_va);
+    if (slot >= 0) {
+        XboxTimer *t = &g_timers[slot];
+        was_set = (uint32_t)t->armed;
+        /* A set timer starts unsignaled, like the real KeSetTimer: inside the
+         * lock, so no firing can fall between this and the arming below. */
         if (ev)
             ResetEvent(ev);
+        BRIDGE_MEM32(timer_va + 4) = 0;   /* SignalState */
+        t->dpc_va    = dpc_va;
+        t->due_ms    = now + delay_ms;
+        t->period_ms = period_ms;
+        t->armed     = 1;
+        t->caller    = g_xbox_kernel_caller;
+        t->sets++;
+        t->total_sets++;
+        t->last_set_ms = now;
+        t->stall_told = 0;
     }
+    LeaveCriticalSection(&g_timer_lock);
     g_eax = was_set;
 }
 
@@ -2740,7 +2848,8 @@ static void bridge_KeSetTimerEx(void)
     kernel_set_timer(STACK_ARG(0), due, (long)STACK_ARG(3), STACK_ARG(4));
 }
 
-/* Drop a timer so it stops firing. Returns whether it was armed. */
+/* Drop a timer so it stops firing. Returns whether it was armed. The slot
+ * keeps the timer (and its [TIMER] counts) until another timer needs it. */
 int xbox_kernel_cancel_timer(uint32_t timer_va)
 {
     int i, was_set = 0;
@@ -2749,8 +2858,9 @@ int xbox_kernel_cancel_timer(uint32_t timer_va)
         return 0;
     EnterCriticalSection(&g_timer_lock);
     for (i = 0; i < XBOX_MAX_TIMERS; i++)
-        if (g_timers[i].timer_va == timer_va) {
-            g_timers[i].timer_va = 0;
+        if (g_timers[i].timer_va == timer_va && g_timers[i].armed) {
+            g_timers[i].armed = 0;
+            g_timers[i].stall_told = 1;   /* cancelled on purpose: not a stall */
             was_set = 1;
         }
     LeaveCriticalSection(&g_timer_lock);

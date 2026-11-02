@@ -55,8 +55,10 @@ Start the game with hpcos_launcher.exe. Opening hpcos.exe directly only offers
 to open the launcher. Only one copy of the game runs at a time: starting it
 again brings the running game to the front.
 
-The launcher sets the aspect ratio (4:3 or 16:9), display, graphics and
-controls, then starts the game with Play. If you turn its page off, the
+The launcher sets the aspect ratio (4:3 or 16:9), display, graphics,
+controls and the language, then starts the game with Play. Language: the
+game starts in English (US or UK), French, German, Spanish or Italian, the
+languages the disc carries. If you turn its page off, the
 launcher starts the game straight away; hold Shift while opening it to see
 the page again.
 
@@ -80,7 +82,11 @@ Keyboard and mouse (defaults; change them under F10 > Controls)
   Y                     right mouse button
   Black / White         R / Q
   Left / right trigger  Shift / Ctrl
-  D-pad                 1 2 3 4 (up, down, left, right)
+  D-pad                 no keys by default (bind them under F10 > Controls)
+  Spells                1 Flipendo, 2 Diffindo, 3 Lumos, 4 Incendio,
+                        5 Skurge, 6 Avifors, 7 Alohomora, 8 Expelliarmus:
+                        cast straight from the key without equipping it
+                        (only spells Harry has learnt)
   Start / Back          Escape / Tab
   Stick clicks          C (left), middle mouse button (right)
   Pace of the keys      mouse wheel: down Slow walk < Walk < Run up (Run is
@@ -149,8 +155,14 @@ Controls
     Mouse sensitivity, Invert mouse Y
     Movement keys        the pace W A S D move Harry at: Slow walk, Walk or
                          Run; the mouse wheel steps it in game
+    Button prompts       the game's on-screen hints name your keys:
+                         Follow the last input (keys after keyboard and
+                         mouse, buttons after the controller), Controller
+                         buttons or Keyboard keys. The button picture in the
+                         corner still shows the pad's buttons.
     Key bindings         click a binding, then press a key or mouse button
-                         (Escape clears it); "Default keys" restores them
+                         (Escape clears it); "Default keys" restores them;
+                         the spell keys are at the end of the list
   Controller
     Use controller       off: the game ignores the controller (and it does
                          not vibrate); keyboard and mouse still play
@@ -182,6 +194,10 @@ Enhancements
     Land the broom on any flat surface (experimental)
                          land over a flat roof or a wall's top as in a
                          landing zone (not on the lake)
+  Lighting
+    Per-pixel lighting   smooth light round Lumos and lamps instead of the
+                         console's per-vertex patches (on by default); off
+                         looks exactly as on the console
 
 Debug
   Logs                   "Open logs folder" shows logs\runs; "Mark this

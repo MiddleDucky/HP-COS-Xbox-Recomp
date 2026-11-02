@@ -126,6 +126,15 @@ void DrawControls(Settings& s) {
     }
     Row("Keyboard and mouse");
     if (ImGui::Checkbox("Keyboard and mouse play as controller 1", &s.kbm)) Changed();
+    {
+        // xboxrecomp: the game's button prompts as key names (hle_frontend.c, the HUD's button picture)
+        static const char* const kPrompts[] = {"Follow the last input", "Controller buttons", "Keyboard keys"};
+        int bp = int(std::min<uint32_t>(s.button_prompts, 2));
+        if (ImGui::Combo("Button prompts", &bp, kPrompts, 3)) {
+            s.button_prompts = uint32_t(bp);
+            Changed();
+        }
+    }
     int ms = int(s.mouse_sensitivity);
     if (ImGui::SliderInt("Mouse sensitivity", &ms, 1, 100)) s.mouse_sensitivity = uint32_t(ms);
     if (ImGui::IsItemDeactivatedAfterEdit()) Changed();
@@ -295,6 +304,7 @@ static void ResetPage(Settings& s, const char* page) {
         std::memcpy(&s.invert_x, &d.invert_x, sizeof(s.invert_x));
         std::memcpy(&s.invert_y, &d.invert_y, sizeof(s.invert_y));
         std::memcpy(&s.kbm, &d.kbm, sizeof(s.kbm));
+        std::memcpy(&s.button_prompts, &d.button_prompts, sizeof(s.button_prompts));
         std::memcpy(&s.keys, &d.keys, sizeof(s.keys));
         std::memcpy(&s.mouse_invert_y, &d.mouse_invert_y, sizeof(s.mouse_invert_y));
         std::memcpy(&s.mouse_sensitivity, &d.mouse_sensitivity, sizeof(s.mouse_sensitivity));
@@ -316,6 +326,7 @@ static void ResetPage(Settings& s, const char* page) {
     if (!std::strcmp(page, "Enhancements")) {
         std::memcpy(&s.grounds_warps, &d.grounds_warps, sizeof(s.grounds_warps));
         std::memcpy(&s.broom_land_flat, &d.broom_land_flat, sizeof(s.broom_land_flat));
+        std::memcpy(&s.per_pixel_lighting, &d.per_pixel_lighting, sizeof(s.per_pixel_lighting));
     }
 }
 
@@ -501,6 +512,10 @@ void DrawPanel(bool start) {
         Row("Broom");
         if (ImGui::Checkbox("Land the broom on any flat surface (experimental)", &s.broom_land_flat)) Changed();
         ImGui::TextDisabled("On: over a flat roof or a wall's top, land as in a landing zone. Off: only the game's landing zones.");
+        // xboxrecomp: per pixel lighting goes beyond the console's (moved from Graphics, 2026-11-02)
+        Row("Lighting");
+        if (ImGui::Checkbox("Per-pixel lighting", &s.per_pixel_lighting)) Changed();
+        ImGui::TextDisabled("On: smooth light round Lumos and lamps. Off: per vertex, as the console.");
         ImGui::EndTabItem();
     }
     if (tabs && !start && ImGui::BeginTabItem("Debug")) {

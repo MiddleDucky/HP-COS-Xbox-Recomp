@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace gpu {
@@ -21,6 +22,9 @@ std::string F(const char* fmt, ...) {
 }
 
 const char* kCommon = R"(
+#ifndef PPL_FIELDS
+#define PPL_FIELDS
+#endif
 struct VOut {
     float4 pos : SV_Position;
     float4 d0 : COLOR0;
@@ -33,6 +37,7 @@ struct VOut {
     float4 t3 : TEXCOORD3;
     float fog : TEXCOORD4;
     float wd : TEXCOORD6;  // clip w, for W-buffered draws
+    PPL_FIELDS  // xboxrecomp: per pixel lighting, the vertex program's inputs (PerPixelFields)
 };
 cbuffer VC : register(b0) { float4 c[192]; };
 cbuffer DC : register(b1) {
@@ -629,11 +634,9 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]) {
     return k;
 }
 
-std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs, uint64_t decode) {
-    std::string s = kCommon;
-    s += kVsHelpers;
-    s += VsInputs(regs, decode);
-    s += kVsPrologue;
+// the program's instructions as HLSL, between kVsPrologue and the epilogue
+std::string VsBody(const std::vector<uint32_t>& prog, uint16_t regs) {
+    std::string s;
     for (size_t n = 0; n + 4 <= prog.size(); n += 4) {
         Tok k{&prog[n]};
         uint32_t mac = k.f(1, 21, 4), ilu = k.f(1, 25, 3);
@@ -667,7 +670,80 @@ std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs, 
         }
         if (k.f(3, 0, 1)) break;
     }
-    s += kVsEpilogue;
+    return s;
+}
+
+// xboxrecomp: per pixel lighting. The title lights in its vertex programs and the console interpolates the colours
+// they write (oD0 oD1, back faces oB0 oB1) across each triangle, so a point light (Lumos) on a big floor triangle shows
+// as a patch shaped by its corners. A program is a function of its inputs and the constants: its inputs go to the
+// pixel shader interpolated, and the pixel shader runs the program again on them for those colours. Programs that
+// index constants by a0 (skinning: per vertex matrix indices, which do not interpolate) keep vertex lighting.
+std::string PerPixelFields(uint16_t regs) {
+    std::string f = "#define PPL_FIELDS";
+    int n = 0;
+    for (int r = 0; r < 16; r++)
+        if ((regs >> r) & 1) f += F(" float4 pv%d : TEXCOORD%d;", r, 8 + n++);
+    return f + "\n";
+}
+
+std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs, uint64_t decode, bool ppl) {
+    std::string s = ppl ? PerPixelFields(regs) : std::string();
+    s += kCommon;
+    s += kVsHelpers;
+    s += VsInputs(regs, decode);
+    s += kVsPrologue;
+    s += VsBody(prog, regs);
+    std::string epi = kVsEpilogue;
+    if (ppl) {
+        std::string pass;
+        for (int r = 0; r < 16; r++)
+            if ((regs >> r) & 1) pass += F("    o.pv%d = i.v%d;\n", r, r);
+        size_t at = epi.rfind("    return o;");
+        epi.insert(at, pass);
+    }
+    s += epi;
+    return s;
+}
+
+bool PerPixelLightable(const std::vector<uint32_t>& prog, uint16_t regs) {
+    if (!regs) return false;
+    std::string b = VsBody(prog, regs);
+    if (b.find("a0") != std::string::npos) return false;  // a0 written or read: matrix palettes
+    return b.find("oD0.") != std::string::npos || b.find("oD1.") != std::string::npos ||
+           b.find("oB0.") != std::string::npos || b.find("oB1.") != std::string::npos;
+}
+
+// xboxrecomp: point lights per pixel came out twice as bright and hard edged (Lumos: a flat green disc with a sharp
+// rim, issue #13, 2026-11-02). The title tunes them for its vertex lighting: Lumos's colour is 3x overbright with a
+// linear falloff to nothing at 3 units, and the room's triangles (2 to 6 units) average it into a dim, soft patch on
+// the console (draw 50 of a capture: peak 0.40 per vertex, 0.83 per pixel). So a point light is averaged per pixel
+// over a disc in the surface's plane, as the triangles would: the shape stays smooth (no corner patches), the peak
+// and the rim soften. RECOMP_PPL_SOFTEN: the disc's radius in the program's units (1.5 by default; 0 turns it off).
+// Modelled on that capture's room: radius 1.5 brings the peak to 0.59, 2.5 to 0.43 (the console's 0.40) but spreads
+// the pool wider (twice the console's average), so the default sits between; the setting picks by eye
+// A point light is a program taking its position input from a constant (c - v0, the light vector)
+static float PerPixelSoften() {
+    static float r = [] {
+        const char* e = std::getenv("RECOMP_PPL_SOFTEN");
+        return e && *e ? std::max(0.0f, float(std::atof(e))) : 1.5f;
+    }();
+    return r;
+}
+
+static bool PerPixelPointLight(const std::vector<uint32_t>& prog, uint16_t regs) {
+    return (regs & 1) && VsBody(prog, regs).find("(-(i.v0).xyz") != std::string::npos;
+}
+
+// the program again, in the pixel shader, for its colours only (the compiler drops the rest)
+std::string PerPixelFunction(const std::vector<uint32_t>& prog, uint16_t regs) {
+    std::string s = kVsHelpers;
+    s += "struct VIn {\n";
+    for (int r = 0; r < 16; r++)
+        if ((regs >> r) & 1) s += F("    float4 v%d;\n", r);
+    s += "};\nvoid pplight(VIn i, out float4 pd0, out float4 pd1, out float4 pb0, out float4 pb1) {\n";
+    s += kVsPrologue;
+    s += VsBody(prog, regs);
+    s += "    pd0 = saturate(oD0);\n    pd1 = saturate(oD1);\n    pb0 = saturate(oB0);\n    pb1 = saturate(oB1);\n}\n";
     return s;
 }
 
@@ -807,9 +883,11 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     return s;
 }
 
-std::string PixelHlsl(const PixelKey& k) {
-    std::string s = kCommon;
+std::string PixelHlsl(const PixelKey& k, const PerPixelSource* ppl) {
+    std::string s = ppl ? PerPixelFields(ppl->regs) : std::string();
+    s += kCommon;
     s += kPsHelpers;
+    if (ppl) s += PerPixelFunction(*ppl->prog, ppl->regs);
     for (int i = 0; i < 4; i++) {
         const TexInfo& t = k.tex[i];
         const char* type = t.shadow ? "Texture2D<float>" : t.kind == kTex3D ? "Texture3D" : t.kind == kTexCube ? "TextureCube" : "Texture2D";
@@ -818,6 +896,33 @@ std::string PixelHlsl(const PixelKey& k) {
     s += F("float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {\n");
     s += "    float4 pT0 = i.t0, pT1 = i.t1, pT2 = i.t2, pT3 = i.t3;\n";
     s += k.two_sided ? "    float4 v0 = front ? i.d0 : i.b0, v1 = front ? i.d1 : i.b1;\n" : "    float4 v0 = i.d0, v1 = i.d1;\n";
+    if (ppl) {
+        s += "    {\n        VIn vi;\n";
+        for (int r = 0; r < 16; r++)
+            if ((ppl->regs >> r) & 1) s += F("        vi.v%d = i.pv%d;\n", r, r);
+        s += "        float4 pd0, pd1, pb0, pb1;\n        pplight(vi, pd0, pd1, pb0, pb1);\n";
+        const float soft = PerPixelSoften();
+        if (soft > 0 && PerPixelPointLight(*ppl->prog, ppl->regs)) {
+            // the surface's plane from the position's screen derivatives; 12 points on a disc of radius soft
+            // (golden angle spiral), each lit and clamped as a vertex would be, averaged with the pixel's own
+            s += F("        float3 dpx = ddx(i.pv0.xyz), dpy = ddy(i.pv0.xyz), nrm = cross(dpx, dpy);\n"
+                   "        if (dot(dpx, dpx) > 1e-12 && dot(nrm, nrm) > 1e-24) {\n"
+                   "            float3 t1 = normalize(dpx), t2 = normalize(cross(nrm, t1));\n"
+                   "            float4 s0 = pd0, s1 = pd1, sb0 = pb0, sb1 = pb1;\n"
+                   "            [loop] for (int k = 0; k < 12; k++) {\n"
+                   "                float rr = %.6f * sqrt((k + 0.5) / 12.0), an = k * 2.3999632;\n"
+                   "                VIn vk = vi;\n"
+                   "                vk.v0.xyz = i.pv0.xyz + rr * (cos(an) * t1 + sin(an) * t2);\n"
+                   "                float4 q0, q1, qb0, qb1;\n"
+                   "                pplight(vk, q0, q1, qb0, qb1);\n"
+                   "                s0 += q0; s1 += q1; sb0 += qb0; sb1 += qb1;\n"
+                   "            }\n"
+                   "            pd0 = s0 / 13.0; pd1 = s1 / 13.0; pb0 = sb0 / 13.0; pb1 = sb1 / 13.0;\n"
+                   "        }\n", soft);
+        }
+        s += k.two_sided ? "        v0 = front ? pd0 : pb0;\n        v1 = front ? pd1 : pb1;\n" : "        v0 = pd0;\n        v1 = pd1;\n";
+        s += "    }\n";
+    }
     s += "    if (misc.w == 0) v1 = float4(0, 0, 0, 1);\n";
     s += "    float4 pFog = float4(fogcolor.rgb, saturate(i.fog));\n";
     std::string body;

@@ -58,6 +58,7 @@ bool g_raw = false;                        // raw mouse input registered
 bool g_clipped = false;
 
 bool Held(uint32_t vk) { return vk && vk < 256 && g_down[vk].load(std::memory_order_relaxed); }
+std::atomic<bool> g_last_kbm{true};  // xboxrecomp: keyboard and mouse used last (app_KeyboardPrompts), until a pad says otherwise
 
 // the mouse button a message names, as VK
 uint32_t MouseVk(unsigned msg, uintptr_t wp) {
@@ -270,6 +271,8 @@ void CancelKeyCapture() { g_capture = -1; }
 // hle_input.c: a pad read for the game, after the PC's controller filled it in. Returns which sticks keyboard and
 // mouse drove (1 the left, 2 the right): those skip hle_input.c's stick range compensation, as they skip the deadzones
 // and responses here, which are the controller's
+extern "C" volatile int app_spell_press = -1;  // xboxrecomp: a pad input a spell key holds (hle_trainer.c)
+
 extern "C" int app_InputPad(int port, XBOX_GAMEPAD* g) {
     int kbm_sticks = 0;
     const app::Settings& s = app::Get();
@@ -282,6 +285,8 @@ extern "C" int app_InputPad(int port, XBOX_GAMEPAD* g) {
     if (port == 0 && s.kbm && GetForegroundWindow() == static_cast<HWND>(app::Window()) && !app::MenuOpen()) {
         for (uint32_t i = 0; i < app::kPadInputs; i++)
             if (app::Held(s.keys[i])) out[i] = 255;
+        // xboxrecomp: a spell key's cast (hle_trainer.c spell_keys): the button it borrows held
+        if (app_spell_press >= 0 && app_spell_press < int(app::kPadInputs)) out[app_spell_press] = 255;
         float lx = float(app::Held(s.keys[19])) - float(app::Held(s.keys[18]));
         float ly = float(app::Held(s.keys[16])) - float(app::Held(s.keys[17]));
         if (lx || ly) {
@@ -319,10 +324,59 @@ extern "C" int app_InputPad(int port, XBOX_GAMEPAD* g) {
             kbm_sticks |= 2;
         }
     }
+    // xboxrecomp: which the player used last, for the button prompts (app_KeyboardPrompts): the controller's buttons,
+    // triggers past a light touch or sticks past their deadzone (already shaped) against bound keys or the mouse
+    if (port == 0) {
+        bool pad = false, keys = false;
+        for (uint32_t i = 0; i < app::kPadInputs; i++) pad |= in[i] > 40;
+        pad |= g->sThumbLX || g->sThumbLY || g->sThumbRX || g->sThumbRY;
+        if (s.kbm && GetForegroundWindow() == static_cast<HWND>(app::Window()) && !app::MenuOpen()) {
+            for (uint32_t i = 0; i < app::kKeyBinds; i++) keys |= app::Held(s.keys[i]);
+            keys |= (kbm_sticks & 2) != 0;
+        }
+        if (keys) app::g_last_kbm = true;
+        else if (pad) app::g_last_kbm = false;
+    }
     if (s.invert_x) g->sThumbRX = int16_t(std::max(-32767, -int(g->sThumbRX)));
     if (s.invert_y) g->sThumbRY = int16_t(std::max(-32767, -int(g->sThumbRY)));
     app::Write(*g, out);
     return kbm_sticks;
+}
+
+// xboxrecomp: the game's prompts show key names (hle_frontend.c's text, the HUD's button picture): button_prompts 2,
+// or 0 with keyboard and mouse used last (and keyboard and mouse on)
+extern "C" int app_KeyboardPrompts(void) {
+    const app::Settings& s = app::Get();
+    if (s.button_prompts == 2) return 1;
+    if (s.button_prompts == 1 || !s.kbm) return 0;
+    return app::g_last_kbm ? 1 : 0;
+}
+
+// xboxrecomp: the key bound to pad input i (A B X Y Black White LT RT Up Down Left Right Start Back LThumb RThumb),
+// named for a prompt: "Space", "E", "Right Click"; empty when unbound
+extern "C" const char* app_ButtonKeyLabel(int i) {
+    const app::Settings& s = app::Get();
+    if (i < 0 || uint32_t(i) >= app::kPadInputs) return "";
+    uint32_t vk = s.keys[i];
+    switch (vk) {
+        case 0: return "";
+        case 0x01: return "Left Click";
+        case 0x02: return "Right Click";
+        case 0x04: return "Middle Click";
+        case 0x05: return "Mouse 4";
+        case 0x06: return "Mouse 5";
+        default: return app::KeyName(vk);
+    }
+}
+
+// xboxrecomp: the spell keys (hle_trainer.c spell_keys, on the title's thread): the first spell key held, 1 to
+// kSpellKeys in kKeyBindNames' order, 0 none; keyboard and mouse on, the window in front, no menu
+extern "C" int app_SpellKey(void) {
+    const app::Settings& s = app::Get();
+    if (!s.kbm || GetForegroundWindow() != static_cast<HWND>(app::Window()) || app::MenuOpen()) return 0;
+    for (uint32_t i = 0; i < app::kSpellKeys; i++)
+        if (app::Held(s.keys[app::kPadInputs + 8 + i])) return int(i) + 1;
+    return 0;
 }
 
 // hle_input.c: the movement keys' pace (app::MoveMode)

@@ -526,6 +526,7 @@ void sub_00049440(void)
  * and what shows and clears its subtitle (2026-10-30). Built into the recompile with --exclude-manual: gen's body is
  * sub_0003BAC0_gen */
 extern void sub_0003BAC0_gen(void);
+extern uint32_t hpcos_PromptText(uint32_t text);
 void sub_0003BAC0(void)
 {
     static int on = -1;
@@ -538,6 +539,7 @@ void sub_0003BAC0(void)
         }
     }
     sub_0003BAC0_gen();
+    g_eax = hpcos_PromptText(g_eax);  /* hle_frontend.c: key names for the buttons with key prompts on */
     if (!on) return;
     enum { kSeen = 64 };
     static uint32_t seen_id[kSeen];
@@ -661,8 +663,10 @@ void sub_0001C9B0(void)
         len += snprintf(script + len, sizeof script - len, " %05X", v);
         n++;
     }
-    fprintf(stderr, "[MUSIC] %lu state %u arg %u from %08X%s level %u phase %u%s\n", (unsigned long)GetTickCount(), state,
-            arg, ret, script, level, phase, keep ? " (left out: the sword's theme plays on)"
+    fprintf(stderr, "[MUSIC] %lu state %u arg %u from %08X%s level %u phase %u, manager player %08X buffer %08X state %d%s%s\n",
+            (unsigned long)GetTickCount(), state, arg, ret, script, level, phase, MEM32(0x1D3C20), MEM32(0x1D3C24),
+            (int32_t)MEM32(0x1D3C2C), MEM32(0x1D3C24) ? "" : " (no music loaded: the request does nothing)",
+            keep ? " (left out: the sword's theme plays on)"
             : repeat ? " (left out: a script asking for the state playing)"
             : hall ? " (left out: the hall's music by distance)" : "");
     if (keep || repeat || hall) {
@@ -672,6 +676,267 @@ void sub_0001C9B0(void)
     if (fight && state == MUSIC_SWORD) sword_heard = 1;
     hpcos_chamber_finale = level == LEVEL_CHAMBER && state == MUSIC_FIGHT_WON;
     sub_0001C9B0_gen();
+}
+
+/* [MUSICLOAD] a level's music load, sub_0001CE70 (__thiscall on the manager 0x1D3C20, ret 20; the .mpf's path is the
+ * 2nd argument): it reads the .mpf (sub_00032250 size, sub_00035DC0 + sub_00032DD0) into +8, allocates the stream's
+ * buffer from the game heap [0x51DEB4] (sub_00035D80, tag 0x17E288) into +4 and makes the player (sub_00126250) into
+ * +0. A failed buffer clears the manager (player -1, buffer 0, .mpf 0), and every sub_0001C9B0 request after it does
+ * nothing: no .mus opens. A tester's fresh install (2026-10-30) had no music in the Burrow and Diagon Alley with the
+ * .mpf read in full and the requests passing; the tester's logs come late, so one run has to tell every step apart:
+ *   [MUSICLOAD] load / alloc / player / done: each step of the load, the buffer's size, the game heap's free bytes and
+ *     largest free block, the player sub_00126250 made, and the .mus beside the exe (game\EAMusic, its size);
+ *   [MUSICREQ] what PathFinder's request sub_00126800(player, state, arg) answered;
+ *   [HEAPFAIL] any game heap allocation refused (sub_00035730(5) after the free list walk, sub_00035D80 giving 0), the
+ *     tag, size and heap state, the first 40;
+ *   [MUSICSTATE] every 10 s with the [AUDIO] report (hle_dsound.c): the manager's fields, the music volume
+ *     ([0x1E1658] x [0x17DEF0], what sub_0001C9B0 hands sub_00126E20), and how often PathFinder's update sub_00124760
+ *     and the streamer's refill sub_00117550 ran: zero means that thread stopped.
+ * The game heap (sub_00035C40): blocks with a 0x24-byte header, +0 bit 0 free, +0x14 size; free list from heap+4 by +8.
+ * Gen's bodies are renamed *_gen by hand (regen's --exclude-manual does it): sub_0001CE70, sub_00035D80, sub_00035730,
+ * sub_00126250, sub_00126800, sub_00124760, sub_00117550. */
+extern void sub_0001CE70_gen(void);
+extern void sub_00035D80_gen(void);
+extern void sub_00035730_gen(void);
+extern void sub_00126250_gen(void);
+extern void sub_00126800_gen(void);
+extern void sub_00124760_gen(void);
+extern void sub_00117550_gen(void);
+static int g_music_loading, g_music_alloc;  /* 1 asked and given, -1 refused */
+static volatile LONG g_pf_updates, g_mus_refills, g_heap_fails;
+
+static int guest_ptr_ok(uint32_t a)
+{
+    return (a >= 0x10000u && a < 0x04000000u) || (a >= 0x80000000u && a < 0x84000000u);
+}
+
+/* free bytes, largest free block and free block count of a game heap (its free list) */
+static void game_heap_stats(uint32_t heap, uint32_t *free_bytes, uint32_t *largest, uint32_t *count)
+{
+    *free_bytes = *largest = *count = 0;
+    if (!guest_ptr_ok(heap)) return;
+    for (uint32_t b = MEM32(heap + 4), n = 0; guest_ptr_ok(b) && n < 100000; b = MEM32(b + 8), n++) {
+        if (!(MEM32(b) & 1)) continue;
+        uint32_t sz = MEM32(b + 0x14);
+        *free_bytes += sz, (*count)++;
+        if (sz > *largest) *largest = sz;
+    }
+}
+
+static void guest_cstr(uint32_t p, char *out, int cap)
+{
+    int n = 0;
+    for (; guest_ptr_ok(p) && n < cap - 1; p++) {
+        uint8_t c = MEM8(p);
+        if (!c) break;
+        out[n++] = c >= 0x20 && c < 0x7F ? (char)c : '?';
+    }
+    out[n] = 0;
+}
+
+static void heap_fail(const char *how, uint32_t heap, uint32_t tag, uint32_t size, uint32_t ret)
+{
+    if (InterlockedIncrement(&g_heap_fails) > 40) return;
+    uint32_t fr, big, cnt;
+    game_heap_stats(heap, &fr, &big, &cnt);
+    char name[64] = "";
+    if (tag >= 0x11000u && tag < 0x200000u) guest_cstr(tag, name, sizeof name);
+    fprintf(stderr, "[HEAPFAIL] %lu %s heap %08X%s tag %08X '%s' size %u from %08X: free %u bytes in %u blocks, largest %u,"
+            " level %u%s\n", (unsigned long)GetTickCount(), how, heap, heap == MEM32(0x51DEB4) ? " (main)" : "", tag, name,
+            size, ret, fr, cnt, big, MEM32(0x00527B78), g_music_loading ? " (during a music load)" : "");
+}
+
+void sub_00035D80(void)
+{
+    uint32_t tag = MEM32(g_esp + 4), size = MEM32(g_esp + 8), ret = MEM32(g_esp);
+    sub_00035D80_gen();
+    if (!g_eax) heap_fail("alloc refused", MEM32(0x51DEB4), tag, size, ret);
+    if (g_music_loading && tag == 0x17E288u) {
+        uint32_t fr, big, cnt;
+        game_heap_stats(MEM32(0x51DEB4), &fr, &big, &cnt);
+        g_music_alloc = g_eax ? 1 : -1;
+        fprintf(stderr, "[MUSICLOAD] alloc %u bytes (%.1f KB) from %08X -> %08X%s; heap now free %u in %u blocks, largest %u\n",
+                size, size / 1024.0, ret, g_eax, g_eax ? "" : " (the game heap refused it)", fr, cnt, big);
+    }
+}
+
+/* the free list walk found no block (sub_000358D0, thiscall on the heap, code 5) */
+void sub_00035730(void)
+{
+    uint32_t heap = g_ecx, code = MEM32(g_esp + 4), ret = MEM32(g_esp);
+    if (code == 5) heap_fail("no free block", heap, 0, 0, ret);
+    sub_00035730_gen();
+}
+
+void sub_00126250(void)
+{
+    uint32_t ret = MEM32(g_esp);
+    sub_00126250_gen();
+    if (g_music_loading || ret == 0x0001CF54u)
+        fprintf(stderr, "[MUSICLOAD] player from sub_00126250 -> %08X\n", g_eax);
+}
+
+/* [PFRACE] PathFinder's busy word [0x54DF18] (0 idle, -1 the tick, else the selected context) is a plain
+ * check-then-set: each API call and the tick sub_00125F00 test it for 0, take it (sub_001240A0) and clear it at the end.
+ * On the console one core with the tick on a higher-priority thread keeps them apart; here a thread can block inside
+ * (the audio trace's stderr writes) and another walk in. With the audio trace on and the device at 192 kHz (Windows,
+ * 2026-10-30) the level's .mus never opened after an accepted request and PathFinder's update sub_00124760 stopped.
+ * Every entry is tracked by host thread: a second thread entering while one is inside is logged ([PFRACE], the first
+ * 30), and the tick's outcomes are counted for [MUSICSTATE]: ran, paused ([0x54DF15]), off ([0x54DF14] 0), busy
+ * ([0x54DF18] not 0), by caller (0x125FC7 the 100 ms service, 0x125FD7 the streamer's callback list). */
+static volatile LONG g_pf_owner, g_pf_depth, g_pf_races;
+static const char *volatile g_pf_owner_fn;
+static volatile LONG g_tick_ran, g_tick_paused, g_tick_off, g_tick_busy, g_tick_svc, g_tick_list, g_tick_max_us;
+
+static int pf_enter(const char *fn)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    LONG owner = InterlockedCompareExchange(&g_pf_owner, me, 0);
+    if (owner && owner != me) {
+        if (InterlockedIncrement(&g_pf_races) <= 30)
+            fprintf(stderr, "[PFRACE] %lu %s on thread %ld entered while thread %ld is in %s; busy word %08X, ret %08X\n",
+                    (unsigned long)GetTickCount(), fn, me, owner, g_pf_owner_fn ? g_pf_owner_fn : "?", MEM32(0x54DF18),
+                    MEM32(g_esp));
+        return 0;
+    }
+    if (!owner) g_pf_owner_fn = fn;
+    InterlockedIncrement(&g_pf_depth);
+    return 1;
+}
+
+static void pf_leave(int owned)
+{
+    if (!owned) return;
+    if (InterlockedDecrement(&g_pf_depth) == 0) g_pf_owner_fn = 0, InterlockedExchange(&g_pf_owner, 0);
+}
+
+#define PF_WRAP(addr, name) \
+    extern void sub_##addr##_gen(void); \
+    void sub_##addr(void) { int o = pf_enter(name); sub_##addr##_gen(); pf_leave(o); }
+PF_WRAP(00124100, "sub_00124100")
+PF_WRAP(00126290, "sub_00126290 (player)")
+PF_WRAP(00126710, "sub_00126710")
+PF_WRAP(00126B10, "sub_00126B10")
+PF_WRAP(00126D60, "sub_00126D60")
+PF_WRAP(00126E20, "sub_00126E20 (volume)")
+PF_WRAP(00126F10, "sub_00126F10")
+
+/* PathFinder's pause (player, 1 pause / 0 resume): the game's music pause sub_0001C920 and resume sub_0001C930, and the
+ * request itself; a pause left on stops the tick ([0x54DF15]) */
+extern void sub_00126C40_gen(void);
+void sub_00126C40(void)
+{
+    uint32_t player = MEM32(g_esp + 4), on = MEM32(g_esp + 8), ret = MEM32(g_esp), up = 0;
+    for (uint32_t i = 1; i < 32 && !up; i++) {
+        uint32_t v = MEM32(g_esp + 4 * i);
+        if (v >= 0x11005 && v < 0x130620 && v != ret && MEM8(v - 5) == 0xE8) up = v;
+    }
+    int o = pf_enter("sub_00126C40 (pause)");
+    sub_00126C40_gen();
+    pf_leave(o);
+    fprintf(stderr, "[MUSIC] %lu PathFinder %s player %08X from %08X %08X -> %08X, pause byte now %u\n",
+            (unsigned long)GetTickCount(), on ? "pause" : "resume", player, ret, up, g_eax, MEM8(0x54DF15));
+}
+
+extern void sub_00125F00_gen(void);
+void sub_00125F00(void)
+{
+    uint32_t ret = MEM32(g_esp);
+    InterlockedIncrement(ret == 0x00125FC7u ? &g_tick_svc : &g_tick_list);
+    if (MEM8(0x54DF15)) InterlockedIncrement(&g_tick_paused);
+    else if (!MEM8(0x54DF14)) InterlockedIncrement(&g_tick_off);
+    else if (MEM32(0x54DF18)) InterlockedIncrement(&g_tick_busy);
+    else InterlockedIncrement(&g_tick_ran);
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    int o = pf_enter("sub_00125F00 (tick)");
+    sub_00125F00_gen();
+    pf_leave(o);
+    QueryPerformanceCounter(&t1);
+    LONG us = (LONG)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart);
+    for (LONG m = g_tick_max_us; us > m && InterlockedCompareExchange(&g_tick_max_us, us, m) != m; m = g_tick_max_us) {}
+}
+
+void sub_00126800(void)
+{
+    uint32_t player = MEM32(g_esp + 4), state = MEM32(g_esp + 8), arg = MEM32(g_esp + 12), ret = MEM32(g_esp);
+    uint32_t busy = MEM32(0x54DF18);
+    int o = pf_enter("sub_00126800 (request)");
+    sub_00126800_gen();
+    pf_leave(o);
+    fprintf(stderr, "[MUSICREQ] %lu PathFinder request player %08X state %u arg %u from %08X -> %08X (busy word before %08X,"
+            " after %08X)%s\n", (unsigned long)GetTickCount(), player, state, arg, ret, g_eax, busy, MEM32(0x54DF18),
+            g_eax == 0xFFFFFFEEu ? " (DROPPED: PathFinder was busy)" : "");
+}
+
+void sub_00124760(void)
+{
+    InterlockedIncrement(&g_pf_updates);
+    sub_00124760_gen();
+}
+
+void sub_00117550(void)
+{
+    InterlockedIncrement(&g_mus_refills);
+    sub_00117550_gen();
+}
+
+/* hle_dsound.c's output thread, every 10 s */
+void hpcos_music_report(void)
+{
+    float vol = MEMF(0x1E1658), scale = MEMF(0x17DEF0);
+    fprintf(stderr, "[MUSICSTATE] %lu level %u: manager player %08X buffer %08X mpf %08X state %d, volume %.3f x %.1f,"
+            " PathFinder updates %ld, streamer refills %ld, game heap failures %ld; ticks ran %ld paused %ld off %ld busy %ld"
+            " (service %ld, streamer list %ld, longest %.2f ms), busy word %08X paused %u on %u, races %ld\n",
+            (unsigned long)GetTickCount(), MEM32(0x00527B78), MEM32(0x1D3C20), MEM32(0x1D3C24), MEM32(0x1D3C28),
+            (int32_t)MEM32(0x1D3C2C), vol, scale, InterlockedExchange(&g_pf_updates, 0),
+            InterlockedExchange(&g_mus_refills, 0), g_heap_fails, InterlockedExchange(&g_tick_ran, 0),
+            InterlockedExchange(&g_tick_paused, 0), InterlockedExchange(&g_tick_off, 0),
+            InterlockedExchange(&g_tick_busy, 0), InterlockedExchange(&g_tick_svc, 0),
+            InterlockedExchange(&g_tick_list, 0), InterlockedExchange(&g_tick_max_us, 0) / 1000.0, MEM32(0x54DF18),
+            MEM8(0x54DF15), MEM8(0x54DF14), g_pf_races);
+}
+
+/* the .mus beside the exe for a .mpf path (game\EAMusic\<name>.mus): its size, -1 missing */
+static long long host_mus_size(const char *mpf, char *base, int cap)
+{
+    const char *s = mpf;
+    for (const char *p = mpf; *p; p++)
+        if (*p == '\\' || *p == '/' || *p == ':') s = p + 1;
+    int n = 0;
+    for (; s[n] && s[n] != '.' && n < cap - 1; n++) base[n] = s[n];
+    base[n] = 0;
+    char path[160];
+    snprintf(path, sizeof path, "game\\EAMusic\\%s.mus", base);
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) return -1;
+    return ((long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+}
+
+void sub_0001CE70(void)
+{
+    uint32_t ret = MEM32(g_esp), a[5], mgr = g_ecx;
+    for (int i = 0; i < 5; i++) a[i] = MEM32(g_esp + 4 + 4 * i);
+    char name[96], base[64];
+    guest_cstr(a[1], name, sizeof name);
+    long long mus = host_mus_size(name, base, sizeof base);
+    uint32_t fr, big, cnt;
+    game_heap_stats(MEM32(0x51DEB4), &fr, &big, &cnt);
+    fprintf(stderr, "[MUSICLOAD] %lu load '%s' from %08X args %08X %08X %08X %08X %08X, before: player %08X buffer %08X"
+            " mpf %08X; game\\EAMusic\\%s.mus %lld bytes%s; game heap free %u in %u blocks, largest %u\n",
+            (unsigned long)GetTickCount(), name, ret, a[0], a[1], a[2], a[3], a[4], MEM32(mgr), MEM32(mgr + 4),
+            MEM32(mgr + 8), base, mus, mus < 0 ? " (MISSING)" : mus == 0 ? " (EMPTY)" : "", fr, cnt, big);
+    g_music_loading = 1, g_music_alloc = 0;
+    sub_0001CE70_gen();
+    g_music_loading = 0;
+    uint32_t player = MEM32(mgr), buffer = MEM32(mgr + 4), mpf = MEM32(mgr + 8);
+    fprintf(stderr, "[MUSICLOAD] %lu '%s' done: player %08X buffer %08X mpf %08X%s\n", (unsigned long)GetTickCount(), name,
+            player, buffer, mpf,
+            g_music_alloc < 0 ? " (FAILED: the game heap refused the stream buffer)"
+            : !mpf ? " (FAILED: the .mpf didn't load)"
+            : !buffer ? " (FAILED: no stream buffer)"
+            : !player || player == 0xFFFFFFFFu ? " (FAILED: no player)" : "");
 }
 
 /* [VASE] why a hit's animation didn't start: sub_0003CF20(block, -1, 0x5276B0) (from sub_0003D020) makes the player and

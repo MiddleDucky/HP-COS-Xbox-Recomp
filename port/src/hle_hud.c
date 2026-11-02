@@ -117,6 +117,14 @@ static int front_end_screen(void)
     return g_frame - g_front_frame <= 1;
 }
 
+/* the last frame with the title's blue mist (WIDE), which only the main menu's backdrop has */
+static uint32_t g_mist_frame = 0xFFFFFFF0u;
+
+static int title_screen(void)
+{
+    return g_frame - g_mist_frame <= 1;
+}
+
 /* the last frame with a loading screen's picture (0x1BC5D: the full-width picture with its frame and bar track) */
 static uint32_t g_loading_frame = 0xFFFFFFF0u;
 
@@ -153,8 +161,16 @@ static int element_side(const uint32_t *chain, int depth, uint32_t sprite, uint3
     if (loading_screen() && in_chain(chain, depth, 0x0004B2EDu)) return FRONT;
     if (in_chain(chain, depth, 0x0004D42Fu) && def && sprite_height(sprite) > 400.0f) {
         uint32_t tex = MEM32(def + 8);
-        if (tex >= 0x22 && tex <= 0x24) return WIDE;
-        if (tex >= 0x11 && tex <= 0x13) return CENTRE;
+        if (tex >= 0x22 && tex <= 0x24) {
+            g_mist_frame = g_frame;
+            return WIDE;
+        }
+        /* the logo's textures depend on the language's panel set (panel.geo 0x11 to 0x13, panel_ita.geo 0x1A to 0x1C);
+         * taken for an Options backdrop (0x09 to 0x0B) it was split and moved out, and the title's words with it
+         * (FRONT). The Options backdrop reuses the logo's three defs, so the defs can't tell them apart; the mist,
+         * which only the title has, can: a full strip while it shows (last frame's: the logo is added first) */
+        if (tex >= 0x09 && tex <= 0x0B) return BACKDROP;  /* Options: also on the frame after the title's last */
+        if ((tex >= 0x11 && tex <= 0x13) || (tex >= 0x1A && tex <= 0x1C) || title_screen()) return CENTRE;
         /* the other front end backdrops (Options, Continue): frame, picture and HP logo in one image */
         return BACKDROP;
     }

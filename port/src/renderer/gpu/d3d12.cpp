@@ -734,6 +734,7 @@ struct Tex {
     uint64_t frame = 0;
     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
     bool norm = false;  // a normalization cube
+    bool prompt_pic = false;  // xboxrecomp: the HUD's A B X Y picture (PromptPicture), by its contents
 };
 
 struct PsoKey {
@@ -841,6 +842,7 @@ struct DrawShaders {
     uint64_t pkey = 0;
     uint64_t ph = 0;
     bool wdepth = false;  // xboxrecomp: the pixel shader writes log2(1 + w) as depth (UseLogDepth)
+    bool ppl = false;     // xboxrecomp: per pixel lighting, the program run again per pixel (shaders.cpp PerPixelFields)
 };
 
 // xboxrecomp: which draws write depth from w. HP:CoS draws most of the world W buffered (D3DZB_USEW) and other
@@ -1027,7 +1029,10 @@ private:
     void UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p, const uint32_t* palette,
                        bool same);
     void UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std::vector<uint8_t>& px, uint32_t pitch);
-    uint64_t EnsurePixelShader(const PixelKey& pk, uint64_t pkey);
+    uint64_t EnsurePixelShader(const PixelKey& pk, uint64_t pkey, const PerPixelSource* ppl = nullptr);
+    bool PerPixel(const State& s, const Assembled& a, const DrawShaders& sh);
+    std::unordered_map<uint64_t, bool> ppl_ok_;
+    std::string prompt_sig_;  // xboxrecomp: the key names the keycap picture was drawn with  // xboxrecomp: per program and inputs, PerPixelLightable
     void BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k);
     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
     ID3D12PipelineState* EnsurePipeline(const PsoKey& k, bool wait = false);
@@ -2768,7 +2773,12 @@ ComPtr<ID3D12PipelineState> D3D12Backend::CreatePipeline(const PsoKey& k, uint64
             ID3DBlob* ps2 = EnsureShaderCode(k.ps, true, unused);
             if (vs2 && ps2) return CreatePipeline(k, h, vs2, ps2, gs, compile, pending);
         }
-        LOGE("d3d12: pipeline creation failed");
+        // xboxrecomp: which pipeline and why, as its draws are skipped from now on (psos_ keeps the null): 32 failed
+        // at every start on an RTX 3060 under vkd3d-proton (2026-11-01), unnamed. VKD3D_DEBUG=warn says more there
+        LOGE("d3d12: pipeline %016llX creation failed (0x%08lX), its draws are skipped: vs %016llX ps %016llX%s, %u "
+             "target(s) format %d, depth format %d, %u sample(s), topology type %d", (unsigned long long)h,
+             (unsigned long)made, (unsigned long long)k.vs, (unsigned long long)k.ps, gs ? " with a line gs" : "",
+             d.NumRenderTargets, int(d.RTVFormats[0]), int(d.DSVFormat), d.SampleDesc.Count, int(d.PrimitiveTopologyType));
         return nullptr;
     }
     cache::StorePipeline(name, pso.Get());
@@ -3045,6 +3055,96 @@ void ReadStagePalette(const State& s, int stage, const TextureDesc& d, StagePale
 }
 
 // a texture in guest memory: made again when its layout changed, uploaded again when its bytes did
+// xboxrecomp: key prompts (F10 Controls, Button prompts; app_KeyboardPrompts). The HUD's button cluster at the top
+// right is one 128x128 picture of the pad's Y X B A (panel.geo), known here by a hash of its texels; with key prompts on
+// it is drawn as four keycaps with the bound keys' names, where the buttons were (Y top, X left, B right, A bottom).
+extern "C" int app_KeyboardPrompts(void);
+extern "C" const char* app_ButtonKeyLabel(int pad_input);
+constexpr uint64_t kPromptPicHash = 0;  // RECOMP_PROMPT_LOG prints the candidates' hashes
+
+uint64_t FullHash(uint32_t data, uint32_t n) {
+    return Hash(kernel::HostPtr(data), n);
+}
+
+// a label short enough for a keycap
+std::string CapLabel(const char* name) {
+    std::string n = name;
+    if (n == "Left Click") return "LMB";
+    if (n == "Right Click") return "RMB";
+    if (n == "Middle Click") return "MMB";
+    if (n == "Mouse 4") return "M4";
+    if (n == "Mouse 5") return "M5";
+    if (n == "Space") return "SPACE";
+    if (n == "Escape") return "ESC";
+    if (n == "Enter") return "ENTER";
+    if (n == "Backspace") return "BKSP";
+    return n;
+}
+
+// 128x128 BGRA, keycaps over transparency
+std::vector<uint8_t> PromptPicture(const std::string labels[4]) {
+    constexpr int W = 128;
+    std::vector<uint8_t> px(W * W * 4, 0);
+    struct Cap { int cx, cy; } caps[4] = {{64, 24}, {22, 64}, {106, 64}, {64, 104}};  // Y X B A
+    // the labels, white on black, through GDI: its coverage is the text's alpha
+    HDC dc = CreateCompatibleDC(nullptr);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = W;
+    bi.bmiHeader.biHeight = -W;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bm || !bits) {
+        if (bm) DeleteObject(bm);
+        DeleteDC(dc);
+        return px;
+    }
+    HGDIOBJ old = SelectObject(dc, bm);
+    std::memset(bits, 0, W * W * 4);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    for (int i = 0; i < 4; i++) {
+        if (labels[i].empty()) continue;
+        int h = labels[i].size() <= 1 ? 26 : labels[i].size() <= 3 ? 18 : 13;
+        HFONT f = CreateFontA(-h, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Arial");
+        HGDIOBJ of = SelectObject(dc, f);
+        RECT r{caps[i].cx - 30, caps[i].cy - 16, caps[i].cx + 30, caps[i].cy + 16};
+        DrawTextA(dc, labels[i].c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, of);
+        DeleteObject(f);
+    }
+    GdiFlush();
+    const uint8_t* text = static_cast<const uint8_t*>(bits);
+    for (int y = 0; y < W; y++) {
+        for (int x = 0; x < W; x++) {
+            float a = 0, edge = 0;
+            for (int i = 0; i < 4; i++) {
+                if (labels[i].empty()) continue;
+                int hw = labels[i].size() <= 1 ? 19 : 28, hh = 17;  // a single letter's cap is near square
+                // rounded box distance, radius 7
+                float dx = std::max(std::fabs(float(x) + 0.5f - caps[i].cx) - (hw - 7), 0.0f);
+                float dy = std::max(std::fabs(float(y) + 0.5f - caps[i].cy) - (hh - 7), 0.0f);
+                float d = std::sqrt(dx * dx + dy * dy) - 7;
+                a = std::max(a, std::clamp(0.5f - d, 0.0f, 1.0f));
+                edge = std::max(edge, std::clamp(1.0f - std::fabs(d + 1.5f) / 1.5f, 0.0f, 1.0f));
+            }
+            uint8_t* o = &px[(y * W + x) * 4];
+            float t = text[(y * W + x) * 4 + 1] / 255.0f;  // green: GDI's grey coverage
+            float c = 0.18f + 0.62f * edge;                // dark cap, light rim
+            c = c * (1 - t) + 1.0f * t;
+            uint8_t v = uint8_t(std::clamp(c, 0.0f, 1.0f) * 255);
+            o[0] = o[1] = o[2] = v;
+            o[3] = uint8_t(std::clamp(a * 0.92f + t * 0.08f, 0.0f, 1.0f) * 255);
+        }
+    }
+    SelectObject(dc, old);
+    DeleteObject(bm);
+    DeleteDC(dc);
+    return px;
+}
+
 ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const TextureDesc& d, const FormatInfo& fi,
                                                DrawTextures& stages) {
     TexInfo& info = stages.info[stage];
@@ -3064,7 +3164,39 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
         if (sig != tx.sig || !same) {
             tx.sig = sig;
             UploadTexture(tx, d, fi, p, palette.va ? palette.colours : nullptr, same);
+            // xboxrecomp: the HUD's button picture, by its texels (key prompts)
+            tx.prompt_pic = false;
+            if (d.width == 128 && d.height == 128 && !d.cube && d.depth == 1) {
+                uint64_t h = FullHash(d.data, LevelSize(d, 0));
+                tx.prompt_pic = h == kPromptPicHash;
+                static const bool log = std::getenv("RECOMP_PROMPT_LOG") != nullptr;
+                if (log) fprintf(stderr, "[PROMPTS] 128x128 texture %08X format %02X hash %016llX\n", d.data, d.format,
+                                 (unsigned long long)h);
+            }
         }
+    }
+    if (tx.prompt_pic && app_KeyboardPrompts()) {
+        // the keycaps instead, remade when a key name changes
+        std::string labels[4] = {CapLabel(app_ButtonKeyLabel(3)), CapLabel(app_ButtonKeyLabel(2)),
+                                 CapLabel(app_ButtonKeyLabel(1)), CapLabel(app_ButtonKeyLabel(0))};
+        std::string sig = labels[0] + "|" + labels[1] + "|" + labels[2] + "|" + labels[3];
+        TextureDesc kd;
+        kd.data = 0xFFFF0000u;
+        kd.format = 0x12;  // LIN_A8R8G8B8
+        kd.width = kd.height = 128;
+        kd.pitch = 128 * 4;
+        kd.linear = true;
+        const FormatInfo& kfi = Format(kd.format);
+        Tex& kt = textures_[0xFFFFFFFFFFFF0000ull];
+        bool ksame = SameTexture(kt, kd);
+        if (!ksame && !CreateTexture(kt, kd, kfi, 0xFFFFFFFFFFFF0000ull)) return nullptr;
+        if (!ksame || prompt_sig_ != sig) {
+            prompt_sig_ = sig;
+            std::vector<uint8_t> pic = PromptPicture(labels);
+            UploadTexture(kt, kd, kfi, pic.data(), nullptr, ksame);
+        }
+        FillTextureView(kt, kd, stages.sv[stage]);
+        return kt.res.Get();
     }
     FillTextureView(tx, d, stages.sv[stage]);
     if (fi.depth) info.shadow = ShadowDepthKind(d.format);
@@ -3316,6 +3448,7 @@ void EnsureProgramHash(const State& s) {
 constexpr uint64_t kDeclarationSalt = 0x10000;    // fixed function seed, above the 16 bit register mask
 constexpr uint64_t kPretransformedSalt = 0x5A5A;  // screen space fixed function vertices, apart from untransformed
 constexpr uint64_t kQuadSalt = 0xC3C30000;        // the QuadHlsl variant, apart from the plain shader
+constexpr uint64_t kPerPixelSalt = 0x5050000000000000ull;  // xboxrecomp: the per pixel lighting variant
 
 uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     uint64_t seed = sh.prog ? s.vs->hash ^ a.regs : Hash(&s.vs_handle, 4, a.regs | kDeclarationSalt);
@@ -3323,11 +3456,12 @@ uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     if (!sh.prog && a.pretransformed) vkey ^= kPretransformedSalt;
     if (sh.quad) vkey ^= kQuadSalt;
     if (!sh.prog) vkey = Hash(&sh.fk, sizeof(sh.fk), vkey);
+    if (sh.ppl) vkey ^= kPerPixelSalt;
     return vkey;
 }
 
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
-    if (sh.prog) return VertexProgramHlsl(s.vs->program, a.regs, a.decode);
+    if (sh.prog) return VertexProgramHlsl(s.vs->program, a.regs, a.decode, sh.ppl);
     return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
 }
 
@@ -3349,6 +3483,18 @@ uint64_t D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, co
     return vh;
 }
 
+// xboxrecomp: a vertex program's lighting done per pixel (F10 Graphics, per_pixel_lighting): programs that light
+// without a0 (no matrix palette), drawn as triangles, not a screen quad
+bool D3D12Backend::PerPixel(const State& s, const Assembled& a, const DrawShaders& sh) {
+    if (!sh.prog || sh.quad || a.topology != Topology::Triangles || !app::Get().per_pixel_lighting) return false;
+    uint64_t key = s.vs->hash ^ a.regs;
+    auto it = ppl_ok_.find(key);
+    if (it != ppl_ok_.end()) return it->second;
+    bool ok = PerPixelLightable(s.vs->program, a.regs);
+    ppl_ok_[key] = ok;
+    return ok;
+}
+
 bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& stages) {
     draw_rt_ = bound_rt_;
     draw_ds_ = bound_ds_;
@@ -3359,11 +3505,11 @@ bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& sta
 
 constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
 
-uint64_t D3D12Backend::EnsurePixelShader(const PixelKey& pk, uint64_t pkey) {
+uint64_t D3D12Backend::EnsurePixelShader(const PixelKey& pk, uint64_t pkey, const PerPixelSource* ppl) {
     // pixel shaders share the map with vertex shaders, the salt keeps their keys apart
     auto pit = shader_src_.find(pkey ^ kPixelKeySalt);
     if (pit != shader_src_.end()) return pit->second;
-    uint64_t ph = Register(PixelHlsl(pk), "main", "ps_5_0");
+    uint64_t ph = Register(PixelHlsl(pk, ppl), "main", "ps_5_0");
     shader_src_[pkey ^ kPixelKeySalt] = ph;
     return ph;
 }
@@ -3795,7 +3941,8 @@ void D3D12Backend::CaptureShader(const char* kind, uint64_t key, const std::stri
 void D3D12Backend::CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk) {
     std::string src = VertexHlsl(s, a, sh);
     CaptureShader("vs", sh.vkey, sh.quad ? QuadHlsl(std::move(src)) : src);
-    CaptureShader("ps", sh.pkey, PixelHlsl(pk));
+    PerPixelSource pps{sh.prog ? &s.vs->program : nullptr, a.regs};
+    CaptureShader("ps", sh.pkey, PixelHlsl(pk, sh.ppl ? &pps : nullptr));
 }
 
 D3D12_SRV_DIMENSION NullViewDimension(uint8_t kind) {
@@ -4328,6 +4475,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // vertex shader
     DrawShaders sh = ClassifyShaders(s, a, count);
     if (sh.prog) EnsureProgramHash(s);
+    sh.ppl = PerPixel(s, a, sh);
     sh.vkey = VertexKey(s, a, sh);
     sh.vh = EnsureVertexShader(s, a, sh);
 
@@ -4340,7 +4488,9 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     pk.wbuf = sh.wdepth;
     pk.quad = sh.quad;
     sh.pkey = Hash(&pk, sizeof(pk));
-    sh.ph = EnsurePixelShader(pk, sh.pkey);
+    PerPixelSource pps{&s.vs->program, a.regs};
+    if (sh.ppl) sh.pkey = Hash(&sh.vkey, sizeof(sh.vkey), sh.pkey);  // the pixel shader carries the program
+    sh.ph = EnsurePixelShader(pk, sh.pkey, sh.ppl ? &pps : nullptr);
 
     // pipeline
     PsoKey k;
@@ -5566,3 +5716,4 @@ extern "C" void hpcos_GpuStats(double out[6], uint32_t frames) {
     out[4] = double(gpu::g_upload_bytes.exchange(0)) / f / 1048576.0;
     out[5] = double(gpu::g_ring_waits.exchange(0)) / f;
 }
+

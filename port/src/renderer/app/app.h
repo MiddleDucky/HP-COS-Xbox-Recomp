@@ -21,16 +21,20 @@ constexpr uint32_t kPadInputs = 16;
 inline const char* const kPadInputNames[kPadInputs] = {"A",    "B",     "X",     "Y",     "Black", "White",
                                                        "LT",   "RT",    "Up",    "Down",  "Left",  "Right",
                                                        "Start", "Back", "LThumb", "RThumb"};
-// key bindings: the 16 pad inputs, then the left stick (forward back left right) and the camera (up down left right)
-constexpr uint32_t kKeyBinds = kPadInputs + 8;
+// key bindings: the 16 pad inputs, then the left stick (forward back left right) and the camera (up down left right),
+// then xboxrecomp's spell keys (hle_trainer.c spell_keys: each casts one spell without equipping it)
+constexpr uint32_t kSpellKeys = 8;
+constexpr uint32_t kKeyBinds = kPadInputs + 8 + kSpellKeys;
 inline const char* const kKeyBindNames[kKeyBinds] = {
     "A", "B", "X", "Y", "Black", "White", "LT", "RT", "D-pad up", "D-pad down", "D-pad left", "D-pad right", "Start",
     "Back", "Left stick click", "Right stick click", "Move forward", "Move back", "Move left", "Move right",
-    "Camera up", "Camera down", "Camera left", "Camera right"};
-// Space, E, left mouse, right mouse, R, Q, Shift, Ctrl, 1-4, Escape, Tab, C, middle mouse; W S A D; arrows
+    "Camera up", "Camera down", "Camera left", "Camera right", "Spell: Flipendo", "Spell: Diffindo", "Spell: Lumos",
+    "Spell: Incendio", "Spell: Skurge", "Spell: Avifors", "Spell: Alohomora", "Spell: Expelliarmus"};
+// Space, E, left mouse, right mouse, R, Q, Shift, Ctrl, no D-pad (the number row casts spells), Escape, Tab, C,
+// middle mouse; W S A D; arrows; the spells on 1-8
 #define kDefaultKeys                                                                                          \
-    0x20, 'E', 0x01, 0x02, 'R', 'Q', 0x10, 0x11, '1', '2', '3', '4', 0x1B, 0x09, 'C', 0x04, 'W', 'S', 'A', 'D', \
-        0x26, 0x28, 0x25, 0x27
+    0x20, 'E', 0x01, 0x02, 'R', 'Q', 0x10, 0x11, 0, 0, 0, 0, 0x1B, 0x09, 'C', 0x04, 'W', 'S', 'A', 'D',         \
+        0x26, 0x28, 0x25, 0x27, '1', '2', '3', '4', '5', '6', '7', '8'
 
 struct Settings {
     DisplayMode display_mode = DisplayMode::Windowed;  // RECOMP_DISPLAY_MODE
@@ -45,6 +49,9 @@ struct Settings {
     // xboxrecomp: post-processing (d3d12.cpp): bloom over the 3D scene before the HUD, sharpening and grading over
     // the finished frame. Off or neutral by default: the console's picture
     bool bloom = false;
+    // xboxrecomp: the vertex programs' lighting run again per pixel (shaders.cpp PerPixelFields): lights such as
+    // Lumos lit smoothly over big floor triangles instead of in patches shaped by their corners. On by default
+    bool per_pixel_lighting = true;
     uint32_t bloom_strength = 40;      // 0 to 100
     uint32_t sharpen = 0;              // 0 (off) to 100
     uint32_t saturation = 100;         // 0 to 200 %, 100 as the game
@@ -79,7 +86,11 @@ struct Settings {
     uint32_t colorblind = 0;           // ColorBlind: correction filter over the finished frame
     uint32_t colorblind_strength = 100;  // 0 to 100 %
     uint32_t speakers = 2;             // xboxrecomp: 2 stereo, 6 5.1 surround (hle_dsound.c, at start)
+    uint32_t language = 0;             // xboxrecomp: the console's language, which the title starts in: 0 US English, 1 UK English,
+                                       // 2 French, 3 German, 4 Spanish, 5 Italian (RECOMP_LANGUAGE to the kernel, at start)
     bool kbm = true;                   // keyboard and mouse drive pad 1 alongside a controller
+    uint32_t button_prompts = 0;       // xboxrecomp: the game's button pictures and prompts: 0 the last input's (keys
+                                       // after keyboard and mouse, buttons after the controller), 1 controller, 2 keys
     uint32_t mouse_sensitivity = 50;   // 1 to 100
     bool mouse_invert_y = false;
     uint32_t move_mode = 2;            // xboxrecomp: the movement keys' pace: kMoveSlowWalk, kMoveWalk, kMoveRun; the

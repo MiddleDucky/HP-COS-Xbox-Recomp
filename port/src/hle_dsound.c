@@ -28,6 +28,8 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <xaudio2.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
 
 #include <math.h>
 #include <stdint.h>
@@ -38,6 +40,7 @@
 /* the register names (eax, esp, ...) that RECOMP_ICALL expands to */
 #define RECOMP_GENERATED_CODE
 #include "recomp/gen/recomp_types.h"
+void hpcos_music_report(void); /* hle_debug.c: the music manager and its threads, every 10 s */
 
 #ifdef _MSC_VER
 #pragma comment(lib, "xaudio2.lib")
@@ -641,6 +644,36 @@ static void wav_write(const int16_t *pcm, uint32_t frames)
 static unsigned g_dry, g_clipped, g_mixed;
 static DWORD g_report_ms;
 
+/* [AUDIO] the Windows playback device's own mix format (shared mode): XAudio2 mixes at 48000 Hz and Windows converts
+ * to it. 2026-10-30: level music never started with the device at 192000 Hz (or 96000) unless exclusive mode was
+ * allowed (which put it back to 48000) - logged so every run shows the device's rate. */
+static void log_device_format(void)
+{
+    static const GUID clsid_enum = {0xBCDE0395, 0xE52F, 0x467C, {0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}};
+    static const GUID iid_enum = {0xA95664D2, 0x9614, 0x4F35, {0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6}};
+    static const GUID iid_client = {0x1CB9AD4C, 0xDBFA, 0x4C32, {0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2}};
+    IMMDeviceEnumerator *en = NULL;
+    IMMDevice *dev = NULL;
+    IAudioClient *ac = NULL;
+    WAVEFORMATEX *mf = NULL;
+    REFERENCE_TIME def = 0, min = 0;
+    if (SUCCEEDED(CoCreateInstance(&clsid_enum, NULL, CLSCTX_ALL, &iid_enum, (void **)&en)) &&
+        SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eConsole, &dev)) &&
+        SUCCEEDED(IMMDevice_Activate(dev, &iid_client, CLSCTX_ALL, NULL, (void **)&ac)) &&
+        SUCCEEDED(IAudioClient_GetMixFormat(ac, &mf))) {
+        IAudioClient_GetDevicePeriod(ac, &def, &min);
+        fprintf(stderr, "[AUDIO] Windows device mix format: %lu Hz, %u channels, %u-bit, period %.1f ms (min %.1f)%s\n",
+                (unsigned long)mf->nSamplesPerSec, mf->nChannels, mf->wBitsPerSample, def / 10000.0, min / 10000.0,
+                mf->nSamplesPerSec != MIX_RATE ? " - not 48000 Hz: Windows resamples our output" : "");
+        CoTaskMemFree(mf);
+    } else {
+        fprintf(stderr, "[AUDIO] Windows device mix format: unknown\n");
+    }
+    if (ac) IAudioClient_Release(ac);
+    if (dev) IMMDevice_Release(dev);
+    if (en) IMMDeviceEnumerator_Release(en);
+}
+
 static DWORD WINAPI mixer_thread(LPVOID unused)
 {
     static float mix[MIX_FRAMES * 6];
@@ -654,6 +687,7 @@ static DWORD WINAPI mixer_thread(LPVOID unused)
     (void)unused;
 
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    log_device_format();
     init_latency();
     /* late wake ups of this thread are what empties the device queue; the CPU itself is mostly idle */
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
@@ -772,6 +806,7 @@ static DWORD WINAPI mixer_thread(LPVOID unused)
                                 (unsigned long)now_ms, (unsigned long)((now_ms - g_report_ms) / 1000), g_clicks,
                                 g_stale, g_late, g_late_max_ms, g_burst_max, g_jump_max * 100.0, g_dry, g_clipped,
                                 g_stream_dry);
+                    hpcos_music_report();  /* hle_debug.c: [MUSICSTATE] */
                     g_dry = g_clipped = g_clicks = g_stale = g_late = g_burst_max = g_stream_dry = 0;
                     g_late_max_ms = 0;
                     g_jump_max = 0;

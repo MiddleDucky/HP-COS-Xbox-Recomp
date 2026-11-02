@@ -837,9 +837,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 
 void xbox_FramebufferWindowStart(void)
 {
+    /* read once: the input poll reaches here several times a frame (app::Window), and getenv takes the CRT's
+     * environment lock and walks the whole table each time */
+    static volatile LONG want = -1;
     HANDLE th;
 
-    if (!getenv("RECOMP_FB_WINDOW"))
+    if (want < 0)
+        InterlockedExchange(&want, getenv("RECOMP_FB_WINDOW") ? 1 : 0);
+    if (!want || s_fb_running)
         return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;

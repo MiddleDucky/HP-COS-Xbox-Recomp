@@ -1029,12 +1029,87 @@ static void grounds_borders(void)
     }
 }
 
+/* debug (RECOMP_SPELL_PROBE=1): the spell buttons' state as it changes - the inventory's three slots (0x527EFC, words,
+ * -1 none), the learnt bits (0x527F0C), the slot enables (0x527F14) and the buttons' actions (0x527F1C..20) */
+static void spell_probe(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_SPELL_PROBE") && *getenv("RECOMP_SPELL_PROBE") != '0';
+    if (!on) return;
+    static uint32_t last_pad;
+    uint32_t pad = MEM32(0x51E0AC);  /* the title's pad 1 buttons this frame (hle_frontend.c kPads) */
+    if (pad != last_pad) {
+        fprintf(stderr, "[SPELLS] pad buttons %08X -> %08X\n", last_pad, pad);
+        last_pad = pad;
+    }
+    static uint32_t last[8];
+    uint32_t now[8] = {MEM16(0x527EFC), MEM16(0x527EFE), MEM16(0x527F00), MEM32(0x527F0C), MEM8(0x527F14),
+                       MEM16(0x527F1C), MEM16(0x527F1E), MEM16(0x527F20)};
+    if (!memcmp(now, last, sizeof now)) return;
+    memcpy(last, now, sizeof now);
+    fprintf(stderr, "[SPELLS] slots %04X %04X %04X learnt %08X enables %02X actions %04X %04X %04X\n", now[0], now[1],
+            now[2], now[3], now[4], now[5], now[6], now[7]);
+}
+
+/* Spell keys (F10 Controls, key_spell_*; 1-8 by default): a spell cast straight from a key, learnt ones only, without
+ * the inventory. The three buttons' spells are the words at 0x527EFC: Y, B, X (the inventory's sub_000A51F0(button,
+ * spell) writes them, -1 none), each a spell's number (its bit in the learnt word 0x527F0C): Lumos 0, Diffindo 1,
+ * Flipendo 2, Avifors 4, Skurge 14, Incendio 20, Alohomora 22, Expelliarmus 23 (found 2026-11-01 from a run equipping
+ * each). The title casts the spell of the button pressed. A key whose spell is on a button holds that button; otherwise
+ * the X slot (or the first one the game has opened, 0x527F14 bits 1 2 4) takes the spell while the key is held and a
+ * little after (the cast plays out), then gets its own back. app_spell_press holds the button (renderer/app/input.cpp). */
+extern int app_SpellKey(void);
+extern volatile int app_spell_press;
+
+static void spell_keys(void)
+{
+    static const int16_t kSpell[8] = {2, 1, 0, 20, 14, 4, 22, 23};  /* the keys' order: Flipendo .. Expelliarmus */
+    static const int kSlotPad[3] = {3, 1, 2};                      /* slot 0 Y, 1 B, 2 X -> pad inputs Y, B, X */
+    static int borrowed = -1;                                      /* the slot lent to a spell, -1 none */
+    static int16_t kept;                                           /* its own spell */
+    static DWORD released;                                         /* when the key went up */
+    static int held_key;
+    int key = app_SpellKey();
+    DWORD now = GetTickCount();
+    if (key && key != held_key) {
+        int16_t spell = kSpell[key - 1];
+        uint8_t open = MEM8(0x527F14);
+        if (!(MEM32(0x527F0C) & (1u << spell))) {
+            key = 0;  /* not learnt */
+        } else {
+            int slot = -1;
+            for (int i = 0; i < 3; i++)
+                if ((int16_t)MEM16(0x527EFC + 2 * i) == spell && (open & (1u << i))) slot = i;
+            if (slot < 0) {
+                if (borrowed < 0) {
+                    static const int kOrder[3] = {2, 1, 0};
+                    for (int k = 0; k < 3 && borrowed < 0; k++)
+                        if (open & (1u << kOrder[k])) borrowed = kOrder[k];
+                    if (borrowed >= 0) kept = (int16_t)MEM16(0x527EFC + 2 * borrowed);
+                }
+                slot = borrowed;
+                if (slot >= 0) MEM16(0x527EFC + 2 * slot) = (uint16_t)spell;
+            }
+            app_spell_press = slot >= 0 ? kSlotPad[slot] : -1;
+        }
+    }
+    if (!key && held_key) {
+        app_spell_press = -1;
+        released = now;
+    }
+    held_key = key;
+    if (!key && borrowed >= 0 && now - released > 600) {
+        MEM16(0x527EFC + 2 * borrowed) = (uint16_t)kept;
+        borrowed = -1;
+    }
+}
+
 void sub_00053710(void)
 {
     HpcosTrainerShm *t = shm();
     uint32_t ent = ARG(0);
     give_card_key(ent);
-    if (ent && ent == MEM32(kPlayer)) hpcos_WideAspectTick(), harry_diff(ent), trig_trace(ent), grounds_borders(), lesson_arch(), lake_edge();
+    if (ent && ent == MEM32(kPlayer)) hpcos_WideAspectTick(), spell_probe(), spell_keys(), harry_diff(ent), trig_trace(ent), grounds_borders(), lesson_arch(), lake_edge();
     if (!t || !ent || ent != MEM32(kPlayer)) {
         sub_00053710_gen();
         return;

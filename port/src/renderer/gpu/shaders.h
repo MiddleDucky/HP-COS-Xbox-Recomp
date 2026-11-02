@@ -56,7 +56,14 @@ bool WBuffered(const State& s);
 
 // vertex program microcode to HLSL, regs is the bit mask of v registers the draw supplies
 // decode: VertexDecode per register, 4 bits each, for elements the input assembler hands over raw
-std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t regs, uint64_t decode = 0);
+std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t regs, uint64_t decode = 0, bool ppl = false);
+// xboxrecomp: per pixel lighting (shaders.cpp PerPixelFields): whether a program can be run again per pixel for its
+// colours, and what PixelHlsl needs for it
+bool PerPixelLightable(const std::vector<uint32_t>& program, uint16_t regs);
+struct PerPixelSource {
+    const std::vector<uint32_t>* prog;
+    uint16_t regs;
+};
 // fixed function vertex state a shader is built for
 struct FixedKey {
     uint32_t light = 0;    // bit 0 lighting, 1 specular, 2 local viewer, 3 normalize, then D3DMCS 2 bits each from bit 8:
@@ -66,7 +73,7 @@ struct FixedKey {
 };
 FixedKey MakeFixedKey(const State& s);
 std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode = 0, const FixedKey& f = {});
-std::string PixelHlsl(const PixelKey& k);
+std::string PixelHlsl(const PixelKey& k, const PerPixelSource* ppl = nullptr);
 std::string QuadHlsl(std::string s, uint32_t texels = 0);  // texels: stages with coordinates in texels
 std::string LineGsHlsl(std::string vs);  // a line draw's geometry shader, entry "gsline", over its vertex shader
 

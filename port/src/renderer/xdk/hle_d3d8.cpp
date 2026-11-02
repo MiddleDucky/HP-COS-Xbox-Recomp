@@ -194,6 +194,12 @@ void SetComplex(uint32_t rs, uint32_t v) {
 }
 
 // frame pacing: Swap returns on the 59.94 Hz grid, every g_interval-th tick
+// xboxrecomp: g_pace_late_ms, how far past its tick the latest Swap left, for [FRAME] (2026-11-02). A high resolution
+// waitable timer in place of Sleep was tried and measured worse under Wine (worst 0.32 ms off the grid against 0.004:
+// the final Sleep(0) loop already lands on the tick), so the wait is unchanged; frames slower than 16.7 ms are the
+// frame's own work, which this shows
+double g_pace_late_ms = 0;
+
 void Pace() {
     static LARGE_INTEGER freq, next;
     LARGE_INTEGER now;
@@ -207,6 +213,7 @@ void Pace() {
         Sleep(left > 1 ? DWORD(left - 1) : 0);
         QueryPerformanceCounter(&now);
     }
+    g_pace_late_ms = double(now.QuadPart - next.QuadPart) * 1000.0 / double(freq.QuadPart);
     next.QuadPart += period;
 }
 
@@ -751,7 +758,8 @@ HLE(00134D70, 1) {
         // [FRAME] every 5 s: frames, the slowest and how many over 25 ms, between frames leaving the pacing
         static LARGE_INTEGER prev, t0;
         static uint32_t frames, slow;
-        static double worst;
+        static double worst, late_worst;
+        if (g_pace_late_ms > late_worst) late_worst = g_pace_late_ms;
         QueryPerformanceFrequency(&f);
         if (prev.QuadPart) {
             double shown = double(b.QuadPart - prev.QuadPart) * 1000.0 / double(f.QuadPart);
@@ -766,9 +774,10 @@ HLE(00134D70, 1) {
         prev = b;
         double span = double(b.QuadPart - t0.QuadPart) / double(f.QuadPart);
         if (span >= 5.0) {
-            fprintf(stderr, "[FRAME] %.1f fps, slowest %.1f ms, %u frames over 25 ms\n", frames / span, worst, slow);
+            fprintf(stderr, "[FRAME] %.1f fps, slowest %.1f ms, %u frames over 25 ms, Swap up to %.2f ms after its tick\n",
+                    frames / span, worst, slow, late_worst);
             frames = slow = 0;
-            worst = 0;
+            worst = late_worst = 0;
             t0 = b;
         }
         QueryPerformanceFrequency(&f);

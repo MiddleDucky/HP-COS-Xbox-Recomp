@@ -30,7 +30,7 @@ namespace app {
 
 namespace {
 
-enum class Kind { U32, Bool, Display, Aspect, Key, Pad, ColorBlind, Fps };
+enum class Kind { U32, Bool, Display, Aspect, Key, Pad, ColorBlind, Fps, Language };
 
 struct Entry {
     const char* key;  // in hpcos.toml
@@ -68,6 +68,8 @@ const Entry kEntries[] = {
     {"contrast", nullptr, Kind::U32, FIELD(contrast), 0, 100, nullptr},
     {"vsync", "RECOMP_VSYNC", Kind::Bool, FIELD(vsync), 0, 0, nullptr},
     {"fps_counter", nullptr, Kind::Bool, FIELD(fps_counter), 0, 0, nullptr},
+    {"per_pixel_lighting", "RECOMP_PER_PIXEL_LIGHTING", Kind::Bool, FIELD(per_pixel_lighting), 0, 0,
+     "lighting worked out for every pixel instead of at the corners of each triangle (the console's way): lights such as Lumos light the floor round them smoothly"},
     {"bloom", "RECOMP_BLOOM", Kind::Bool, FIELD(bloom), 0, 0,
      "a glow round bright parts of the 3D scene (not the HUD)"},
     {"bloom_strength", nullptr, Kind::U32, FIELD(bloom_strength), 0, 100, nullptr},
@@ -96,9 +98,13 @@ const Entry kEntries[] = {
      "everything in the camera's view drawn (the field of view slider's width), not only what the doorways show; false: culled as the game does"},
     {"speakers", "RECOMP_SPEAKERS", Kind::U32, FIELD(speakers), 2, 6,
      "2 stereo, 6 5.1 surround (the console's speaker mix, each channel to its own speaker); takes a restart"},
+    {"language", "RECOMP_LANGUAGE", Kind::Language, FIELD(language), 0, 0,
+     "the language the game starts in: 'english' (US), 'english_uk', 'french', 'german', 'spanish' or 'italian'; takes a restart"},
     {"colorblind", nullptr, Kind::ColorBlind, FIELD(colorblind), 0, 0,
      "colour-blind correction over the finished frame: 'off', 'protanopia', 'deuteranopia' or 'tritanopia'"},
     {"colorblind_strength", nullptr, Kind::U32, FIELD(colorblind_strength), 0, 100, "0 to 100 %"},
+    {"button_prompts", nullptr, Kind::U32, FIELD(button_prompts), 0, 2,
+     "the game's button prompts and pictures: 0 follow the last input (key names after keyboard and mouse), 1 always the controller's, 2 always the keys"},
     {"keyboard_mouse", nullptr, Kind::Bool, FIELD(kbm), 0, 0,
      "keyboard and mouse play as controller 1, alongside a pad (key names below; Mouse1-5 the mouse buttons)"},
     {"mouse_sensitivity", nullptr, Kind::U32, FIELD(mouse_sensitivity), 1, 100, "1 to 100, the camera's speed with the mouse"},
@@ -154,12 +160,24 @@ const Entry kEntries[] = {
     {"key_camera_down", nullptr, Kind::Key, FIELD(keys[21]), 0, 0, nullptr},
     {"key_camera_left", nullptr, Kind::Key, FIELD(keys[22]), 0, 0, nullptr},
     {"key_camera_right", nullptr, Kind::Key, FIELD(keys[23]), 0, 0, nullptr},
+    {"key_spell_flipendo", nullptr, Kind::Key, FIELD(keys[24]), 0, 0,
+     "spells cast straight from a key, without equipping them (only those learnt): Flipendo, Diffindo, Lumos, Incendio, Skurge, Avifors, Alohomora, Expelliarmus"},
+    {"key_spell_diffindo", nullptr, Kind::Key, FIELD(keys[25]), 0, 0, nullptr},
+    {"key_spell_lumos", nullptr, Kind::Key, FIELD(keys[26]), 0, 0, nullptr},
+    {"key_spell_incendio", nullptr, Kind::Key, FIELD(keys[27]), 0, 0, nullptr},
+    {"key_spell_skurge", nullptr, Kind::Key, FIELD(keys[28]), 0, 0, nullptr},
+    {"key_spell_avifors", nullptr, Kind::Key, FIELD(keys[29]), 0, 0, nullptr},
+    {"key_spell_alohomora", nullptr, Kind::Key, FIELD(keys[30]), 0, 0, nullptr},
+    {"key_spell_expelliarmus", nullptr, Kind::Key, FIELD(keys[31]), 0, 0, nullptr},
 };
 #undef FIELD
 
 constexpr const char* kDisplayNames[] = {"windowed", "borderless", "fullscreen"};
 constexpr const char* kAspectNames[] = {"4:3", "16:9", "stretch"};
 constexpr const char* kColorBlindNames[] = {"off", "protanopia", "deuteranopia", "tritanopia"};
+// the languages this edition offers (its table at 0x1F7A68; sub_00011290 maps the console's language to them)
+constexpr const char* kLanguageNames[] = {"english", "english_uk", "french", "german", "spanish", "italian"};
+constexpr uint32_t kLanguages = 6;
 
 uint32_t& U(Settings& s, const Entry& e) { return *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(&s) + e.off); }
 bool& B(Settings& s, const Entry& e) { return *reinterpret_cast<bool*>(reinterpret_cast<char*>(&s) + e.off); }
@@ -205,6 +223,11 @@ bool Parse(Settings& s, const Entry& e, std::string v) {
                 if (!_stricmp(v.c_str(), kColorBlindNames[i])) return U(s, e) = i, true;
             }
             return false;
+        case Kind::Language:
+            for (uint32_t i = 0; i < kLanguages; i++) {
+                if (!_stricmp(v.c_str(), kLanguageNames[i])) return U(s, e) = i, true;
+            }
+            return false;
         case Kind::Pad:
             for (uint32_t i = 0; i < kPadInputs; i++) {
                 if (!_stricmp(v.c_str(), kPadInputNames[i])) return U(s, e) = i, true;
@@ -228,6 +251,7 @@ std::string Format(Settings& s, const Entry& e) {
         case Kind::Aspect: return std::string("'") + kAspectNames[std::min(U(s, e), 2u)] + "'";
         case Kind::Fps: return std::to_string(U(s, e));
         case Kind::ColorBlind: return std::string("'") + kColorBlindNames[std::min(U(s, e), 3u)] + "'";
+        case Kind::Language: return std::string("'") + kLanguageNames[std::min(U(s, e), kLanguages - 1)] + "'";
         case Kind::Pad: return std::string("'") + kPadInputNames[std::min(U(s, e), kPadInputs - 1)] + "'";
         case Kind::Key: return std::string("'") + KeyName(U(s, e)) + "'";
     }
@@ -306,10 +330,22 @@ void Merge(State& st) {
     }
 }
 
+void SetEnvDefault(const char* name, const std::string& v);
+
 void Init(State& st) {
     if (st.ready) return;
     st.ready = true;
     bool had = ReadFile(st.file);
+    // xboxrecomp (2026-11-01): the number row casts spells now. A file from before keeps the D-pad on 1-4 (the old
+    // defaults) beside the new spell keys on 1-4: the D-pad's keys go, as the new defaults have it
+    bool migrated = false;
+    {
+        uint32_t* k = st.file.keys;
+        if (k[8] == '1' && k[9] == '2' && k[10] == '3' && k[11] == '4' && k[kPadInputs + 8] == '1') {
+            k[8] = k[9] = k[10] = k[11] = 0;
+            migrated = true;
+        }
+    }
     st.cur = st.file;
     for (size_t i = 0; i < std::size(kEntries); i++) {
         const Entry& e = kEntries[i];
@@ -325,7 +361,9 @@ void Init(State& st) {
         }
     }
     st.boot_aspect = st.cur.aspect;
-    if (!had) WriteFile(st.file);
+    // the kernel answers the title's language query (XC_LANGUAGE) from this; read once, as the title starts
+    SetEnvDefault("RECOMP_LANGUAGE", kLanguageNames[std::min(st.cur.language, kLanguages - 1)]);
+    if (!had || migrated) WriteFile(st.file);
     std::error_code ec;
     st.stamp = std::filesystem::last_write_time(FilePath(), ec);
     LOGI("settings: %s%s", FilePath().string().c_str(), had ? "" : " (new, defaults)");
