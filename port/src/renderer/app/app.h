@@ -21,20 +21,16 @@ constexpr uint32_t kPadInputs = 16;
 inline const char* const kPadInputNames[kPadInputs] = {"A",    "B",     "X",     "Y",     "Black", "White",
                                                        "LT",   "RT",    "Up",    "Down",  "Left",  "Right",
                                                        "Start", "Back", "LThumb", "RThumb"};
-// key bindings: the 16 pad inputs, then the left stick (forward back left right) and the camera (up down left right),
-// then xboxrecomp's spell keys (hle_trainer.c spell_keys: each casts one spell without equipping it)
-constexpr uint32_t kSpellKeys = 8;
-constexpr uint32_t kKeyBinds = kPadInputs + 8 + kSpellKeys;
+// key bindings: the 16 pad inputs, then the left stick (forward back left right) and the camera (up down left right)
+constexpr uint32_t kKeyBinds = kPadInputs + 8;
 inline const char* const kKeyBindNames[kKeyBinds] = {
     "A", "B", "X", "Y", "Black", "White", "LT", "RT", "D-pad up", "D-pad down", "D-pad left", "D-pad right", "Start",
     "Back", "Left stick click", "Right stick click", "Move forward", "Move back", "Move left", "Move right",
-    "Camera up", "Camera down", "Camera left", "Camera right", "Spell: Flipendo", "Spell: Diffindo", "Spell: Lumos",
-    "Spell: Incendio", "Spell: Skurge", "Spell: Avifors", "Spell: Alohomora", "Spell: Expelliarmus"};
-// Space, E, left mouse, right mouse, R, Q, Shift, Ctrl, no D-pad (the number row casts spells), Escape, Tab, C,
-// middle mouse; W S A D; arrows; the spells on 1-8
+    "Camera up", "Camera down", "Camera left", "Camera right"};
+// Space, E, left mouse, right mouse, R, Q, Shift, Ctrl, 1-4, Escape, Tab, C, middle mouse; W S A D; arrows
 #define kDefaultKeys                                                                                          \
-    0x20, 'E', 0x01, 0x02, 'R', 'Q', 0x10, 0x11, 0, 0, 0, 0, 0x1B, 0x09, 'C', 0x04, 'W', 'S', 'A', 'D',         \
-        0x26, 0x28, 0x25, 0x27, '1', '2', '3', '4', '5', '6', '7', '8'
+    0x20, 'E', 0x01, 0x02, 'R', 'Q', 0x10, 0x11, '1', '2', '3', '4', 0x1B, 0x09, 'C', 0x04, 'W', 'S', 'A', 'D', \
+        0x26, 0x28, 0x25, 0x27
 
 struct Settings {
     DisplayMode display_mode = DisplayMode::Windowed;  // RECOMP_DISPLAY_MODE

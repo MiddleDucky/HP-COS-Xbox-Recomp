@@ -82,11 +82,7 @@ Keyboard and mouse (defaults; change them under F10 > Controls)
   Y                     right mouse button
   Black / White         R / Q
   Left / right trigger  Shift / Ctrl
-  D-pad                 no keys by default (bind them under F10 > Controls)
-  Spells                1 Flipendo, 2 Diffindo, 3 Lumos, 4 Incendio,
-                        5 Skurge, 6 Avifors, 7 Alohomora, 8 Expelliarmus:
-                        cast straight from the key without equipping it
-                        (only spells Harry has learnt)
+  D-pad                 1 2 3 4 (up, down, left, right)
   Start / Back          Escape / Tab
   Stick clicks          C (left), middle mouse button (right)
   Pace of the keys      mouse wheel: down Slow walk < Walk < Run up (Run is
@@ -161,8 +157,7 @@ Controls
                          buttons or Keyboard keys. The button picture in the
                          corner still shows the pad's buttons.
     Key bindings         click a binding, then press a key or mouse button
-                         (Escape clears it); "Default keys" restores them;
-                         the spell keys are at the end of the list
+                         (Escape clears it); "Default keys" restores them
   Controller
     Use controller       off: the game ignores the controller (and it does
                          not vibrate); keyboard and mouse still play

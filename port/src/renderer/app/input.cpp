@@ -271,8 +271,6 @@ void CancelKeyCapture() { g_capture = -1; }
 // hle_input.c: a pad read for the game, after the PC's controller filled it in. Returns which sticks keyboard and
 // mouse drove (1 the left, 2 the right): those skip hle_input.c's stick range compensation, as they skip the deadzones
 // and responses here, which are the controller's
-extern "C" volatile int app_spell_press = -1;  // xboxrecomp: a pad input a spell key holds (hle_trainer.c)
-
 extern "C" int app_InputPad(int port, XBOX_GAMEPAD* g) {
     int kbm_sticks = 0;
     const app::Settings& s = app::Get();
@@ -285,8 +283,6 @@ extern "C" int app_InputPad(int port, XBOX_GAMEPAD* g) {
     if (port == 0 && s.kbm && GetForegroundWindow() == static_cast<HWND>(app::Window()) && !app::MenuOpen()) {
         for (uint32_t i = 0; i < app::kPadInputs; i++)
             if (app::Held(s.keys[i])) out[i] = 255;
-        // xboxrecomp: a spell key's cast (hle_trainer.c spell_keys): the button it borrows held
-        if (app_spell_press >= 0 && app_spell_press < int(app::kPadInputs)) out[app_spell_press] = 255;
         float lx = float(app::Held(s.keys[19])) - float(app::Held(s.keys[18]));
         float ly = float(app::Held(s.keys[16])) - float(app::Held(s.keys[17]));
         if (lx || ly) {
@@ -367,16 +363,6 @@ extern "C" const char* app_ButtonKeyLabel(int i) {
         case 0x06: return "Mouse 5";
         default: return app::KeyName(vk);
     }
-}
-
-// xboxrecomp: the spell keys (hle_trainer.c spell_keys, on the title's thread): the first spell key held, 1 to
-// kSpellKeys in kKeyBindNames' order, 0 none; keyboard and mouse on, the window in front, no menu
-extern "C" int app_SpellKey(void) {
-    const app::Settings& s = app::Get();
-    if (!s.kbm || GetForegroundWindow() != static_cast<HWND>(app::Window()) || app::MenuOpen()) return 0;
-    for (uint32_t i = 0; i < app::kSpellKeys; i++)
-        if (app::Held(s.keys[app::kPadInputs + 8 + i])) return int(i) + 1;
-    return 0;
 }
 
 // hle_input.c: the movement keys' pace (app::MoveMode)

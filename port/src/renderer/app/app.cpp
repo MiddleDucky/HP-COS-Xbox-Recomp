@@ -160,15 +160,6 @@ const Entry kEntries[] = {
     {"key_camera_down", nullptr, Kind::Key, FIELD(keys[21]), 0, 0, nullptr},
     {"key_camera_left", nullptr, Kind::Key, FIELD(keys[22]), 0, 0, nullptr},
     {"key_camera_right", nullptr, Kind::Key, FIELD(keys[23]), 0, 0, nullptr},
-    {"key_spell_flipendo", nullptr, Kind::Key, FIELD(keys[24]), 0, 0,
-     "spells cast straight from a key, without equipping them (only those learnt): Flipendo, Diffindo, Lumos, Incendio, Skurge, Avifors, Alohomora, Expelliarmus"},
-    {"key_spell_diffindo", nullptr, Kind::Key, FIELD(keys[25]), 0, 0, nullptr},
-    {"key_spell_lumos", nullptr, Kind::Key, FIELD(keys[26]), 0, 0, nullptr},
-    {"key_spell_incendio", nullptr, Kind::Key, FIELD(keys[27]), 0, 0, nullptr},
-    {"key_spell_skurge", nullptr, Kind::Key, FIELD(keys[28]), 0, 0, nullptr},
-    {"key_spell_avifors", nullptr, Kind::Key, FIELD(keys[29]), 0, 0, nullptr},
-    {"key_spell_alohomora", nullptr, Kind::Key, FIELD(keys[30]), 0, 0, nullptr},
-    {"key_spell_expelliarmus", nullptr, Kind::Key, FIELD(keys[31]), 0, 0, nullptr},
 };
 #undef FIELD
 
@@ -336,16 +327,6 @@ void Init(State& st) {
     if (st.ready) return;
     st.ready = true;
     bool had = ReadFile(st.file);
-    // xboxrecomp (2026-11-01): the number row casts spells now. A file from before keeps the D-pad on 1-4 (the old
-    // defaults) beside the new spell keys on 1-4: the D-pad's keys go, as the new defaults have it
-    bool migrated = false;
-    {
-        uint32_t* k = st.file.keys;
-        if (k[8] == '1' && k[9] == '2' && k[10] == '3' && k[11] == '4' && k[kPadInputs + 8] == '1') {
-            k[8] = k[9] = k[10] = k[11] = 0;
-            migrated = true;
-        }
-    }
     st.cur = st.file;
     for (size_t i = 0; i < std::size(kEntries); i++) {
         const Entry& e = kEntries[i];
@@ -363,7 +344,7 @@ void Init(State& st) {
     st.boot_aspect = st.cur.aspect;
     // the kernel answers the title's language query (XC_LANGUAGE) from this; read once, as the title starts
     SetEnvDefault("RECOMP_LANGUAGE", kLanguageNames[std::min(st.cur.language, kLanguages - 1)]);
-    if (!had || migrated) WriteFile(st.file);
+    if (!had) WriteFile(st.file);
     std::error_code ec;
     st.stamp = std::filesystem::last_write_time(FilePath(), ec);
     LOGI("settings: %s%s", FilePath().string().c_str(), had ? "" : " (new, defaults)");

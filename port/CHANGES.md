@@ -2,11 +2,16 @@
 
 ## v0.3.0 (2026-11-02), compared with v0.2.0
 
-### New
-- **Language** (launcher): the game starts in English (US or UK), French, German, Spanish or Italian, the languages the disc carries. The title screen shows in every language in 16:9, and "Quit To Desktop" follows the chosen language.
-- **Spell keys:** 1 to 8 cast Flipendo, Diffindo, Lumos, Incendio, Skurge, Avifors, Alohomora and Expelliarmus straight from the keyboard, without equipping them (only spells Harry has learnt). They can be rebound under F10 > Controls; the number row no longer works the D-pad by default.
-- **Button prompts** (F10 > Controls): the game's on-screen hints name your keys after you play with keyboard and mouse, and the pad's buttons after the controller (or always one or the other). The button picture in the corner still shows the pad's buttons.
+### Languages
+- **Language** (launcher): the game starts in English (US), English (UK), French, German, Spanish or Italian, each with its own text and speech from the disc. It always started in US English before. The game's Options menu can still change it for the session.
+- **The title screen in every language in 16:9.** Outside English the logo came apart and the menu's words were misplaced; it now shows whole in each language.
+- **"Quit To Desktop" follows the chosen language,** with the game's own Yes and No.
+
+### Graphics
 - **Per-pixel lighting** (F10 > Enhancements > Lighting, on by default): Lumos and the lamps light floors and walls smoothly instead of in patches shaped by the triangles' corners, softened to stay close to the console's look. Off looks exactly as on the console.
+
+### Controls
+- **Button prompts** (F10 > Controls): the game's on-screen hints name your keys after you play with keyboard and mouse, and the pad's buttons after the controller (or always one or the other). The button picture in the corner still shows the pad's buttons.
 
 ### Fixes
 - **No more crash shortly after starting on some Proton setups** (seconds into the movie after the WB logo). The crash came from the port's own diagnostics.
@@ -14,6 +19,7 @@
 
 ### Logs
 - **Crash reports name the faulting module and thread**, and a graphics pipeline the driver refuses is named in the log.
+- **The music is logged from load to playback** (the level's music file, the player, each request) along with the sound device's format, to track down silent music.
 - **`[FRAME]` lines say how far after its tick each frame went out,** to tell slow frames from uneven pacing.
 
 ## v0.2.0 (2026-10-30), compared with v0.1.0
