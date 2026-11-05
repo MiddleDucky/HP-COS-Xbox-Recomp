@@ -19,7 +19,7 @@ objdump=x86_64-w64-mingw32-objdump
 nm=x86_64-w64-mingw32-nm
 mkdir -p logs
 cmake -S . -B build-release "${cross[@]}" -DCMAKE_BUILD_TYPE=Release -DHPCOS_RELEASE=ON \
-      -DHPCOS_VERSION="${VERSION:-0.3.1}" > logs/build-release-config.log
+      -DHPCOS_VERSION="${VERSION:-0.3.2}" > logs/build-release-config.log
 nice -n 10 cmake --build build-release -j"$(nproc)" --target hpcos hpcos_launcher > logs/build-release.log 2>&1 ||
     { tail -30 logs/build-release.log; exit 1; }
 
@@ -35,7 +35,12 @@ cp -f CHANGES.md "$dist/CHANGES.txt"
 # source), and the MIT code built in: the renderer and Dear ImGui
 cp -f LICENSE "$dist/licenses/LICENSE.txt"
 cp -f NOTICE "$dist/licenses/NOTICE.txt"
-cp -f "$toolkit/LICENSE" "$dist/licenses/xboxrecomp-MIT.txt"
+# in the GitHub repository the top-level LICENSE is the port's; the toolkit's own is under LICENSES/
+if [ -f "$toolkit/LICENSES/xboxrecomp-MIT.txt" ]; then
+    cp -f "$toolkit/LICENSES/xboxrecomp-MIT.txt" "$dist/licenses/xboxrecomp-MIT.txt"
+else
+    cp -f "$toolkit/LICENSE" "$dist/licenses/xboxrecomp-MIT.txt"
+fi
 cp -f "$toolkit/NOTICE" "$dist/licenses/xboxrecomp-NOTICE.txt"
 cp -f "$toolkit/LICENSES/LGPL-2.1.txt" "$dist/licenses/LGPL-2.1.txt"
 cp -f src/renderer/LICENSE "$dist/licenses/renderer-MIT.txt"

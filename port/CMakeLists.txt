@@ -128,7 +128,7 @@ set(GAME_SOURCES
 # Properties > Details)
 # HPCOS_VERSION: the release's version (tools/package_release.sh passes VERSION), in Properties > Details as the file
 # and product version; the description is the product's name, the copyright the port's author
-set(HPCOS_VERSION "0.3.1" CACHE STRING "the release version, major.minor.patch")
+set(HPCOS_VERSION "0.3.2" CACHE STRING "the release version, major.minor.patch")
 string(REGEX MATCHALL "[0-9]+" hpcos_ver_parts "${HPCOS_VERSION}.0.0.0")
 list(GET hpcos_ver_parts 0 hpcos_v0)
 list(GET hpcos_ver_parts 1 hpcos_v1)
