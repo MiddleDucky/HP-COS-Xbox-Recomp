@@ -27,6 +27,7 @@
 
 #include "kernel.h"
 #include "guest_vmem.h"
+#include "guest_vad.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #ifdef _WIN32
@@ -41,6 +42,7 @@
  * but only as warnings, and this file is compiled with /W4 /WX-. */
 #include <stdlib.h>
 #include <float.h>
+#include <xmmintrin.h>
 /* Section B string helpers: wcslen helper, case folding.
  * ctype.h/wctype.h are not pulled in by the platform headers on either host. */
 #include <string.h>
@@ -52,7 +54,7 @@
  * here binds to the TLS template rather than the calling thread's copy, which
  * reads as every register being zero. */
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi, g_ebp;
 extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
 extern RECOMP_TLS uint32_t g_seh_ebp;
 extern ptrdiff_t g_xbox_mem_offset;
@@ -462,6 +464,15 @@ struct bridge_thread_start {
     uint32_t ctx1, ctx2, stack_top;
 };
 
+struct ob_managed { struct ob_managed *next; uint32_t body; char *name; };
+static struct ob_managed *g_ob_list;
+#define OB_HANDLE_TAG ((uintptr_t)0x7E0000000000ull)
+#define OB_REFS(b)    BRIDGE_MEM32((b) - 0x10)
+#define OB_HANDLES(b) BRIDGE_MEM32((b) - 0xC)
+#define OB_TYPE(b)    BRIDGE_MEM32((b) - 8)
+#define OB_FLAGS(b)   BRIDGE_MEM32((b) - 4)
+static struct ob_managed *ob_find_name(const char *name);
+static uint32_t ob_from_handle(uint32_t handle);
 static NTSTATUS bridge_write_handle(uint32_t handle_va, HANDLE h);
 
 static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
@@ -478,6 +489,123 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
 void guest_cpu_join(void);
 void guest_cpu_part(void);
 void xbox_PinToGuestCore(void);
+
+static void bridge_thread_mark_exit(uint32_t status);
+
+/* The console converts text as Latin-1 whatever the PC's language: a byte widens
+ * to the same number, a character above 0xFF becomes '?'. Same shape as the Win32
+ * calls: -1 counts the NUL, no output buffer returns the size. */
+static int l1_mb2wc(const char *s, int n, WCHAR *d, int max)
+{
+    int i;
+    if (n < 0) n = (int)strlen(s) + 1;
+    if (!max) return n;
+    if (n > max) n = max;
+    for (i = 0; i < n; i++) d[i] = (WCHAR)(unsigned char)s[i];
+    return n;
+}
+
+static int l1_wc2mb(const WCHAR *s, int n, char *d, int max)
+{
+    int i;
+    if (n < 0) {
+        for (n = 0; s[n]; n++) { }
+        n++;
+    }
+    if (!max) return n;
+    if (n > max) n = max;
+    for (i = 0; i < n; i++) d[i] = s[i] < 0x100 ? (char)s[i] : '?';
+    return n;
+}
+
+/* RtlUpperChar and RtlLowerChar's table, for bytes. */
+static int l1_upper(int c)
+{
+    c &= 0xFF;
+    if (c >= 'a' && c <= 'z') return c - 0x20;
+    if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return c - 0x20;
+    return c == 0xFF ? '?' : c;
+}
+
+static int l1_lower(int c)
+{
+    c &= 0xFF;
+    if (c >= 'A' && c <= 'Z') return c + 0x20;
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return c + 0x20;
+    return c;
+}
+void xbox_IsrLock(void);
+void xbox_IsrUnlock(void);
+static const char* bridge_get_xbox_path(uint32_t obj_attrs_va);
+static const WCHAR *bridge_object_name(uint32_t oa_va, WCHAR *buf, size_t chars);
+static NTSTATUS bridge_named_status(HANDLE h);
+
+/* The kernel turns interrupts off around these list and counter updates. */
+static volatile LONG s_ex_lock;
+static void ex_lock(void)
+{
+    while (InterlockedExchange(&s_ex_lock, 1)) SwitchToThread();
+}
+static void ex_unlock(void)
+{
+    InterlockedExchange(&s_ex_lock, 0);
+}
+static uint32_t s_thread_notify[8];     /* PsSetCreateThreadNotifyRoutine */
+static void bridge_thread_notify(HANDLE th, uint32_t create);
+static RECOMP_TLS uint32_t t_in_dpc;   /* KeIsExecutingDpc */
+KIRQL xbox_CurrentIrql(void);
+
+/* The host's own native call of the same name, where Win32 has no equal: these
+ * objects behave the same and the structures match. */
+static void *bridge_nt_fn(const char *name)
+{
+#ifdef _WIN32
+    return (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), name);
+#else
+    (void)name;
+    return NULL;
+#endif
+}
+
+recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
+static uint32_t bridge_nt_query(const char *name, uint32_t token, void *buf, ULONG len);
+
+/* Runs a user APC routine, VOID Routine(Context, Arg1, Arg2), on this thread:
+ * it is in an alertable wait, as on the console. */
+static void bridge_call_user_apc(uint32_t routine, uint32_t ctx, uint32_t a1, uint32_t a2)
+{
+    recomp_func_t fn = recomp_lookup(routine);
+    uint32_t esp = g_esp, eax = g_eax;
+    if (!fn) fn = recomp_lookup_manual(routine);
+    if (!fn) fn = recomp_lookup_kernel(routine);
+    if (!fn) {
+        fprintf(stderr, "  [KERNEL] user APC 0x%08X not in dispatch\n", routine);
+        return;
+    }
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = a2;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = a1;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    fn();
+    g_esp = esp;
+    g_eax = eax;
+}
+
+struct bridge_user_apc { uint32_t routine, ctx, a1, a2; int once; };
+
+static VOID WINAPI bridge_user_apc_host(ULONG_PTR p)
+{
+    struct bridge_user_apc *a = (struct bridge_user_apc *)p;
+    bridge_call_user_apc(a->routine, a->ctx, a->a1, a->a2);
+    free(a);
+}
+
+static VOID bridge_timer_apc_host(PVOID p, DWORD low, DWORD high)
+{
+    struct bridge_user_apc *a = (struct bridge_user_apc *)p;
+    bridge_call_user_apc(a->routine, a->ctx, low, high);
+    if (a->once) free(a);
+}
 
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
@@ -512,6 +640,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     fflush(stderr);
     /* The routine returned instead of calling PsTerminateSystemThread; the
      * stack is still ours to give back. */
+    bridge_thread_mark_exit(0);
     xbox_FreeThreadStack(g_thread_stack_top);
     g_thread_stack_top = 0;
     return 0;
@@ -526,7 +655,9 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+    /* Held until the caller has stored the handle, and for good if the title
+     * asked for a suspended thread: on the console it has not run by then. */
+    th = CreateThread(NULL, 0, bridge_thread_main, s, CREATE_SUSPENDED, NULL);
     if (!th) free(s);
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
@@ -627,7 +758,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                     return;
                 }
 
-                stack_top = xbox_AllocThreadStack();
+                stack_top = xbox_AllocThreadStackSized(STACK_ARG(2));
 
                 if (!stack_top) {
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
@@ -642,8 +773,16 @@ static void bridge_PsCreateSystemThreadEx(void)
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
                     fflush(stderr);
-                    if (xbox_handle_ptr && th) {
-                        bridge_write_handle(xbox_handle_ptr, th);
+                    if (!th) {
+                        g_eax = 0xC000009Au;   /* STATUS_INSUFFICIENT_RESOURCES */
+                        return;
+                    }
+                    {
+                        uint32_t id_va = STACK_ARG(4);
+                        if (id_va) BRIDGE_MEM32(id_va) = (uint32_t)GetThreadId(th);
+                        if (xbox_handle_ptr) bridge_write_handle(xbox_handle_ptr, th);
+                        bridge_thread_notify(th, 1);
+                        if (!(uint8_t)STACK_ARG(7)) ResumeThread(th);   /* CreateSuspended */
                     }
                 }
             }
@@ -663,6 +802,7 @@ static void bridge_PsCreateSystemThreadEx(void)
 
 /* Asynchronous-handle bookkeeping, defined with the file bridges below. */
 static void bridge_note_async_handle(uint32_t token);
+static int bridge_handle_is_async(uint32_t token);
 static void bridge_forget_async_handle(uint32_t token);
 static int  bridge_handle_is_async(uint32_t token);
 /* The file each open handle names, for [SLOWCALL]; defined with them. */
@@ -674,6 +814,7 @@ static void bridge_forget_file_name(uint32_t token);
  * referenced by tagged 32-bit tokens. */
 static NTSTATUS bridge_write_handle(uint32_t handle_va, HANDLE h);
 static HANDLE bridge_take_handle(uint32_t token);
+static void ob_close_handle(uint32_t body);
 
 static void bridge_NtClose(void)
 {
@@ -688,16 +829,23 @@ static void bridge_NtClose(void)
     bridge_forget_file_name(raw_handle);
 
     /* Fake handles the bridge gives out have nothing behind them. */
-    if (raw_handle == 0xDEAD0001u || raw_handle == 0xDECD0001u ||
+    if ((raw_handle >= 0xDEAE0000u && raw_handle < 0xDEAE0000u + 1024) ||
+        raw_handle == 0xDEAD0001u || raw_handle == 0xDECD0001u ||
         raw_handle == 0xBEEF0001u || raw_handle == 0xBEEF0002u ||
         raw_handle == 0xBEEF0010u) {
         g_eax = 0; /* STATUS_SUCCESS */
         return;
     }
     {
+        uint32_t ob_body = ob_from_handle(raw_handle);
         HANDLE h = bridge_take_handle(raw_handle);
         if (!h) {
             g_eax = 0xC0000008u; /* STATUS_INVALID_HANDLE, as the kernel's NtClose */
+            return;
+        }
+        if (ob_body) {
+            ob_close_handle(ob_body);
+            g_eax = 0;
             return;
         }
         if (h != INVALID_HANDLE_VALUE) {
@@ -844,6 +992,24 @@ static void bridge_MmFreeContiguousMemory(void)
     g_eax = 0;
 }
 
+/* RECOMP_VAD=1: reservations and commits tracked, as the console's checks (see
+ * guest_vad.h). The memory still comes from the heap, committed from the start. */
+static void bridge_vad_zero(uint32_t va, uint32_t bytes)
+{
+    memset(XBOX_TO_NATIVE(va), 0, bytes);
+}
+
+/* 0 when these arguments would pass the console's checks. */
+static uint32_t bridge_vad_check(uint32_t zero_bits, uint32_t type, uint32_t size, uint32_t base)
+{
+    if (zero_bits > 0x15u || (type & 0xFF67CFFFu) || !(type & 0x83000u) ||
+        ((type & 0x80000u) && type != 0x80000u))
+        return 0xC000000Du;
+    if (base > 0x7FFDFFFFu || 0x7FFE0000u - base < size || !size)
+        return 0xC000000Du;
+    return 0;
+}
+
 /* ── NtAllocateVirtualMemory (ordinal 184) ────────────────
  * NTSTATUS NtAllocateVirtualMemory(PVOID *BaseAddress, ULONG ZeroBits,
  *     PULONG AllocationSize, ULONG AllocationType, ULONG Protect)
@@ -890,6 +1056,21 @@ static void bridge_NtAllocateVirtualMemory(void)
                 BRIDGE_MEM32(size_ptr) = vm_size;
             }
             g_eax = vm_status;
+            return;
+        }
+    }
+
+    if (guest_vad_enabled()) {
+        guest_vad_init((uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram));
+        g_eax = bridge_vad_check(zero_bits, alloc_type, size, base_hint);
+        if (g_eax) return;
+        if (base_hint != 0 && (alloc_type & 0x2000) == 0) {   /* MEM_COMMIT alone */
+            uint32_t b = base_hint, s = size;
+            g_eax = guest_vad_commit(&b, &s, protect, bridge_vad_zero);
+            if (g_eax == 0) {
+                BRIDGE_MEM32(base_ptr) = b;
+                BRIDGE_MEM32(size_ptr) = s;
+            }
             return;
         }
     }
@@ -976,7 +1157,8 @@ static void bridge_NtAllocateVirtualMemory(void)
      * two. This clamp is enough for a title that reserves generously and
      * commits little, and it fails loudly and later rather than silently and
      * at startup if one does not. */
-    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    /* A reservation's base is 64 KB aligned on the console. */
+    uint32_t xbox_va = xbox_HeapAlloc(size, guest_vad_enabled() ? 65536 : 4096);
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         /* A pure reservation too big for the heap. Take it from the mapped
          * space above RAM, where it costs no heap and the pages are distinct.
@@ -1014,6 +1196,9 @@ static void bridge_NtAllocateVirtualMemory(void)
         g_eax = 0xC0000017u; /* STATUS_NO_MEMORY */
         return;
     }
+
+    if (guest_vad_enabled())
+        guest_vad_reserve(xbox_va, &size, protect, (alloc_type & 0x1000) != 0);
 
     /* Write back the allocated address and actual size */
     if (base_ptr) BRIDGE_MEM32(base_ptr) = xbox_va;
@@ -1065,8 +1250,8 @@ static void bridge_NtQueryVirtualMemory(void)
     uint32_t info_va = STACK_ARG(1);
     uint32_t page_base = base_va & ~0xFFFu;
 
-    if (!info_va) {
-        g_eax = 0xC000000Du;               /* STATUS_INVALID_PARAMETER */
+    if (!info_va || base_va > 0x7FFDFFFFu) {
+        g_eax = 0xC000000Du;               /* STATUS_INVALID_PARAMETER, past the title's range as the kernel */
         return;
     }
 
@@ -1088,6 +1273,16 @@ static void bridge_NtQueryVirtualMemory(void)
             g_eax = 0;
             return;
         }
+    }
+
+    if (guest_vad_enabled()) {
+        uint32_t vi[7], k;
+        guest_vad_init((uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram));
+        g_eax = guest_vad_query(base_va, vi);
+        if (g_eax == 0)
+            for (k = 0; k < 7; k++)
+                BRIDGE_MEM32(info_va + k * 4u) = vi[k];
+        return;
     }
 
     BRIDGE_MEM32(info_va + 0x00) = page_base;          /* BaseAddress */
@@ -1205,6 +1400,19 @@ static void bridge_NtFreeVirtualMemory(void)
      * VirtualFree, which fails, so none of it ever came back. Under
      * RECOMP_HEAP_RECLAIM a release returns the block to the heap and a
      * decommit zeroes the pages it names, since heap memory stays committed. */
+    if (guest_vad_enabled() && base_ptr && size_ptr) {
+        uint32_t b = BRIDGE_MEM32(base_ptr), s = BRIDGE_MEM32(size_ptr);
+        int released = 0;
+        g_eax = guest_vad_free(&b, &s, free_type, bridge_vad_zero, &released);
+        if (g_eax == 0) {
+            if (released && xbox_HeapReclaimEnabled())
+                xbox_HeapFree(b);
+            BRIDGE_MEM32(base_ptr) = b;
+            BRIDGE_MEM32(size_ptr) = s;
+        }
+        return;
+    }
+
     if (xbox_HeapReclaimEnabled() && base_ptr && size_ptr) {
         uint32_t vm_base = BRIDGE_MEM32(base_ptr);
         uint32_t left = xbox_HeapBlockSize(vm_base);
@@ -1265,6 +1473,10 @@ static void bridge_FscGetCacheSize(void)
 static void bridge_FscSetCacheSize(void)
 {
     uint32_t pages = STACK_ARG(0);
+    if (pages > 0x800) {
+        g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
+        return;
+    }
 
     /* The kernel rejects a request it cannot satisfy and leaves the current
      * size alone; the caller checks for a negative status. Nothing here can
@@ -1347,6 +1559,8 @@ static void bridge_ExQueryNonVolatileSetting(void)
  *
  * It never returns on hardware. Returning here would let the game run on past
  * a decision to quit, which reads as a hang rather than an exit. */
+static void bridge_run_shutdown_notifications(void);
+
 static void bridge_HalReturnToFirmware(void)
 {
     uint32_t routine = STACK_ARG(0);
@@ -1415,6 +1629,8 @@ static void bridge_HalReturnToFirmware(void)
      * RECOMP_ICALL_FEEDBACK is on. */
     RECOMP_ICALL_FEEDBACK_DUMP();
 
+    bridge_run_shutdown_notifications();
+
     /* Let a host-played FMV finish before the process goes away.
      *
      * The title is not the one presenting it, so it has no reason to wait --
@@ -1438,10 +1654,19 @@ static void bridge_HalReturnToFirmware(void)
     xbox_HalReturnToFirmware(routine);
 }
 
+/* The kernel's pool: over 0xFD8 bytes whole pages, page aligned; otherwise 32-byte units less an 8-byte header, and
+ * that is the size ExQueryPoolBlockSize reports. Small blocks stay 16 aligned here (the console's sit 8 past 32). */
+static uint32_t pool_alloc(uint32_t size)
+{
+    if (size > 0xFD8)
+        return xbox_HeapAlloc((size + 0xFFF) & ~0xFFFu, 4096);
+    return xbox_HeapAlloc(((size + 0x27) & ~31u) - 8, 16);
+}
+
 static void bridge_ExAllocatePool(void)
 {
     uint32_t size = STACK_ARG(0);
-    uint32_t xbox_va = xbox_HeapAlloc(size, 16);
+    uint32_t xbox_va = pool_alloc(size);
 
     if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] ExAllocatePool: size=%u → Xbox VA 0x%08X\n",
@@ -1456,7 +1681,7 @@ static void bridge_ExAllocatePoolWithTag(void)
 {
     uint32_t size = STACK_ARG(0);
     uint32_t tag = STACK_ARG(1);
-    uint32_t xbox_va = xbox_HeapAlloc(size, 16);
+    uint32_t xbox_va = pool_alloc(size);
 
     if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] ExAllocatePoolWithTag: size=%u tag='%c%c%c%c' → Xbox VA 0x%08X\n",
@@ -1491,9 +1716,40 @@ static void bridge_KeRaiseIrqlToDpcLevel(void)
 }
 
 /* ── RtlInitializeCriticalSection / Enter / Leave (ordinals 291, 277, 294) ─ */
+/* The host lock does the work; the guest's own fields are kept as the kernel keeps them, for a title that looks at
+ * them: +0x10 LockCount (-1 free, one more for each holder and waiter), +0x14 RecursionCount, +0x18 OwningThread. */
+static uint32_t bridge_thread_object(uint32_t token);
+static uint32_t cs_this_thread(void)
+{
+    static __thread uint32_t self;
+    if (!self) self = bridge_thread_object(0xFFFFFFFEu);
+    return self;
+}
+static void cs_entered(uint32_t cs_va)
+{
+    BRIDGE_MEM32(cs_va + 0x18) = cs_this_thread();
+    BRIDGE_MEM32(cs_va + 0x14) = BRIDGE_MEM32(cs_va + 0x14) + 1;
+}
+static void cs_leaving(uint32_t cs_va)
+{
+    uint32_t r = BRIDGE_MEM32(cs_va + 0x14) - 1;
+    BRIDGE_MEM32(cs_va + 0x14) = r;
+    if (r == 0) BRIDGE_MEM32(cs_va + 0x18) = 0;
+    InterlockedDecrement((volatile LONG *)XBOX_TO_NATIVE(cs_va + 0x10));
+}
+
 static void bridge_RtlInitializeCriticalSection(void)
 {
+    /* The kernel's fields: an event header, LockCount -1 (free), RecursionCount and OwningThread 0 */
     uint32_t cs_va = STACK_ARG(0);
+    BRIDGE_MEM8(cs_va) = 1;
+    BRIDGE_MEM8(cs_va + 2) = 4;
+    BRIDGE_MEM32(cs_va + 4) = 0;
+    BRIDGE_MEM32(cs_va + 8) = cs_va + 8;
+    BRIDGE_MEM32(cs_va + 0xC) = cs_va + 8;
+    BRIDGE_MEM32(cs_va + 0x10) = 0xFFFFFFFFu;
+    BRIDGE_MEM32(cs_va + 0x14) = 0;
+    BRIDGE_MEM32(cs_va + 0x18) = 0;
     xbox_RtlInitializeCriticalSection(XBOX_TO_NATIVE(cs_va));
     g_eax = 0;
 }
@@ -1501,30 +1757,39 @@ static void bridge_RtlInitializeCriticalSection(void)
 static void bridge_RtlEnterCriticalSection(void)
 {
     uint32_t cs_va = STACK_ARG(0);
+    InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(cs_va + 0x10));   /* waiters count too */
     xbox_RtlEnterCriticalSection(XBOX_TO_NATIVE(cs_va));
+    cs_entered(cs_va);
     g_eax = 0;
 }
 
 static void bridge_RtlLeaveCriticalSection(void)
 {
     uint32_t cs_va = STACK_ARG(0);
+    cs_leaving(cs_va);
     xbox_RtlLeaveCriticalSection(XBOX_TO_NATIVE(cs_va));
     g_eax = 0;
 }
 
 /* ── KeQueryPerformanceCounter / Frequency (ordinals 126, 127) ─ */
+#define XBOX_COUNTER_HZ 3375000u
+
 static void bridge_KeQueryPerformanceCounter(void)
 {
+    /* The console's counter runs at 3,375,000 Hz whatever the PC's does, and its
+     * 32-bit low part wraps every 21 minutes, not every 7 at 10 MHz. */
     LARGE_INTEGER li = xbox_KeQueryPerformanceCounter();
-    g_eax = (uint32_t)li.LowPart;
-    g_edx = (uint32_t)li.HighPart;
+    LARGE_INTEGER hz = xbox_KeQueryPerformanceFrequency();
+    uint64_t c = (uint64_t)li.QuadPart, f = (uint64_t)hz.QuadPart;
+    c = (c / f) * XBOX_COUNTER_HZ + (c % f) * XBOX_COUNTER_HZ / f;
+    g_eax = (uint32_t)c;
+    g_edx = (uint32_t)(c >> 32);
 }
 
 static void bridge_KeQueryPerformanceFrequency(void)
 {
-    LARGE_INTEGER li = xbox_KeQueryPerformanceFrequency();
-    g_eax = (uint32_t)li.LowPart;
-    g_edx = (uint32_t)li.HighPart;
+    g_eax = XBOX_COUNTER_HZ;
+    g_edx = 0;
 }
 
 /* ── KeQuerySystemTime (ordinal 128) ─────────────────────── */
@@ -1539,7 +1804,37 @@ static void bridge_KeQuerySystemTime(void)
 static void bridge_MmQueryStatistics(void)
 {
     uint32_t stats_ptr = STACK_ARG(0);
+    if (BRIDGE_MEM32(stats_ptr) != 0x24u) {   /* the caller says how long its record is */
+        g_eax = 0xC000000Du;
+        return;
+    }
     g_eax = (uint32_t)xbox_MmQueryStatistics(XBOX_TO_NATIVE(stats_ptr));
+}
+
+/* Named objects: the same name opens the same object, with
+ * STATUS_OBJECT_NAME_EXISTS, as on the console. The host keeps the names, under a
+ * prefix, with its separator out of the way. NULL when the object has no name. */
+static const WCHAR *bridge_object_name(uint32_t oa_va, WCHAR *buf, size_t chars)
+{
+    const char *name = oa_va ? bridge_get_xbox_path(oa_va) : NULL;
+    size_t i, n;
+    static const char prefix[] = "Local\\xbox_";
+    if (!name || !*name) return NULL;
+    n = strlen(prefix);
+    for (i = 0; i < n && i + 1 < chars; i++) buf[i] = (WCHAR)prefix[i];
+    for (; *name && i + 1 < chars; name++, i++)
+        buf[i] = *name == '\\' ? L'_' : (WCHAR)(unsigned char)*name;
+    buf[i] = 0;
+    return buf;
+}
+
+/* The status of a create that just ran. */
+static NTSTATUS bridge_named_status(HANDLE h)
+{
+    if (!h)
+        return GetLastError() == ERROR_INVALID_HANDLE ? (NTSTATUS)0xC0000024L   /* other type */
+                                                      : (NTSTATUS)0xC000009AL;
+    return GetLastError() == ERROR_ALREADY_EXISTS ? (NTSTATUS)0x40000000L : 0;
 }
 
 /* ── NtCreateEvent (ordinal 189) ─────────────────────────── */
@@ -1553,13 +1848,27 @@ static void bridge_NtCreateEvent(void)
     /* Use local HANDLE to avoid 8-byte write to 4-byte Xbox memory slot.
      * On x64, HANDLE is 8 bytes but Xbox expects 4-byte handles. */
     HANDLE local_handle = NULL;
-    NTSTATUS status = xbox_NtCreateEvent(
-        &local_handle,
-        XBOX_TO_NATIVE(obj_attr_ptr),
-        event_type, initial_state);
+    NTSTATUS status;
+    if (event_type > 1) {
+        g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    {
+        WCHAR name[256];
+        const WCHAR *named = bridge_object_name(obj_attr_ptr, name, 256);
+        if (named) {
+            local_handle = CreateEventW(NULL, event_type == 0, (BOOL)(initial_state & 0xFF), named);
+            status = bridge_named_status(local_handle);
+        } else {
+            status = xbox_NtCreateEvent(&local_handle, XBOX_TO_NATIVE(obj_attr_ptr),
+                                        event_type, initial_state);
+        }
+    }
 
-    if (handle_ptr && NT_SUCCESS(status))
-        status = bridge_write_handle(handle_ptr, local_handle);
+    if (handle_ptr && NT_SUCCESS(status)) {
+        NTSTATUS written = bridge_write_handle(handle_ptr, local_handle);
+        if (!NT_SUCCESS(written)) status = written;
+    }
 
     fprintf(stderr, "  [BRIDGE] NtCreateEvent: handle_ptr=0x%08X type=%u init=%u → status=0x%08X handle=0x%08X\n",
             handle_ptr, event_type, initial_state, (uint32_t)status,
@@ -1571,9 +1880,36 @@ static void bridge_NtCreateEvent(void)
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
+static uint32_t bridge_handle_status(HANDLE h, uint32_t st);
 static HANDLE ke_guest_event(uint32_t guest_va, int *type);
 
+/* A KEVENT of the synchronization kind: Type 1, Size 4 */
+/* An object a satisfied wait takes something from: a synchronization event or
+ * timer goes back to 0, a semaphore loses one. */
+static int ke_header_is_sync_event(uint32_t va)
+{
+    uint32_t hdr = BRIDGE_MEM32(va);
+    uint32_t type = hdr & 0xFFu, size = (hdr >> 16) & 0xFFu;
+    return (type == 1 && size == 4) || (type == 9 && size == 10) || (type == 5 && size == 5);
+}
+
+static void ke_wait_satisfied(uint32_t va)
+{
+    if (BRIDGE_MEM8(va) == 5)
+        InterlockedDecrement((volatile LONG *)&BRIDGE_MEM32(va + 4));
+    else
+        BRIDGE_MEM32(va + 4) = 0;
+}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
+/* The state an event had, for the previous-state results. Win32 has no read of
+ * it: a zero wait tells, and for an auto-reset event consumes the signal, so
+ * every caller here signals or pulses straight after. */
+static uint32_t bridge_event_state(HANDLE h)
+{
+    return WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+}
+
 static void bridge_KeSetEvent(void)
 {
     uint32_t guest_va = STACK_ARG(0);
@@ -1595,14 +1931,18 @@ static void bridge_KeSetEvent(void)
         }
     }
     h = ke_shadow_lookup(guest_va);
+    if (h)
+        BRIDGE_MEM32(guest_va + 4) = 1;   /* the object's own SignalState, as the kernel keeps it */
     if (!h)
         h = bridge_resolve_handle(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
-    if (h)
-        g_eax = (uint32_t)SetEvent(h);
-    else
+    if (h) {
+        g_eax = bridge_event_state(h);   /* previous state */
+        SetEvent(h);
+    } else {
         g_eax = 0;
+    }
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
@@ -1638,14 +1978,19 @@ static void bridge_KeWaitForSingleObject(void)
     }
 
     h = ke_shadow_lookup(object);
-    if (!h)
-        h = bridge_resolve_handle(object);
-    if (!h)
-        h = XBOX_TO_NATIVE(object);
+    {
+        int shadow_sync = h && ke_header_is_sync_event(object);
+        if (!h)
+            h = bridge_resolve_handle(object);
+        if (!h)
+            h = XBOX_TO_NATIVE(object);
 
-    g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-        h, wait_reason, wait_mode,
-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+            h, wait_reason, wait_mode,
+            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        if (g_eax == 0 && shadow_sync)   /* consumed, in the object's own SignalState too */
+            ke_wait_satisfied(object);
+    }
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -1671,7 +2016,7 @@ static void bridge_NtWaitForSingleObject(void)
 static void bridge_NtClearEvent(void)
 {
     HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
-    g_eax = (uint32_t)xbox_NtClearEvent(handle);
+    g_eax = bridge_handle_status(handle, (uint32_t)xbox_NtClearEvent(handle));
 }
 
 /* ── NtSetEvent (ordinal 225) ────────────────────────────── */
@@ -1683,7 +2028,10 @@ static void bridge_NtSetEvent(void)
 {
     HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
     uint32_t prev   = STACK_ARG(1);
-    g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
+    if (!handle) { g_eax = 0xC0000008u; return; }   /* STATUS_INVALID_HANDLE */
+    if (prev) BRIDGE_MEM32(prev) = bridge_event_state(handle);
+    prev = 0;                                       /* written above */
+    g_eax = bridge_handle_status(handle, (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev)));
 }
 
 /* NtSetEvent for host-side code (HLE replacements of XDK functions) that has
@@ -1701,8 +2049,10 @@ void xbox_GuestSetEvent(uint32_t handle)
 static void bridge_NtPulseEvent(void)
 {
     HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
-    if (handle) PulseEvent(handle);
-    g_eax = 0;
+    uint32_t prev = STACK_ARG(1);
+    if (!handle) { g_eax = 0xC0000008u; return; }   /* STATUS_INVALID_HANDLE */
+    if (prev) BRIDGE_MEM32(prev) = bridge_event_state(handle);
+    g_eax = PulseEvent(handle) ? 0 : bridge_handle_status(handle, 0xC0000008u);
 }
 
 /* ── NtWaitForSingleObjectEx (ordinal 234) ───────────────── */
@@ -1787,8 +2137,26 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
         g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
         return;
     }
-    for (i = 0; i < count; i++)
+    if (wait_type > 1) {
+        g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    for (i = 0; i < count; i++) {
         handles[i] = bridge_resolve_handle(BRIDGE_MEM32(handles_va + i * 4));
+        if (!handles[i]) {
+            g_eax = 0xC0000008u;         /* STATUS_INVALID_HANDLE */
+            return;
+        }
+    }
+    if (wait_type == 0) {                /* WaitAll takes an object only once */
+        uint32_t j;
+        for (i = 0; i < count; i++)
+            for (j = i + 1; j < count; j++)
+                if (handles[i] == handles[j]) {
+                    g_eax = 0xC0000030u; /* STATUS_INVALID_PARAMETER_MIX */
+                    return;
+                }
+    }
 
     {
         static int logged;
@@ -1889,12 +2257,26 @@ static void bridge_KeDelayExecutionThread(void)
  * failure surfaced later somewhere unrelated. Report the code and stop
  * pretending the call succeeded.
  */
+/* A console never returns from a bug check. RECOMP_BUGCHECK_STOP=1 does the same,
+ * for testing; by default the title carries on, with STATUS 0, so a port survives
+ * a check that may only reflect our own kernel. */
+static void bridge_bugcheck_end(uint32_t code)
+{
+    const char *e = getenv("RECOMP_BUGCHECK_STOP");
+    if (e && *e && *e != '0') {
+        fprintf(stderr, "[EXIT] bug check 0x%08X: RECOMP_BUGCHECK_STOP is set, stopping as a console does\n", code);
+        fflush(stderr);
+        ExitProcess(code);
+    }
+    g_eax = 0;
+}
+
 static void bridge_KeBugCheck(void)
 {
     fprintf(stderr, "  [KERNEL] *** KeBugCheck: code=0x%08X ***\n",
             STACK_ARG(0));
     fflush(stderr);
-    g_eax = 0;
+    bridge_bugcheck_end(STACK_ARG(0));
 }
 
 static void bridge_KeBugCheckEx(void)
@@ -1904,7 +2286,7 @@ static void bridge_KeBugCheckEx(void)
             STACK_ARG(0), STACK_ARG(1), STACK_ARG(2),
             STACK_ARG(3), STACK_ARG(4));
     fflush(stderr);
-    g_eax = 0;
+    bridge_bugcheck_end(STACK_ARG(0));
 }
 
 /* ── NtYieldExecution (ordinal 238) ──────────────────────── */
@@ -1926,13 +2308,16 @@ static void bridge_MmGetPhysicalAddress(void)
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
+static int mm_protect_ok(uint32_t p);
+
 static void bridge_MmSetAddressProtect(void)
 {
     uint32_t addr = STACK_ARG(0);
     uint32_t size = STACK_ARG(1);
     uint32_t prot = STACK_ARG(2);
 
-    xbox_MmSetAddressProtect(XBOX_TO_NATIVE(addr), size, prot);
+    if (mm_protect_ok(prot))   /* otherwise nothing, as the kernel */
+        xbox_MmSetAddressProtect(XBOX_TO_NATIVE(addr), size, prot);
     g_eax = 0;
 }
 
@@ -2021,6 +2406,8 @@ static void bridge_PsTerminateSystemThread(void)
         /* The normal exit for a worker, and therefore the one that has to
          * return the stack -- ExitThread never comes back to bridge_thread_main
          * to do it. */
+        bridge_thread_notify(NULL, 0);
+        bridge_thread_mark_exit(exit_status);
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
         ExitThread(exit_status);
@@ -2037,7 +2424,9 @@ static void bridge_HalReadSMCTrayState(void)
     uint32_t state_ptr = STACK_ARG(0);
     uint32_t count_ptr = STACK_ARG(1);
 
-    if (state_ptr) BRIDGE_MEM32(state_ptr) = 0x10;  /* No disc */
+    /* As the kernel, with the tray never moving: media present (0x60; 0x10 is an open tray), no changes counted. The
+     * count pointer holding 0x11223344 asks for a second counter, also 0 here. */
+    if (state_ptr) BRIDGE_MEM32(state_ptr) = 0x60;
     if (count_ptr) BRIDGE_MEM32(count_ptr) = 0;
     g_eax = 0;
 }
@@ -2140,7 +2529,9 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    xbox_IsrLock();
     fn();
+    xbox_IsrUnlock();
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2171,9 +2562,11 @@ static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
  * DPC runs on the next drain rather than immediately. Nothing here depends on
  * DPC ordering beyond "after the ISR".
  */
-#define XBOX_MAX_PENDING_DPC 64
+/* The console links a DPC through the object itself: no limit. This queue grows. */
+#define XBOX_FIRST_PENDING_DPC 64
 typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
-static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
+static PendingDpc *g_dpc_queue;
+static LONG g_dpc_cap;
 static volatile LONG g_dpc_head, g_dpc_tail;
 
 /* The queue is fed from several host threads at once -- the USB and APU
@@ -2219,8 +2612,23 @@ static void bridge_KeInsertQueueDpc(void)
         return;
     }
     tail = g_dpc_tail;
-    next = (tail + 1) % XBOX_MAX_PENDING_DPC;
-    if (next == g_dpc_head) {
+    next = g_dpc_cap ? (tail + 1) % g_dpc_cap : 0;
+    if (!g_dpc_cap || next == g_dpc_head) {
+        LONG cap = g_dpc_cap ? g_dpc_cap * 2 : XBOX_FIRST_PENDING_DPC, n = 0, i;
+        PendingDpc *q = (PendingDpc *)malloc((size_t)cap * sizeof(PendingDpc));
+        if (q) {
+            for (i = g_dpc_head; i != tail; i = (i + 1) % g_dpc_cap)
+                q[n++] = g_dpc_queue[i];
+            free(g_dpc_queue);
+            g_dpc_queue = q;
+            g_dpc_cap = cap;
+            g_dpc_head = 0;
+            tail = n;
+            g_dpc_tail = n;
+            next = n + 1;
+        }
+    }
+    if (!g_dpc_cap || next == g_dpc_head) {
         LeaveCriticalSection(&g_dpc_lock);
         fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
         fflush(stderr);
@@ -2247,7 +2655,7 @@ static void bridge_KeRemoveQueueDpc(void)
         return;
     dpc_lock();
     if (BRIDGE_MEM8(dpc + 2)) {
-        for (i = g_dpc_head; i != g_dpc_tail; i = (i + 1) % XBOX_MAX_PENDING_DPC)
+        for (i = g_dpc_head; i != g_dpc_tail; i = (i + 1) % g_dpc_cap)
             if (g_dpc_queue[i].dpc == dpc)
                 g_dpc_queue[i].dpc = 0;         /* drained as a no-op */
         BRIDGE_MEM8(dpc + 2) = 0;
@@ -2315,6 +2723,15 @@ static int kernel_raise_interrupt(uint32_t vector)
  */
 #define NV2A_VECTOR            3u
 
+/* A host routine run on every vblank from the timer thread (guest stack and TIB in place), for an HLE Direct3D that
+ * never connects the XDK's vblank ISR but owes the title its D3DDevice_SetVerticalBlankCallback calls. */
+static void (*g_vblank_hook)(void);
+
+void xbox_SetVblankHook(void (*fn)(void))
+{
+    g_vblank_hook = fn;
+}
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
@@ -2351,6 +2768,8 @@ static void kernel_vblank_tick(void)
     }
 
     xbox_Nv2aCountVblank();
+    if (g_vblank_hook)
+        g_vblank_hook();
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
@@ -2379,14 +2798,18 @@ static void kernel_drain_dpcs(void)
             break;
         }
         d = g_dpc_queue[g_dpc_head];
-        g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
+        g_dpc_head = (g_dpc_head + 1) % g_dpc_cap;
         /* Cleared before the routine runs, as the kernel does: the routine
          * may queue itself again. */
         if (d.dpc)
             BRIDGE_MEM8(d.dpc + 2) = 0;
         LeaveCriticalSection(&g_dpc_lock);
         if (d.dpc)
+        {
+            t_in_dpc = 1;
             kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+            t_in_dpc = 0;
+        }
     }
 }
 
@@ -2407,15 +2830,14 @@ static void bridge_KeInitializeDpc(void)
      * makes this memset write through NULL inside the bridge. The export
      * returns void, so refusing is doing nothing -- which is what the real
      * kernel does with an object it cannot write. */
-    if (!bridge_buf_ok(dpc_va, 32, "KeInitializeDpc")) {
+    if (!bridge_buf_ok(dpc_va, 28, "KeInitializeDpc")) {
         g_eax = 0;
         return;
     }
 
-    /* Zero the structure (32 bytes) */
-    memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
-
-    /* Set Type (0x13 = DpcObject) and fields */
+    /* As the kernel: only these fields. A KDPC is 0x1C bytes, and whatever the
+     * title keeps right after it isn't ours to clear. */
+    BRIDGE_MEM8(dpc_va + 2) = 0;       /* Inserted */
     BRIDGE_MEM16(dpc_va + 0) = 0x13;   /* Type */
     BRIDGE_MEM32(dpc_va + 12) = routine; /* DeferredRoutine */
     BRIDGE_MEM32(dpc_va + 16) = context; /* DeferredContext */
@@ -2444,11 +2866,16 @@ static void bridge_HalGetInterruptVector(void)
     uint32_t level   = STACK_ARG(0);
     uint32_t irql_va = STACK_ARG(1);
 
-    if (irql_va) {
-        /* IRQL is conventionally the vector for device interrupts. */
-        BRIDGE_MEM8(irql_va) = (uint8_t)level;
+    /* As the kernel: levels 0 to 0x1A are vectors 0x30 up, the IRQL falling as the vector rises; any other level is
+     * no vector, with the IRQL left alone. */
+    uint32_t vector = level + 0x30;
+    if (vector < 0x30 || vector > 0x4A) {
+        g_eax = 0;
+        return;
     }
-    g_eax = level;
+    if (irql_va)
+        BRIDGE_MEM8(irql_va) = (uint8_t)(0x4A - vector);
+    g_eax = vector;
 }
 
 /* VOID KeInitializeInterrupt(PKINTERRUPT, ServiceRoutine, ServiceContext,
@@ -2465,11 +2892,14 @@ static void bridge_KeInitializeInterrupt(void)
         return;
     }
 
-    /* Xbox KINTERRUPT is 44 bytes. */
-    memset(XBOX_TO_NATIVE(interrupt_va), 0, 44);
+    /* As the kernel: +0 routine, +4 context, +8 the level (vector less 0x30), +0xC IRQL, +0x10 connected, +0x12 mode.
+     * The dispatch code it copies to +0x18 has no use here, and nothing past its own fields is touched. */
     BRIDGE_MEM32(interrupt_va + 0)  = routine;
     BRIDGE_MEM32(interrupt_va + 4)  = context;
-    BRIDGE_MEM32(interrupt_va + 8)  = vector;
+    BRIDGE_MEM32(interrupt_va + 8)  = vector >= 0x30 ? vector - 0x30 : vector;
+    BRIDGE_MEM32(interrupt_va + 0xC) = STACK_ARG(4) & 0xFF;
+    BRIDGE_MEM8(interrupt_va + 0x10) = 0;
+    BRIDGE_MEM8(interrupt_va + 0x12) = (uint8_t)STACK_ARG(5);
     g_eax = 0;
 }
 
@@ -2492,9 +2922,14 @@ static void bridge_KeConnectInterrupt(void)
 {
     uint32_t interrupt_va = STACK_ARG(0);
 
+    if (interrupt_va && BRIDGE_MEM8(interrupt_va + 0x10)) {   /* already connected: FALSE, as the kernel */
+        g_eax = 0;
+        return;
+    }
     if (interrupt_va) {
         uint32_t vector = BRIDGE_MEM32(interrupt_va + 8);
         if (vector < XBOX_MAX_VECTORS) {
+            BRIDGE_MEM8(interrupt_va + 0x10) = 1;
             g_connected_isr[vector] = interrupt_va;
             fprintf(stderr, "  [KERNEL] KeConnectInterrupt: vector %u -> "
                             "routine 0x%08X context 0x%08X\n",
@@ -2542,9 +2977,52 @@ static void bridge_MmClaimGpuInstanceMemory(void)
 /* VOID HalRegisterShutdownNotification(PHAL_SHUTDOWN_REGISTRATION, BOOLEAN)
  * Records a callback for console shutdown. Nothing here ever shuts down that
  * way, so registration is accepted and dropped. */
+/* HalRegisterShutdownNotification(Registration, Register): the record is { Routine, Priority, ListEntry }, kept highest
+ * priority first and, among equals, in the order registered. The kernel calls each with the record as HalReturnToFirmware
+ * runs; here only with RECOMP_SHUTDOWN_NOTIFY=1, until tried in games, since a routine that waits would stop us exiting. */
+#define XBOX_SHUTDOWN_MAX 256
+static uint32_t g_shutdown_reg[XBOX_SHUTDOWN_MAX];
+static int g_shutdown_count;
+static SRWLOCK g_shutdown_lock = SRWLOCK_INIT;
+
 static void bridge_HalRegisterShutdownNotification(void)
 {
+    uint32_t reg = STACK_ARG(0), add = STACK_ARG(1) & 0xFF;
+    int i;
+    AcquireSRWLockExclusive(&g_shutdown_lock);
+    for (i = 0; i < g_shutdown_count && g_shutdown_reg[i] != reg; i++) {}
+    if (i < g_shutdown_count) {  /* already there: taken out, and put back below if asked */
+        memmove(&g_shutdown_reg[i], &g_shutdown_reg[i + 1], (g_shutdown_count - i - 1) * sizeof(uint32_t));
+        g_shutdown_count--;
+    }
+    if (add && g_shutdown_count < XBOX_SHUTDOWN_MAX) {
+        int32_t priority = (int32_t)BRIDGE_MEM32(reg + 4);
+        for (i = 0; i < g_shutdown_count && priority <= (int32_t)BRIDGE_MEM32(g_shutdown_reg[i] + 4); i++) {}
+        memmove(&g_shutdown_reg[i + 1], &g_shutdown_reg[i], (g_shutdown_count - i) * sizeof(uint32_t));
+        g_shutdown_reg[i] = reg;
+        g_shutdown_count++;
+    }
+    ReleaseSRWLockExclusive(&g_shutdown_lock);
     g_eax = 0;
+}
+
+static void bridge_run_shutdown_notifications(void)
+{
+    const char *e = getenv("RECOMP_SHUTDOWN_NOTIFY");
+    if (!e || *e != '1') return;
+    for (;;) {
+        uint32_t reg;
+        AcquireSRWLockExclusive(&g_shutdown_lock);
+        if (!g_shutdown_count) {
+            ReleaseSRWLockExclusive(&g_shutdown_lock);
+            return;
+        }
+        reg = g_shutdown_reg[0];
+        memmove(&g_shutdown_reg[0], &g_shutdown_reg[1], (g_shutdown_count - 1) * sizeof(uint32_t));
+        g_shutdown_count--;
+        ReleaseSRWLockExclusive(&g_shutdown_lock);
+        bridge_call_user_apc(BRIDGE_MEM32(reg), reg, 0, 0);
+    }
 }
 
 /* ── Kernel timers (ordinals 113, 149, 150, 97) ───────────
@@ -2573,7 +3051,7 @@ static void bridge_KeInitializeTimerEx(void)
 
     /* Dispatcher header. 0x08 = notification timer, 0x09 = synchronization. */
     BRIDGE_MEM8(timer_va + 0)  = (uint8_t)(0x08 + (type & 1));
-    BRIDGE_MEM8(timer_va + 2)  = 40;      /* Size */
+    BRIDGE_MEM8(timer_va + 2)  = 10;      /* Size, in dwords */
     BRIDGE_MEM8(timer_va + 3)  = 0;       /* Inserted */
     BRIDGE_MEM32(timer_va + 4) = 0;       /* SignalState */
     BRIDGE_MEM32(timer_va + 8) = 0;       /* WaitListHead */
@@ -2611,7 +3089,8 @@ static void bridge_KeInitializeTimerEx(void)
  * audio off a timer. A title that needs better wants the host's timer queue,
  * not a smaller sleep.
  */
-#define XBOX_MAX_TIMERS 32
+#define XBOX_TIMERS_PER_BLOCK 64
+#define XBOX_TIMER_BLOCKS 4096
 typedef struct {
     uint32_t  timer_va;     /* the guest KTIMER, 0 for a slot never used */
     uint32_t  dpc_va;
@@ -2626,7 +3105,27 @@ typedef struct {
     long long first_set_ms, last_set_ms, last_fire_ms;
     int       stall_told;   /* the watchdog line was written for this lull */
 } XboxTimer;
-static XboxTimer g_timers[XBOX_MAX_TIMERS];
+/* The console keeps a timer in the title's own KTIMER, so it has no limit. Ours
+ * are in blocks that never move or go away: the timer thread holds a row across
+ * its lock. Rows are reused once idle. */
+static XboxTimer *g_timer_blocks[XBOX_TIMER_BLOCKS];
+static volatile LONG g_timer_count;
+#define timer_at(i) (&g_timer_blocks[(i) / XBOX_TIMERS_PER_BLOCK][(i) % XBOX_TIMERS_PER_BLOCK])
+
+/* A new row, -1 out of memory. g_timer_lock held. */
+static int timer_add(void)
+{
+    int i = g_timer_count, b = i / XBOX_TIMERS_PER_BLOCK;
+    if (b >= XBOX_TIMER_BLOCKS)
+        return -1;
+    if (!g_timer_blocks[b]) {
+        g_timer_blocks[b] = (XboxTimer *)calloc(XBOX_TIMERS_PER_BLOCK, sizeof(XboxTimer));
+        if (!g_timer_blocks[b])
+            return -1;
+    }
+    g_timer_count = i + 1;
+    return i;
+}
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
@@ -2657,8 +3156,8 @@ static void timer_log_window(long long now)
     if (!last) last = now;
     if (now - last < 10000)
         return;
-    for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-        XboxTimer *t = &g_timers[i];
+    for (i = 0; i < g_timer_count; i++) {
+        XboxTimer *t = timer_at(i);
         if (!t->timer_va || (!t->sets && !t->fires))
             continue;
         if (!any++)
@@ -2675,8 +3174,8 @@ static void timer_watchdog(long long now)
 {
     int i;
 
-    for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-        XboxTimer *t = &g_timers[i];
+    for (i = 0; i < g_timer_count; i++) {
+        XboxTimer *t = timer_at(i);
         long long gap;
         if (!t->timer_va || t->armed || t->stall_told || t->total_sets < 20 || !t->last_fire_ms)
             continue;
@@ -2733,8 +3232,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
-        for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-            XboxTimer *t = &g_timers[i];
+        for (i = 0; i < g_timer_count; i++) {
+            XboxTimer *t = timer_at(i);
             uint32_t dpc, va;
             HANDLE ev;
 
@@ -2785,10 +3284,21 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
 {
-    long long delay_ms = (due_100ns < 0) ? (-due_100ns) / 10000 : 0;
+    /* Negative: relative. Otherwise absolute, in system time, as the console
+     * (a time already past fires at once). Rounded up: never early. */
+    long long delay_ms;
+    if (due_100ns < 0) {
+        delay_ms = (-due_100ns + 9999) / 10000;
+    } else {
+        LARGE_INTEGER now_time;
+        long long left;
+        xbox_KeQuerySystemTime(&now_time);   /* a clock the title set with NtSetSystemTime counts */
+        left = due_100ns - now_time.QuadPart;
+        delay_ms = left > 0 ? (left + 9999) / 10000 : 0;
+    }
     long long now;
     HANDLE ev = ke_shadow_lookup(timer_va);   /* outside the timer lock: it takes its own */
-    int i, slot = -1, unused = -1, idle = -1;
+    int i, slot = -1, idle = -1;
     uint32_t was_set = 0;
 
     if (!g_timer_started) {
@@ -2799,29 +3309,30 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
 
     EnterCriticalSection(&g_timer_lock);
     now = (long long)GetTickCount64();
-    for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-        if (g_timers[i].timer_va == timer_va) { slot = i; break; }
-        if (!g_timers[i].timer_va && unused < 0) unused = i;
-        if (g_timers[i].timer_va && !g_timers[i].armed && idle < 0) idle = i;
+    for (i = 0; i < g_timer_count; i++) {
+        if (timer_at(i)->timer_va == timer_va) { slot = i; break; }
+        if (!timer_at(i)->armed && idle < 0) idle = i;
     }
-    if (slot < 0) {   /* a timer not seen before: a never-used slot, else an idle one */
-        slot = unused >= 0 ? unused : idle;
+    if (slot < 0) {   /* a timer not seen before: a new row; an idle one only once there are many (timers on the
+                       * stack come and go), so that timers set in turn don't keep taking each other's rows */
+        slot = (idle >= 0 && g_timer_count >= XBOX_TIMERS_PER_BLOCK) ? idle : timer_add();
+        if (slot < 0) slot = idle;
         if (slot >= 0) {
-            memset(&g_timers[slot], 0, sizeof g_timers[slot]);
-            g_timers[slot].timer_va = timer_va;
-            g_timers[slot].first_set_ms = now;
+            memset(timer_at(slot), 0, sizeof(XboxTimer));
+            timer_at(slot)->timer_va = timer_va;
+            timer_at(slot)->first_set_ms = now;
             fprintf(stderr, "[TIMER] %lld ms: new timer %08X set by %08X: due in %lld ms, period %ld ms, dpc %08X%s\n",
                     now, timer_va, g_xbox_kernel_caller, delay_ms, period_ms, dpc_va,
                     ev ? "" : " (no event: KeInitializeTimerEx not seen)");
         } else {
             static int told;
             if (!told++)
-                fprintf(stderr, "[TIMER] %lld ms: the table is full (%d armed timers); timer %08X set by %08X "
-                        "will never fire\n", now, XBOX_MAX_TIMERS, timer_va, g_xbox_kernel_caller);
+                fprintf(stderr, "[TIMER] %lld ms: out of memory; timer %08X set by %08X will never fire\n",
+                        now, timer_va, g_xbox_kernel_caller);
         }
     }
     if (slot >= 0) {
-        XboxTimer *t = &g_timers[slot];
+        XboxTimer *t = timer_at(slot);
         was_set = (uint32_t)t->armed;
         /* A set timer starts unsignaled, like the real KeSetTimer: inside the
          * lock, so no firing can fall between this and the arming below. */
@@ -2866,10 +3377,10 @@ int xbox_kernel_cancel_timer(uint32_t timer_va)
     if (!g_timer_started)
         return 0;
     EnterCriticalSection(&g_timer_lock);
-    for (i = 0; i < XBOX_MAX_TIMERS; i++)
-        if (g_timers[i].timer_va == timer_va && g_timers[i].armed) {
-            g_timers[i].armed = 0;
-            g_timers[i].stall_told = 1;   /* cancelled on purpose: not a stall */
+    for (i = 0; i < g_timer_count; i++)
+        if (timer_at(i)->timer_va == timer_va && timer_at(i)->armed) {
+            timer_at(i)->armed = 0;
+            timer_at(i)->stall_told = 1;   /* cancelled on purpose: not a stall */
             was_set = 1;
         }
     LeaveCriticalSection(&g_timer_lock);
@@ -2888,7 +3399,9 @@ static void bridge_ExQueryPoolBlockSize(void)
      * answer. It used to return a literal 0 on the theory that this is only
      * ever used for stats -- which is a guess about the caller, and a title
      * that sizes a copy from it copies nothing. */
-    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
+    uint32_t s = xbox_HeapBlockSize(STACK_ARG(0));
+    if (s > 0xFD8) g_eax = (s + 0xFFF) & ~0xFFFu;
+    else g_eax = s ? ((s + 8) & ~31u) - 8 : 0;  /* the heap may have rounded to 16 */
 }
 
 /* ── RtlNtStatusToDosError (ordinal 301) ─────────────────
@@ -2898,47 +3411,7 @@ static void bridge_ExQueryPoolBlockSize(void)
  */
 static void bridge_RtlNtStatusToDosError(void)
 {
-    uint32_t status = STACK_ARG(0);
-
-    /* Simple mapping of common status codes */
-    switch (status) {
-    case 0x00000000: g_eax = 0; break;          /* STATUS_SUCCESS → ERROR_SUCCESS */
-    case 0xC0000034: g_eax = 2; break;          /* STATUS_OBJECT_NAME_NOT_FOUND → ERROR_FILE_NOT_FOUND */
-    case 0xC000003A: g_eax = 3; break;          /* STATUS_OBJECT_PATH_NOT_FOUND → ERROR_PATH_NOT_FOUND */
-    case 0xC0000022: g_eax = 5; break;          /* STATUS_ACCESS_DENIED → ERROR_ACCESS_DENIED */
-    case 0xC0000008: g_eax = 6; break;          /* STATUS_INVALID_HANDLE → ERROR_INVALID_HANDLE */
-    case 0xC0000017: g_eax = 8; break;          /* STATUS_NO_MEMORY → ERROR_NOT_ENOUGH_MEMORY */
-    case 0xC000000D: g_eax = 87; break;         /* STATUS_INVALID_PARAMETER → ERROR_INVALID_PARAMETER */
-    /* The informational and warning codes, which are not failures and must
-     * not fall through to the generic answer.
-     *
-     * 317 is ERROR_MR_MID_NOT_FOUND -- "there is no message text for this
-     * number" -- and as a default for a status nobody has mapped yet it is
-     * honest. As an answer to "is this request still in flight?" it is not:
-     * a caller comparing against ERROR_IO_PENDING gets "no" and takes the
-     * branch for a request that never started.
-     *
-     * Shin Megami Tensei: Nine does exactly that. Its resource loader issues
-     * a read, sees the call fail, asks for the error, and marks the object as
-     * loading only when the answer is ERROR_IO_PENDING. With 317 the object
-     * stayed idle, the poll that finishes the load returned "not started" on
-     * every frame, and the title sat in its first boot state forever with
-     * everything else working. */
-    case 0x00000103: g_eax = 997; break;        /* STATUS_PENDING → ERROR_IO_PENDING */
-    case 0x00000102: g_eax = 1460; break;       /* STATUS_TIMEOUT → ERROR_TIMEOUT */
-    case 0x00000104: g_eax = 0; break;          /* STATUS_REPARSE → ERROR_SUCCESS */
-    case 0x80000005: g_eax = 234; break;        /* STATUS_BUFFER_OVERFLOW → ERROR_MORE_DATA */
-    case 0x80000006: g_eax = 18; break;         /* STATUS_NO_MORE_FILES → ERROR_NO_MORE_FILES */
-    case 0xC0000011: g_eax = 38; break;         /* STATUS_END_OF_FILE → ERROR_HANDLE_EOF */
-    case 0xC0000023: g_eax = 122; break;        /* STATUS_BUFFER_TOO_SMALL → ERROR_INSUFFICIENT_BUFFER */
-    case 0xC0000035: g_eax = 183; break;        /* STATUS_OBJECT_NAME_COLLISION → ERROR_ALREADY_EXISTS */
-    case 0xC00000BB: g_eax = 50; break;         /* STATUS_NOT_SUPPORTED → ERROR_NOT_SUPPORTED */
-    /* The CRT heap-grow path retries at a new address only on
-     * ERROR_INVALID_ADDRESS; any other answer makes it give up. */
-    case 0xC0000018: g_eax = 487; break;        /* STATUS_CONFLICTING_ADDRESSES → ERROR_INVALID_ADDRESS */
-
-    default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
-    }
+    g_eax = xbox_RtlNtStatusToDosError((NTSTATUS)STACK_ARG(0));
 }
 
 /* ── File I/O bridge helpers ─────────────────────────────── */
@@ -3177,7 +3650,7 @@ static HANDLE bridge_resolve_handle(uint32_t token)
  * 50 ms music loops late (crackle in gameplay only). Each host thread gets a
  * small zeroed guest block (safe to dereference) mapped to its host HANDLE.
  */
-#define BRIDGE_THREAD_OBJ_MAX 64
+#define BRIDGE_THREAD_OBJ_MAX 4096
 static struct { DWORD tid; uint32_t obj; HANDLE h; } s_thread_objs[BRIDGE_THREAD_OBJ_MAX];
 static int s_thread_obj_count;
 
@@ -3217,12 +3690,49 @@ static uint32_t bridge_thread_object(uint32_t token)
         if (token == 0xFFFFFFFEu) own = h;  /* already our own copy */
         else DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &own,
                              0, FALSE, DUPLICATE_SAME_ACCESS);
+        {   /* It may have ended before anyone asked. */
+            DWORD code;
+            if (own && WaitForSingleObject(own, 0) == WAIT_OBJECT_0 && GetExitCodeThread(own, &code)) {
+                BRIDGE_MEM32(obj + 4) = 1;
+                BRIDGE_MEM32(obj + 0x120) = code;
+            }
+        }
         s_thread_objs[s_thread_obj_count].tid = tid;
         s_thread_objs[s_thread_obj_count].obj = obj;
         s_thread_objs[s_thread_obj_count].h = own;
         s_thread_obj_count++;
         return obj;
     }
+}
+
+/* The thread's end, where XAPI's GetExitCodeThread reads it: SignalState and
+ * ExitStatus (+0x120, as PsTerminateSystemThread stores it). */
+/* Routine(Thread, ThreadId, Create), for each that was registered. */
+static void bridge_thread_notify(HANDLE th, uint32_t create)
+{
+    uint32_t i, obj = 0;
+    for (i = 0; i < 8; i++)
+        if (s_thread_notify[i]) {
+            uint32_t tok;
+            if (!obj) {
+                tok = th ? bridge_handle_token(th) : 0xFFFFFFFEu;
+                obj = bridge_thread_object(tok);
+                if (th && tok) bridge_take_handle(tok);
+            }
+            bridge_call_user_apc(s_thread_notify[i], obj, (uint32_t)(th ? GetThreadId(th) : GetCurrentThreadId()), create);
+        }
+}
+
+static void bridge_thread_mark_exit(uint32_t status)
+{
+    DWORD tid = GetCurrentThreadId();
+    int i;
+    for (i = 0; i < s_thread_obj_count; i++)
+        if (s_thread_objs[i].tid == tid) {
+            BRIDGE_MEM32(s_thread_objs[i].obj + 0x120) = status;
+            BRIDGE_MEM32(s_thread_objs[i].obj + 4) = 1;
+            return;
+        }
 }
 
 static HANDLE bridge_thread_host(uint32_t obj, DWORD *tid)
@@ -3615,17 +4125,17 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
  *
  * NTSTATUS XeLoadSection(PXBE_SECTION_HEADER Section);
  *
- * On hardware a section marked non-preload is paged in from disc on demand,
- * and a title that keeps its video decoder in one -- Wreckless keeps WMVDEC
- * there -- calls this before touching it. Every section is already resident
- * here, so the work is the bookkeeping: hand back success and keep the
- * reference count the title can read.
+ * On hardware a section marked non-preload is read from disc on its first load, and the last
+ * unload frees it (0x80035FA5-0x8003628C). So a title sees fresh bytes each time, and two
+ * sections at one address can take turns. Sections stay resident here, nothing frees them, but
+ * the first load copies the XBE's bytes back so the title sees what it would.
  *
  * Done against guest memory rather than the PXBE_SECTION_HEADER struct: the
  * on-disc header is nine 32-bit fields and a digest, and the native struct
  * declares some of them as pointers, so on x64 its layout is not the 56 bytes
  * actually there.
  *
+ *   +0x04 address  +0x08 size  +0x0C file offset  +0x10 file size
  *   +0x14  section name address      +0x18  section reference count
  */
 #define XBE_SECTION_REFCOUNT_OFFSET 0x18
@@ -3640,10 +4150,19 @@ static void bridge_XeSection(int load)
         return;
     }
     count = BRIDGE_MEM32(section + XBE_SECTION_REFCOUNT_OFFSET);
-    if (load)
+    if (!load && !count) {            /* not loaded: the kernel refuses */
+        g_eax = 0xC000000Du;
+        return;
+    }
+    if (load) {
+        extern void xbox_section_reload(uint32_t va, uint32_t size, uint32_t raw_off, uint32_t raw_size);
+        if (!count)
+            xbox_section_reload(BRIDGE_MEM32(section + 4), BRIDGE_MEM32(section + 8),
+                                BRIDGE_MEM32(section + 0xC), BRIDGE_MEM32(section + 0x10));
         count++;
-    else if (count)
+    } else {
         count--;
+    }
     BRIDGE_MEM32(section + XBE_SECTION_REFCOUNT_OFFSET) = count;
 
     if (KERNEL_LOG_ON())
@@ -3678,7 +4197,7 @@ static void bridge_XeUnloadSection(void) { bridge_XeSection(0); }
 #define XBOX_SEH_END_OF_CHAIN 0xFFFFFFFFu
 #define XBOX_EXCEPTION_UNWINDING  0x02u
 #define XBOX_EXCEPTION_EXIT_UNWIND 0x04u
-#define XBOX_SEH_MAX_FRAMES 64
+#define XBOX_SEH_MAX_FRAMES 0x100000   /* the climbing check below ends a cycle */
 
 static void bridge_RtlUnwind(void)
 {
@@ -3706,7 +4225,10 @@ static void bridge_RtlUnwind(void)
 
         if (reg == XBOX_SEH_END_OF_CHAIN || reg == 0 || reg == target_frame)
             break;
-        if ((reg & 3u) || reg < XBOX_STACK_BASE || reg >= XBOX_STACK_TOP)
+        /* Worker stacks come from the heap, so any mapped address can be a frame:
+         * only the main thread's stack is in XBOX_STACK_BASE..TOP. */
+        if ((reg & 3u) || reg < 0x10000u ||
+            reg >= (g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram))
             break;                       /* not a stack frame: chain is broken */
         if (prev_reg && reg <= prev_reg)
             break;                       /* not climbing: cycle or corruption */
@@ -3765,7 +4287,7 @@ static void bridge_RtlUnwind(void)
  * A flat array because a title has a handful of files open at once and a
  * linear scan of sixty-four entries costs less than a hash would.
  */
-#define BRIDGE_ASYNC_MAX 64
+#define BRIDGE_ASYNC_MAX 4096
 static uint32_t g_async_handles[BRIDGE_ASYNC_MAX];
 
 static void bridge_note_async_handle(uint32_t token)
@@ -3974,6 +4496,19 @@ static void bridge_NtWriteFile(void)
     LARGE_INTEGER  off = {0};
     PLARGE_INTEGER poff = NULL;
 
+    /* As the kernel: an offset is only negative to mean the current position (-2) or the end of the file (-1), and a
+     * file not opened for synchronous I/O has no current position, so it must be given one. */
+    if (offset_va) {
+        LONG hi = (LONG)BRIDGE_MEM32(offset_va + 4);
+        uint32_t lo = BRIDGE_MEM32(offset_va);
+        if (hi < 0 && !(hi == -1 && (lo == 0xFFFFFFFFu || lo == 0xFFFFFFFEu))) {
+            g_eax = 0xC000000Du;
+            return;
+        }
+    } else if (handle && bridge_handle_is_async(STACK_ARG(0))) {
+        g_eax = 0xC000000Du;
+        return;
+    }
     memset(&ios, 0, sizeof(ios));
     if (!bridge_buf_ok(buffer_va, length, "NtWriteFile")) {
         bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
@@ -4006,10 +4541,23 @@ static void bridge_NtQueryInformationFile(void)
     uint32_t infoclass = STACK_ARG(4);
     XBOX_IO_STATUS_BLOCK ios;
 
-    memset(&ios, 0, sizeof(ios));
+        memset(&ios, 0, sizeof(ios));
+
+    if (infoclass >= 0x25) {
+        g_eax = 0xC0000003u;                 /* STATUS_INVALID_INFO_CLASS */
+        return;
+    }
     if (!bridge_buf_ok(info_va, length, "NtQueryInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    /* The I/O manager answers these itself. Our handles are synchronous, with
+     * byte alignment. */
+    if ((infoclass == 16 || infoclass == 17) && length >= 4) {
+        BRIDGE_MEM32(info_va) = infoclass == 16 ? 0x20u /* FILE_SYNCHRONOUS_IO_NONALERT */ : 0u;
+        bridge_write_iostatus(ios_va, 0, 4);
+        g_eax = 0;
         return;
     }
     g_eax = (uint32_t)xbox_NtQueryInformationFile(handle, &ios,
@@ -4031,10 +4579,39 @@ static void bridge_NtSetInformationFile(void)
     uint32_t infoclass = STACK_ARG(4);
     XBOX_IO_STATUS_BLOCK ios;
 
-    memset(&ios, 0, sizeof(ios));
+        memset(&ios, 0, sizeof(ios));
+
+    if (infoclass >= 0x25) {
+        g_eax = 0xC0000003u;                 /* STATUS_INVALID_INFO_CLASS */
+        return;
+    }
     if (!bridge_buf_ok(info_va, length, "NtSetInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    /* Rename: ReplaceIfExists +0, RootDirectory +4, FileName (Length, Max, Buffer) +8. */
+    if (infoclass == 10 && length >= 16) {
+        uint32_t nbytes = BRIDGE_MEM16(info_va + 8), buf = BRIDGE_MEM32(info_va + 12);
+        char path[512];
+        NTSTATUS st;
+        if (!buf || nbytes == 0 || nbytes >= sizeof path) {
+            g_eax = 0xC000000Du;
+            return;
+        }
+        memcpy(path, XBOX_TO_NATIVE(buf), nbytes);
+        path[nbytes] = 0;
+        st = xbox_RenameFile(handle, path, BRIDGE_MEM32(info_va + 4)
+                                 ? bridge_resolve_handle(BRIDGE_MEM32(info_va + 4)) : NULL,
+                             BRIDGE_MEM8(info_va) != 0);
+        bridge_write_iostatus(ios_va, st, 0);
+        g_eax = (uint32_t)st;
+        return;
+    }
+    /* Position, end of file and allocation can't be negative. */
+    if ((infoclass == 14 || infoclass == 19 || infoclass == 20) && length >= 8 &&
+        (int32_t)BRIDGE_MEM32(info_va + 4) < 0) {
+        g_eax = 0xC000000Du;                 /* STATUS_INVALID_PARAMETER */
         return;
     }
     g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
@@ -4055,7 +4632,17 @@ static void bridge_NtQueryVolumeInformationFile(void)
     uint32_t length    = STACK_ARG(3);
     uint32_t infoclass = STACK_ARG(4);
     XBOX_IO_STATUS_BLOCK ios;
+    /* The kernel's table of volume classes and their sizes; 0 is no such class */
+    static const uint8_t kFsClassSize[9] = {0, 24, 0, 24, 8, 16, 48, 32, 64};
 
+    if (infoclass >= 9 || !kFsClassSize[infoclass]) {
+        g_eax = 0xC0000003u;                 /* STATUS_INVALID_INFO_CLASS */
+        return;
+    }
+    if (length < kFsClassSize[infoclass]) {
+        g_eax = 0xC0000004u;                 /* STATUS_INFO_LENGTH_MISMATCH */
+        return;
+    }
     memset(&ios, 0, sizeof(ios));
     if (!bridge_buf_ok(info_va, length, "NtQueryVolumeInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
@@ -4092,6 +4679,7 @@ static void bridge_NtFlushBuffersFile(void)
     uint32_t ios_va = STACK_ARG(1);
     XBOX_IO_STATUS_BLOCK ios;
 
+    if (!handle) { g_eax = 0xC0000008u; return; }   /* as the kernel, no status block written */
     memset(&ios, 0, sizeof(ios));
     g_eax = (uint32_t)xbox_NtFlushBuffersFile(handle, &ios);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
@@ -4138,23 +4726,60 @@ static void bridge_NtQueryDirectoryFile(void)
 }
 
 /* ── NtOpenSymbolicLinkObject (ordinal 203, 2 args = 8 bytes) */
+#define BRIDGE_LINK_TOKEN 0xDEAE0000u
+#define BRIDGE_LINK_OPENS 1024
+static const char *g_link_opened[BRIDGE_LINK_OPENS];
+static LONG g_link_open_count;
+
 static void bridge_NtOpenSymbolicLinkObject(void)
 {
-    uint32_t handle_va = STACK_ARG(0);
-    /* arg1: POBJECT_ATTRIBUTES - ignored, we return a synthetic handle.
-     * Written raw (untagged) so NtClose recognises it and skips it. */
-    if (handle_va) BRIDGE_MEM32(handle_va) = 0xDEAD0001u;
-    g_eax = STATUS_SUCCESS;
+    /* A link the title created answers for itself, and \\??\\D: and \\??\\CdRom0: are the disc,
+     * as the kernel's own. Anything else does not exist: C0000034, as the object manager
+     * answers (0x8002626D). The disc's token is written raw (untagged) so NtClose recognises
+     * and skips it. */
+    extern const char *xbox_SymlinkTarget(const char *);
+    uint32_t handle_va = STACK_ARG(0), oa = STACK_ARG(1), token = 0;
+    uint32_t str = oa ? BRIDGE_MEM32(oa + 4) : 0;
+    char name[64] = "";
+    if (str) {
+        uint16_t n = BRIDGE_MEM16(str);
+        if (n < sizeof name && BRIDGE_MEM32(str + 4)) {
+            memcpy(name, XBOX_TO_NATIVE(BRIDGE_MEM32(str + 4)), n);
+            name[n] = 0;
+        }
+    }
+    {
+        const char *target = name[0] ? xbox_SymlinkTarget(name) : NULL;
+        if (target) {
+            LONG i = InterlockedIncrement(&g_link_open_count) - 1;
+            if (i < BRIDGE_LINK_OPENS) {
+                g_link_opened[i] = target;
+                token = BRIDGE_LINK_TOKEN + (uint32_t)i;
+            } else {
+                token = 0xDEAD0001u;
+            }
+        } else if (!_stricmp(name, "\\??\\D:") || !_stricmp(name, "\\??\\CdRom0:")) {
+            token = 0xDEAD0001u;
+        }
+    }
+    if (handle_va) BRIDGE_MEM32(handle_va) = token;
+    if (!token)
+        fprintf(stderr, "  [LINK] no link '%s' from 0x%08X\n", name, g_xbox_kernel_caller);
+    g_eax = token ? STATUS_SUCCESS : 0xC0000034u;
 }
 
 /* ── NtQuerySymbolicLinkObject (ordinal 215, 3 args = 12 bytes) */
 static void bridge_NtQuerySymbolicLinkObject(void)
 {
-    /* uint32_t handle = STACK_ARG(0); */
+    uint32_t handle = STACK_ARG(0);
     uint32_t target_va = STACK_ARG(1);
     uint32_t retlen_va = STACK_ARG(2);
     const char* target = "\\Device\\CdRom0";
-    USHORT len = (USHORT)strlen(target);
+    USHORT len;
+
+    if (handle >= BRIDGE_LINK_TOKEN && handle < BRIDGE_LINK_TOKEN + BRIDGE_LINK_OPENS)
+        target = g_link_opened[handle - BRIDGE_LINK_TOKEN];
+    len = (USHORT)strlen(target);
 
     if (retlen_va) BRIDGE_MEM32(retlen_va) = (uint32_t)len;
 
@@ -4179,21 +4804,15 @@ static void bridge_NtQuerySymbolicLinkObject(void)
         uint16_t max_len = BRIDGE_MEM16(target_va + 2);
         uint32_t buf_va  = BRIDGE_MEM32(target_va + 4);
 
-        if (!buf_va || len >= max_len) {
-            static unsigned warned;
-            if (warned++ < 4) {
-                fprintf(stderr,
-                        "  [KERNEL] NtQuerySymbolicLinkObject: buffer 0x%08X "
-                        "max=%u cannot hold %u bytes; returning "
-                        "STATUS_BUFFER_TOO_SMALL\n",
-                        buf_va, (unsigned)max_len, (unsigned)len + 1);
-                fflush(stderr);
-            }
-            g_eax = 0xC0000023u;         /* STATUS_BUFFER_TOO_SMALL */
+        /* As the kernel: what fits is copied, and too little room says so. No NUL: it is a counted string. */
+        uint16_t copy = len <= max_len ? len : max_len;
+        if (buf_va && copy) memcpy(XBOX_TO_NATIVE(buf_va), target, copy);
+        BRIDGE_MEM16(target_va) = copy;
+        if (buf_va && copy < max_len) BRIDGE_MEM8(buf_va + copy) = 0;   /* kept for code that has come to rely on one */
+        if (len > max_len) {
+            g_eax = 0xC0000023u;
             return;
         }
-        memcpy(XBOX_TO_NATIVE(buf_va), target, len + 1);
-        BRIDGE_MEM16(target_va) = len;
     }
     g_eax = STATUS_SUCCESS;
 }
@@ -4454,13 +5073,207 @@ static void bridge_ObReferenceObjectByHandle(void)
     uint32_t handle = STACK_ARG(0);
     uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
-    (void)obj_type;
+    {
+        uint32_t own = ob_from_handle(handle);   /* one the title created */
+        if (own) {
+            if (obj_type && OB_TYPE(own) != obj_type) {
+                if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+                g_eax = 0xC0000024u;
+                return;
+            }
+            InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(own - 0x10));
+            if (object_ptr) BRIDGE_MEM32(object_ptr) = own;
+            g_eax = 0;
+            return;
+        }
+    }
     /* Thread handles get a stand-in KTHREAD so XAPI SetThreadPriority's
      * KeSetBasePriorityThread reaches the right host thread. Everything else
      * keeps the old answer (object 0). */
-    uint32_t obj = bridge_thread_object(handle);
+uint32_t obj = bridge_thread_object(handle);
+    /* The console's two failures. A thread's own handle gets the stand-in; other
+     * valid handles keep object 0, there being no guest object behind them. */
+    if (!obj && handle != 0xFFFFFFFEu && handle < 0x48000000u && !bridge_handle_lookup(handle)) {
+        if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+        g_eax = 0xC0000008u;   /* STATUS_INVALID_HANDLE */
+        return;
+    }
+    if (!obj && handle < 0x48000000u && obj_type == XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE) {
+        if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+        g_eax = 0xC0000024u;   /* STATUS_OBJECT_TYPE_MISMATCH */
+        return;
+    }
     if (object_ptr) BRIDGE_MEM32(object_ptr) = obj;
     g_eax = 0;  /* STATUS_SUCCESS */
+}
+
+/* ── Exception dispatch, behind RECOMP_SEH=1 ──────────────
+ *
+ * RtlDispatchException as the kernel's (0x8002970A): the title's handlers are called
+ * newest first; one that says continue ends it, and a raise it never handled is bug
+ * check 0x1E (0x800221BC). Off by default, since a game has never been run with it.
+ *
+ * What this cannot do yet: a __except block or C++ catch is entered by a jump into the
+ * middle of the function that holds it, and generated C has no way in. The handler's
+ * `jmp` then finds no function. That needs the recompiler to emit landing points; see
+ * docs/technical/seh-handling.md. A filter that says "continue execution", and raises
+ * no handler takes, do work.
+ *
+ * Handlers run on the raising thread's guest stack, below a record and a context in the
+ * kernel's layout: +0 ContextFlags, +4 floating save (0x200), then Edi +0x204, Esi, Ebx,
+ * Edx, Ecx, Eax +0x218, Ebp, Eip +0x220, SegCs, EFlags, Esp +0x22C, SegSs.
+ */
+#define XBOX_CONTEXT_SIZE 0x234u
+#define XBOX_EXC_NONCONTINUABLE 0x01u
+#define XBOX_EXC_STACK_INVALID  0x08u
+#define XBOX_EXC_NESTED         0x10u
+
+/* The frame whose handler is running on this thread, and the chain as that dispatch
+ * found it: on a console a frame around each handler call answers "nested" (0x800288A8). */
+static RECOMP_TLS uint32_t s_seh_active, s_seh_outer_head;
+/* A handler that answers "continue" to a noncontinuable raise is raised at again, and
+ * again. A console runs out of stack and stops; here that would take the host down first. */
+#define XBOX_SEH_MAX_DEPTH 16
+static RECOMP_TLS int s_seh_depth;
+
+static int bridge_seh_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_SEH"); on = e && *e == '1'; }
+    return on;
+}
+
+static void bridge_raise_noncontinuable(uint32_t code, uint32_t inner);
+
+static int bridge_dispatch_exception(uint32_t record, uint32_t context)
+{
+    uint32_t reg = BRIDGE_MEM32(XBOX_FS_BASE), nested_end = 0;
+    uint32_t outer_active = s_seh_active, outer_head = s_seh_outer_head;
+    uint32_t map = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+    uint32_t head = reg;
+    int guard, handled = 0;
+
+    for (guard = 0; guard < XBOX_SEH_MAX_FRAMES; guard++) {
+        uint32_t handler, disp, slot;
+        recomp_func_t fn;
+
+        if (reg == XBOX_SEH_END_OF_CHAIN)
+            break;
+        if ((reg & 3u) || reg < 0x10000u || reg + 8 > map) {
+            BRIDGE_MEM32(record + 4) |= XBOX_EXC_STACK_INVALID;
+            break;
+        }
+        if (outer_active && reg == outer_head) {   /* reached what the outer dispatch saw */
+            BRIDGE_MEM32(record + 4) |= XBOX_EXC_NESTED;
+            nested_end = outer_active;
+        }
+        handler = BRIDGE_MEM32(reg + 4);
+        fn = recomp_lookup(handler);
+        if (!fn) fn = recomp_lookup_manual(handler);
+        if (!fn) fn = recomp_lookup_kernel(handler);
+        if (!fn) {
+            fprintf(stderr, "  [SEH] frame 0x%08X: no code at handler 0x%08X\n", reg, handler);
+            reg = BRIDGE_MEM32(reg);
+            continue;
+        }
+
+        /* handler(record, frame, context, &dispatcher context): cdecl */
+        slot = g_esp - 4;
+        BRIDGE_MEM32(slot) = 0;
+        g_esp = slot;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = slot;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = reg;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = record;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+        s_seh_active = reg;
+        s_seh_outer_head = head;
+        fn();
+        disp = g_eax;
+        s_seh_active = outer_active;
+        s_seh_outer_head = outer_head;
+        g_esp += 16;
+        g_esp += 4;
+
+        if (nested_end == reg) {
+            BRIDGE_MEM32(record + 4) &= ~XBOX_EXC_NESTED;
+            nested_end = 0;
+        }
+        if (disp == 0) {               /* continue execution */
+            if (BRIDGE_MEM32(record + 4) & XBOX_EXC_NONCONTINUABLE) {
+                bridge_raise_noncontinuable(0xC0000025u, record);
+                return 0;
+            }
+            handled = 1;
+            break;
+        } else if (disp == 2) {        /* nested */
+            BRIDGE_MEM32(record + 4) |= XBOX_EXC_NESTED;
+        } else if (disp != 1) {        /* not an answer */
+            bridge_raise_noncontinuable(0xC0000026u, record);
+            return 0;
+        }
+        reg = BRIDGE_MEM32(reg);
+    }
+    return handled;
+}
+
+/* RtlRaiseException (0x80029648): the title's registers in a context, then the handlers.
+ * Handled: on from where it was raised, with the registers a handler left. Not: bug check. */
+static void bridge_raise(uint32_t record)
+{
+    uint32_t saved_esp = g_esp, context;
+    uint32_t code = BRIDGE_MEM32(record), addr = BRIDGE_MEM32(saved_esp);
+
+    if (s_seh_depth >= XBOX_SEH_MAX_DEPTH) {
+        fprintf(stderr, "[SEH] 0x%08X at 0x%08X: raised %d deep, stopping\n", code, addr, s_seh_depth);
+        fflush(stderr);
+        bridge_bugcheck_end(0x1E);
+        return;
+    }
+    s_seh_depth++;
+    if (!BRIDGE_MEM32(record + 0xC))
+        BRIDGE_MEM32(record + 0xC) = addr;
+    fprintf(stderr, "[SEH] raise 0x%08X at 0x%08X flags 0x%X\n", code, addr, BRIDGE_MEM32(record + 4));
+
+    g_esp -= XBOX_CONTEXT_SIZE;
+    context = g_esp;
+    memset(XBOX_TO_NATIVE(context), 0, XBOX_CONTEXT_SIZE);
+    BRIDGE_MEM32(context) = 0x1002Bu;
+    BRIDGE_MEM32(context + 0x210) = g_edx;
+    BRIDGE_MEM32(context + 0x214) = g_ecx;
+    BRIDGE_MEM32(context + 0x218) = g_eax;
+    BRIDGE_MEM32(context + 0x21C) = g_seh_ebp;
+    BRIDGE_MEM32(context + 0x220) = addr;
+    BRIDGE_MEM32(context + 0x22C) = saved_esp;
+
+    if (bridge_dispatch_exception(record, context)) {
+        g_edx = BRIDGE_MEM32(context + 0x210);
+        g_ecx = BRIDGE_MEM32(context + 0x214);
+        g_eax = BRIDGE_MEM32(context + 0x218);
+        g_esp = saved_esp;
+        s_seh_depth--;
+        return;
+    }
+    g_esp = saved_esp;
+    s_seh_depth--;
+    fprintf(stderr, "[SEH] 0x%08X at 0x%08X was not handled\n", code, addr);
+    fflush(stderr);
+    bridge_bugcheck_end(0x1E);   /* KMODE_EXCEPTION_NOT_HANDLED */
+}
+
+/* A record of its own, for what the kernel raises: ExRaiseStatus and the misuse checks */
+static void bridge_raise_noncontinuable(uint32_t code, uint32_t inner)
+{
+    uint32_t saved_esp = g_esp, record;
+    g_esp -= 0x50;
+    record = g_esp;
+    memset(XBOX_TO_NATIVE(record), 0, 0x50);
+    BRIDGE_MEM32(record) = code;
+    BRIDGE_MEM32(record + 4) = XBOX_EXC_NONCONTINUABLE;
+    BRIDGE_MEM32(record + 8) = inner;
+    BRIDGE_MEM32(record + 0xC) = BRIDGE_MEM32(saved_esp);
+    bridge_raise(record);
+    g_esp = saved_esp;
 }
 
 /* ── RtlRaiseException (ordinal 302) ─────────────────────
@@ -4476,6 +5289,10 @@ static void bridge_RtlRaiseException(void)
     uint32_t code = record_ptr ? BRIDGE_MEM32(record_ptr) : 0;
 
     static int raise_count = 0;
+    if (record_ptr && bridge_seh_enabled()) {
+        bridge_raise(record_ptr);
+        return;
+    }
     raise_count++;
     if (raise_count <= 10) {
         fprintf(stderr, "  [KERNEL] RtlRaiseException: record=0x%08X code=0x%08X (#%d)\n",
@@ -4506,12 +5323,44 @@ static void bridge_RtlRaiseException(void)
  * Maps physical I/O memory (GPU registers, etc.) into virtual address space.
  * Allocate from Xbox heap so the returned pointer is a valid Xbox VA.
  */
+/* The kernel's check of an Mm* protection: read-only or read-write, optionally one of no-cache or write-combine */
+static int mm_protect_ok(uint32_t p)
+{
+    return !(p & ~0x606u) && ((p & 6) == 2 || (p & 6) == 4) && (p & 0x600) != 0x600;
+}
+
+/* And of an Nt* one (NtProtectVirtualMemory). One of the access values, in the low nibble or the high, with
+ * optionally PAGE_GUARD (0x100), no-cache (0x200) or write-combine (0x400), but no guard on PAGE_NOACCESS */
+static int nt_protect_ok(uint32_t p)
+{
+    uint32_t lo = p & 0xF, hi = (p >> 4) & 0xF;
+    static const signed char kAccess[16] = {-1, 0, 0, -1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};  /* the kernel's */
+    if (p & ~0x7FFu) return 0;
+    if ((p & 1) && (p & 0x700)) return 0;
+    if ((p & 0x200) && (p & 0x400)) return 0;
+    if ((lo == 0) == (hi == 0)) return 0;
+    return kAccess[lo | hi] != -1;
+}
+
 static void bridge_MmMapIoSpace(void)
 {
     uint32_t phys_addr = STACK_ARG(0);
     uint32_t num_bytes = STACK_ARG(1);
     uint32_t protect = STACK_ARG(2);
-    uint32_t xbox_va = xbox_HeapAlloc(num_bytes, 4096);
+    uint32_t offset = phys_addr & 0xFFF, xbox_va;
+
+    if (!mm_protect_ok(protect)) {   /* refused, as the kernel */
+        g_eax = 0;
+        return;
+    }
+    /* Uncached device space is its own address on a console, and here where the device models answer */
+    if (protect == 0x204 && phys_addr >= 0xFD000000u && phys_addr + num_bytes - 1 <= 0xFFBFFFFFu) {
+        g_eax = phys_addr;
+        return;
+    }
+    /* Otherwise pages of their own, with the offset into the page kept */
+    xbox_va = xbox_HeapAlloc((offset + num_bytes + 0xFFF) & ~0xFFFu, 4096);
+    if (xbox_va) xbox_va += offset;
 
     fprintf(stderr, "  [KERNEL] MmMapIoSpace: phys=0x%08X size=%u → Xbox VA 0x%08X\n",
             phys_addr, num_bytes, xbox_va);
@@ -4609,39 +5458,7 @@ static void bridge_ExFreePool(void)
  * title actually reads are filled; the rest is zero, which is what a freshly
  * created device object holds anyway.
  */
-#define XBOX_DEVICE_OBJECT_SIZE 0x38u
 
-static void bridge_IoCreateDevice(void)
-{
-    uint32_t extension_size = STACK_ARG(1);
-    uint32_t device_type    = STACK_ARG(3);
-    uint32_t out_va         = STACK_ARG(5);
-    uint32_t object_va;
-
-    if (!out_va) {
-        g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
-        return;
-    }
-
-    object_va = xbox_HeapAlloc(XBOX_DEVICE_OBJECT_SIZE + extension_size, 16);
-    if (!object_va) {
-        g_eax = 0xC000009Au;   /* STATUS_INSUFFICIENT_RESOURCES */
-        return;
-    }
-
-    memset(XBOX_TO_NATIVE(object_va), 0,
-           XBOX_DEVICE_OBJECT_SIZE + extension_size);
-    BRIDGE_MEM16(object_va + 0x02) = (uint16_t)XBOX_DEVICE_OBJECT_SIZE;
-    BRIDGE_MEM32(object_va + 0x04) = 1;                 /* ReferenceCount   */
-    BRIDGE_MEM32(object_va + 0x08) = STACK_ARG(0);      /* DriverObject     */
-    BRIDGE_MEM32(object_va + 0x18) =                    /* DeviceExtension  */
-        extension_size ? object_va + XBOX_DEVICE_OBJECT_SIZE : 0;
-    BRIDGE_MEM8(object_va + 0x1C)  = (uint8_t)device_type;
-    BRIDGE_MEM8(object_va + 0x1D)  = 1;                 /* StackSize        */
-
-    BRIDGE_MEM32(out_va) = object_va;
-    g_eax = 0;                                          /* STATUS_SUCCESS   */
-}
 
 /* ── KeCancelTimer (ordinal 97, 1 arg)
  * BOOLEAN KeCancelTimer(PKTIMER Timer) -- returns whether it was set. */
@@ -4657,26 +5474,59 @@ static void bridge_KeCancelTimer(void)
 /* ── KeDisconnectInterrupt (ordinal 100, 1 arg) */
 static void bridge_KeDisconnectInterrupt(void)
 {
-    g_eax = (uint32_t)xbox_KeDisconnectInterrupt(
-        (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(STACK_ARG(0)));
+    /* Whether it was connected */
+    uint32_t i = STACK_ARG(0), vector = BRIDGE_MEM32(i + 8);
+    g_eax = BRIDGE_MEM8(i + 0x10);
+    if (g_eax) {
+        if (vector < XBOX_MAX_VECTORS && g_connected_isr[vector] == i)
+            g_connected_isr[vector] = 0;
+        BRIDGE_MEM8(i + 0x10) = 0;
+    }
 }
 
 /* ── KeSetBasePriorityThread (ordinal 143, 2 args) */
 /* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
  * existed in kernel_thread.c all along; only the bridge wrapper was
  * missing, so the thunk fell through to the fallback and returned 0. */
+static int kthread_increment(uint32_t t);
+
 static void bridge_KeQueryBasePriorityThread(void)
 {
+    if (bridge_thread_host(STACK_ARG(0), NULL)) {
+        g_eax = (uint32_t)kthread_increment(STACK_ARG(0));
+        return;
+    }
     g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
         XBOX_TO_NATIVE(STACK_ARG(0)));
+}
+
+/* The stand-in KTHREAD keeps what the kernel keeps there, for the results below: +0x31 saturation, +0x32 priority,
+ * +0x70 base priority, +0x73 boost disabled. Host priorities stay as bridge_apply_priority sets them. The block starts
+ * zeroed, so 0 means a thread nothing has set yet: normal, 8. */
+#define KTHREAD_BASE(t)       (BRIDGE_MEM8((t) + 0x70) ? (int)(int8_t)BRIDGE_MEM8((t) + 0x70) : 8)
+#define KTHREAD_PRIORITY(t)   (BRIDGE_MEM8((t) + 0x32) ? (int)(int8_t)BRIDGE_MEM8((t) + 0x32) : 8)
+
+static int kthread_increment(uint32_t t)
+{
+    int sat = (int)(int8_t)BRIDGE_MEM8(t + 0x31);
+    return sat ? sat * 16 : KTHREAD_BASE(t) - 8;
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
     uint32_t obj = STACK_ARG(0);
     if (bridge_thread_host(obj, NULL)) {
-        bridge_apply_priority("KeSetBasePriorityThread", obj, (LONG)STACK_ARG(1));
-        g_eax = 0;   /* previous increment */
+        /* As the kernel: the old increment comes back. 16 or more either way saturates, and the base stays in the
+         * normal range, 1 to 15. */
+        LONG inc = (LONG)STACK_ARG(1);
+        int base = 8 + inc, old = kthread_increment(obj);
+        BRIDGE_MEM8(obj + 0x31) = (uint8_t)(inc >= 16 ? 1 : inc <= -16 ? -1 : 0);
+        if (base >= 16) base = 15;
+        if (base <= 0) base = 1;
+        BRIDGE_MEM8(obj + 0x70) = (uint8_t)base;
+        BRIDGE_MEM8(obj + 0x32) = (uint8_t)(inc >= 16 ? 15 : base);
+        bridge_apply_priority("KeSetBasePriorityThread", obj, inc);
+        g_eax = (uint32_t)old;
         return;
     }
     g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
@@ -4725,9 +5575,20 @@ static void bridge_NtCreateMutant(void)
     NTSTATUS st;
 
     bridge_build_oa(STACK_ARG(1), &oa, &name);
-    st = xbox_NtCreateMutant(&h, STACK_ARG(1) ? &oa : NULL,
-                             (BOOLEAN)STACK_ARG(2));
-    if (st >= 0 && handle_va) st = bridge_write_handle(handle_va, h);
+    {
+        WCHAR wname[256];
+        const WCHAR *named = bridge_object_name(STACK_ARG(1), wname, 256);
+        if (named) {
+            h = CreateMutexW(NULL, (BOOL)(uint8_t)STACK_ARG(2), named);
+            st = bridge_named_status(h);
+        } else {
+            st = xbox_NtCreateMutant(&h, STACK_ARG(1) ? &oa : NULL, (BOOLEAN)STACK_ARG(2));
+        }
+    }
+    if (st >= 0 && handle_va) {
+        NTSTATUS written = bridge_write_handle(handle_va, h);
+        if (!NT_SUCCESS(written)) st = written;
+    }
     g_eax = (uint32_t)st;
 }
 
@@ -4751,11 +5612,15 @@ static void bridge_NtCreateMutant(void)
  */
 static void bridge_NtReleaseMutant(void)
 {
+    /* The previous count, as the kernel: 1 free, 0 held once, less for each further hold. Ours asks before releasing,
+     * while this thread holds it, so it cannot change. */
     uint32_t count_va = STACK_ARG(1);
+    struct { LONG count; BOOLEAN owned, abandoned; } info = {0, 0, 0};
+    if (count_va) bridge_nt_query("NtQueryMutant", STACK_ARG(0), &info, sizeof info);
 
-    g_eax = (uint32_t)xbox_NtReleaseMutant(
-        bridge_resolve_handle(STACK_ARG(0)),
-        count_va ? (PLONG)XBOX_TO_NATIVE(count_va) : NULL);
+    g_eax = bridge_handle_status(bridge_resolve_handle(STACK_ARG(0)),
+                                 (uint32_t)xbox_NtReleaseMutant(bridge_resolve_handle(STACK_ARG(0)), NULL));
+    if (count_va && g_eax == 0) BRIDGE_MEM32(count_va) = (uint32_t)info.count;
 }
 
 /* -- NtSuspendThread (ordinal 231, 2 args) --------------------------------
@@ -4789,11 +5654,6 @@ static void bridge_NtResumeThread(void)
  * Not STACK_ARG(0). Xbox uses __fastcall here, so the argument never reaches
  * the stack and the arg-size entry is 0. Reading it off the stack would
  * dereference whatever the caller happened to leave there. */
-static void bridge_ObfDereferenceObject(void)
-{
-    xbox_ObfDereferenceObject(XBOX_TO_NATIVE(g_ecx));
-    g_eax = 0;
-}
 
 /* ══════════════════════════════════════════════════════════════════════════
  * More wrappers for xbox_* implementations that had no route. Same rule as
@@ -4807,11 +5667,6 @@ static void bridge_ObfDereferenceObject(void)
  * Mirror of 250. Xbox uses __fastcall here too, so the argument never reaches
  * the stack and the arg-size entry is 0; reading it off the stack would
  * dereference whatever the caller happened to leave there. */
-static void bridge_ObfReferenceObject(void)
-{
-    xbox_ObfReferenceObject(XBOX_TO_NATIVE(g_ecx));
-    g_eax = 0;
-}
 
 /* ── HalReadSMBusValue / HalWriteSMBusValue (ordinals 45 / 50, 4 args)
  *
@@ -4856,13 +5711,13 @@ static void bridge_HalReadWritePCISpace(void)
  * both xbox_* versions are documented no-ops. */
 static void bridge_HalRequestSoftwareInterrupt(void)
 {
-    xbox_HalRequestSoftwareInterrupt((KIRQL)STACK_ARG(0));
+    xbox_HalRequestSoftwareInterrupt((KIRQL)g_ecx);   /* fastcall, in CL */
     g_eax = 0;
 }
 
 static void bridge_HalClearSoftwareInterrupt(void)
 {
-    xbox_HalClearSoftwareInterrupt((KIRQL)STACK_ARG(0));
+    xbox_HalClearSoftwareInterrupt((KIRQL)g_ecx);   /* fastcall, in CL */
     g_eax = 0;
 }
 
@@ -4887,7 +5742,8 @@ static void bridge_ExSaveNonVolatileSetting(void)
  * matches against the block table and takes the raw 32-bit guest VA. */
 static void bridge_MmUnmapIoSpace(void)
 {
-    xbox_HeapFree(STACK_ARG(0));
+    if (STACK_ARG(0) < 0xFD000000u)   /* device space was never allocated */
+        xbox_HeapFree(STACK_ARG(0) & ~0xFFFu);
     g_eax = 0;
 }
 
@@ -4897,11 +5753,6 @@ static void bridge_MmUnmapIoSpace(void)
  * device object on the guest heap, so deletion has to answer there too --
  * HeapFree (what xbox_IoDeleteDevice calls) would free a pointer that heap
  * never saw. */
-static void bridge_IoDeleteDevice(void)
-{
-    xbox_HeapFree(STACK_ARG(0));
-    g_eax = 0;
-}
 
 /* ── KeQueryInterruptTime (ordinal 125, void)
  * Returns a 64-bit tick count; the caller reads it as edx:eax, so the high
@@ -4922,14 +5773,32 @@ static void bridge_KeQueryInterruptTime(void)
  * address. */
 static void bridge_KeSaveFloatingPointState(void)
 {
-    g_eax = (uint32_t)xbox_KeSaveFloatingPointState(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    /* As the kernel: the record is marked valid and the SSE control word kept, and the section runs with the default
+     * one. x87 control is not touched: recompiled x87 code does not use the host's. +0 flags (4 valid), +1 IRQL,
+     * +8 x87 control, +0xC MXCSR, +0x14 thread. */
+    uint32_t state = STACK_ARG(0);
+    BRIDGE_MEM8(state) = 4;
+    BRIDGE_MEM8(state + 1) = (uint8_t)xbox_CurrentIrql();
+    BRIDGE_MEM8(state + 2) = 0;
+    BRIDGE_MEM16(state + 8) = 0x27F;
+    BRIDGE_MEM32(state + 0xC) = _mm_getcsr();
+    BRIDGE_MEM32(state + 0x10) = 0;
+    BRIDGE_MEM32(state + 0x14) = bridge_thread_object(0xFFFFFFFEu);
+    _mm_setcsr(0x1F80);
+    g_eax = 0;
 }
 
 static void bridge_KeRestoreFloatingPointState(void)
 {
-    g_eax = (uint32_t)xbox_KeRestoreFloatingPointState(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    uint32_t state = STACK_ARG(0);
+    if ((BRIDGE_MEM8(state) & 0xFC) != 4) {
+        fprintf(stderr, "  [KERNEL] KeRestoreFloatingPointState: 0x%08X not saved (bug check 0xE7 on a console)\n", state);
+        bridge_bugcheck_end(0xE7);
+        return;
+    }
+    _mm_setcsr(BRIDGE_MEM32(state + 0xC));
+    BRIDGE_MEM8(state) = 0;
+    g_eax = 0;
 }
 
 /* ── NtCreateSemaphore (ordinal 193, 4 args)
@@ -4943,11 +5812,25 @@ static void bridge_NtCreateSemaphore(void)
     HANDLE h = NULL;
     NTSTATUS st;
 
-    st = xbox_NtCreateSemaphore(
-        &h, XBOX_TO_NATIVE(STACK_ARG(1)),
-        (LONG)STACK_ARG(2), (LONG)STACK_ARG(3));
-    if (st >= 0 && handle_va)
-        st = bridge_write_handle(handle_va, h);
+    {
+        WCHAR wname[256];
+        const WCHAR *named = bridge_object_name(STACK_ARG(1), wname, 256);
+        LONG init = (LONG)STACK_ARG(2), max = (LONG)STACK_ARG(3);
+        if (named) {
+            if (max <= 0 || init < 0 || init > max) {
+                g_eax = 0xC000000Du;
+                return;
+            }
+            h = CreateSemaphoreW(NULL, init, max, named);
+            st = bridge_named_status(h);
+        } else {
+            st = xbox_NtCreateSemaphore(&h, XBOX_TO_NATIVE(STACK_ARG(1)), init, max);
+        }
+    }
+    if (st >= 0 && handle_va) {
+        NTSTATUS written = bridge_write_handle(handle_va, h);
+        if (!NT_SUCCESS(written)) st = written;
+    }
     g_eax = (uint32_t)st;
 }
 
@@ -4957,9 +5840,9 @@ static void bridge_NtReleaseSemaphore(void)
 {
     uint32_t count_va = STACK_ARG(2);
 
-    g_eax = (uint32_t)xbox_NtReleaseSemaphore(
+    g_eax = bridge_handle_status(bridge_resolve_handle(STACK_ARG(0)), (uint32_t)xbox_NtReleaseSemaphore(
         bridge_resolve_handle(STACK_ARG(0)), (LONG)STACK_ARG(1),
-        count_va ? (PLONG)XBOX_TO_NATIVE(count_va) : NULL);
+        count_va ? (PLONG)XBOX_TO_NATIVE(count_va) : NULL));
 }
 
 /* ── KeAlertThread (ordinal 93, 2 args)
@@ -5020,6 +5903,8 @@ static void bridge_KeWaitForMultipleObjects(void)
             continue;
         }
         handles[i] = ke_shadow_lookup(obj);
+        if (handles[i] && ke_header_is_sync_event(obj))
+            types[i] = 1;
         if (!handles[i])
             handles[i] = bridge_resolve_handle(obj);
     }
@@ -5035,9 +5920,9 @@ static void bridge_KeWaitForMultipleObjects(void)
     if (wait_type == 0 && g_eax == 0) {
         for (i = 0; i < count; i++)
             if (types[i] == 1)
-                BRIDGE_MEM32(objects[i] + 4) = 0;
+                ke_wait_satisfied(objects[i]);
     } else if (wait_type != 0 && g_eax < count && types[g_eax] == 1) {
-        BRIDGE_MEM32(objects[g_eax] + 4) = 0;
+        ke_wait_satisfied(objects[g_eax]);
     }
 }
 
@@ -5071,6 +5956,25 @@ static void bridge_ObReferenceObjectByName(void)
     if (!name_va) {
         g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
         return;
+    }
+    {   /* one the title created */
+        uint16_t n = BRIDGE_MEM16(name_va);
+        char *text = (char *)malloc(n + 1u);
+        struct ob_managed *m = NULL;
+        if (text) {
+            char *last;
+            memcpy(text, XBOX_TO_NATIVE(BRIDGE_MEM32(name_va + 4)), n);
+            text[n] = 0;
+            last = strrchr(text, '\\');
+            m = ob_find_name(last ? last + 1 : text);
+            free(text);
+        }
+        if (m) {
+            InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(m->body - 0x10));
+            if (object_va) BRIDGE_MEM32(object_va) = m->body;
+            g_eax = 0;
+            return;
+        }
     }
     name.Length        = BRIDGE_MEM16(name_va);
     name.MaximumLength = BRIDGE_MEM16(name_va + 2);
@@ -5233,7 +6137,7 @@ static void bridge_AvSetSavedDataAddress(void)
 /* ── HalDisableSystemInterrupt (ordinal 39, 2 args) */
 static void bridge_HalDisableSystemInterrupt(void)
 {
-    xbox_HalDisableSystemInterrupt(STACK_ARG(0), (KIRQL)STACK_ARG(1));
+    xbox_HalDisableSystemInterrupt(STACK_ARG(0), 0);
     g_eax = 0;
 }
 
@@ -5279,24 +6183,7 @@ static void bridge_WRITE_PORT_BUFFER_USHORT(void)
  * arguments live in ecx/edx, never on the stack -- the arg-size entries are 0
  * and reading STACK_ARG would dereference whatever the caller left there.
  */
-static void bridge_IoBuildDeviceIoControlRequest(void)
-{
-    g_eax = (uint32_t)xbox_IoBuildDeviceIoControlRequest(
-        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
-        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
-        XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
-        (BOOLEAN)STACK_ARG(6), bridge_resolve_handle(STACK_ARG(7)),
-        (PXBOX_IO_STATUS_BLOCK)XBOX_TO_NATIVE(STACK_ARG(8)));
-}
 
-static void bridge_IoBuildSynchronousFsdRequest(void)
-{
-    g_eax = (uint32_t)(uintptr_t)xbox_IoBuildSynchronousFsdRequest(
-        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
-        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
-        XBOX_TO_NATIVE(STACK_ARG(4)), bridge_resolve_handle(STACK_ARG(5)),
-        (PXBOX_IO_STATUS_BLOCK)XBOX_TO_NATIVE(STACK_ARG(6)));
-}
 
 static void bridge_IoDeleteSymbolicLink(void)
 {
@@ -5314,24 +6201,8 @@ static void bridge_IoDeleteSymbolicLink(void)
     g_eax = (uint32_t)xbox_IoDeleteSymbolicLink(&name);
 }
 
-static void bridge_IoInitializeIrp(void)
-{
-    xbox_IoInitializeIrp(XBOX_TO_NATIVE(STACK_ARG(0)),
-        (USHORT)STACK_ARG(1), (CCHAR)STACK_ARG(2));
-    g_eax = 0;
-}
 
-static void bridge_IoInvalidDeviceRequest(void)
-{
-    g_eax = (uint32_t)xbox_IoInvalidDeviceRequest(
-        XBOX_TO_NATIVE(STACK_ARG(0)), XBOX_TO_NATIVE(STACK_ARG(1)));
-}
 
-static void bridge_IoMarkIrpMustComplete(void)
-{
-    xbox_IoMarkIrpMustComplete(XBOX_TO_NATIVE(STACK_ARG(0)));
-    g_eax = 0;
-}
 
 static void bridge_IoSetIoCompletion(void)
 {
@@ -5341,56 +6212,12 @@ static void bridge_IoSetIoCompletion(void)
         (ULONG_PTR)STACK_ARG(4));
 }
 
-static void bridge_IoStartNextPacket(void)
-{
-    xbox_IoStartNextPacket(XBOX_TO_NATIVE(STACK_ARG(0)),
-        (BOOLEAN)STACK_ARG(1));
-    g_eax = 0;
-}
 
-static void bridge_IoStartNextPacketByKey(void)
-{
-    xbox_IoStartNextPacketByKey(XBOX_TO_NATIVE(STACK_ARG(0)),
-        (BOOLEAN)STACK_ARG(1), STACK_ARG(2));
-    g_eax = 0;
-}
 
-static void bridge_IoStartPacket(void)
-{
-    xbox_IoStartPacket(XBOX_TO_NATIVE(STACK_ARG(0)),
-        XBOX_TO_NATIVE(STACK_ARG(1)), (PULONG)XBOX_TO_NATIVE(STACK_ARG(2)),
-        XBOX_TO_NATIVE(STACK_ARG(3)));
-    g_eax = 0;
-}
 
-static void bridge_IoSynchronousDeviceIoControlRequest(void)
-{
-    g_eax = (uint32_t)xbox_IoSynchronousDeviceIoControlRequest(
-        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
-        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
-        XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
-        (PULONG)XBOX_TO_NATIVE(STACK_ARG(6)), (BOOLEAN)STACK_ARG(7));
-}
 
-static void bridge_IoSynchronousFsdRequest(void)
-{
-    g_eax = (uint32_t)xbox_IoSynchronousFsdRequest(
-        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
-        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
-        XBOX_TO_NATIVE(STACK_ARG(4)));
-}
 
-static void bridge_IofCallDriver(void)
-{
-    g_eax = (uint32_t)xbox_IofCallDriver(XBOX_TO_NATIVE(g_ecx),
-                                        XBOX_TO_NATIVE(g_edx));
-}
 
-static void bridge_IofCompleteRequest(void)
-{
-    xbox_IofCompleteRequest(XBOX_TO_NATIVE(g_ecx), (CCHAR)g_edx);
-    g_eax = 0;
-}
 
 /* ── MmLockUnlockPhysicalPage (ordinal 176, 2 args)
  * Page locking is a no-op in user mode; the physical address is a value,
@@ -5418,15 +6245,17 @@ static void bridge_MmFreeSystemMemory(void)
  * guest heap here: create returns base+size, delete frees the base (arg 1). */
 static void bridge_MmCreateKernelStack(void)
 {
-    uint32_t size = STACK_ARG(0);
-    uint32_t base_va = xbox_HeapAlloc(size, 16);
+    /* The top of the stack; whole pages, as the kernel */
+    uint32_t size = (STACK_ARG(0) + 0xFFF) & ~0xFFFu;
+    uint32_t base_va = xbox_HeapAlloc(size, 4096);
 
     g_eax = base_va ? base_va + size : 0;
 }
 
 static void bridge_MmDeleteKernelStack(void)
 {
-    xbox_HeapFree(STACK_ARG(1));
+    /* Top and size: this used to free the size, as if it were an address */
+    xbox_HeapFree(STACK_ARG(0) - ((STACK_ARG(1) + 0xFFF) & ~0xFFFu));
     g_eax = 0;
 }
 
@@ -5458,6 +6287,12 @@ static void bridge_XcPKEncPublic(void)
 
 static void bridge_XcVerifyPKCS1Signature(void)
 {
+    /* A key that is not a real public key here means the kernel's own (XePublicKeyData), which we deliberately do not
+     * hold: nothing can be checked against it, so it passes, as it always did. A title's own key is checked for real. */
+    if (BRIDGE_MEM32(STACK_ARG(1)) != 0x31415352u) {
+        g_eax = 1;
+        return;
+    }
     g_eax = (uint32_t)xbox_XcVerifyPKCS1Signature(
         XBOX_TO_NATIVE(STACK_ARG(0)), XBOX_TO_NATIVE(STACK_ARG(1)),
         XBOX_TO_NATIVE(STACK_ARG(2)));
@@ -5501,12 +6336,6 @@ static void bridge_XcCryptService(void)
     g_eax = 0;
 }
 
-static void bridge_XcUpdateCrypto(void)
-{
-    xbox_XcUpdateCrypto(XBOX_TO_NATIVE(STACK_ARG(0)),
-        XBOX_TO_NATIVE(STACK_ARG(1)));
-    g_eax = 0;
-}
 
 /* ── RtlRip (ordinal 352, 3 args)
  * The CRT rip/assert path. All three pointers are guest C strings, so each is
@@ -5574,8 +6403,7 @@ static void bridge_RtlAnsiStringToUnicodeString(void)
         }
     }
 
-    result = MultiByteToWideChar(CP_ACP, 0,
-        (const char*)XBOX_TO_NATIVE(s_buf_va), (int)s_len,
+    result = l1_mb2wc((const char*)XBOX_TO_NATIVE(s_buf_va), (int)s_len,
         (WCHAR*)XBOX_TO_NATIVE(d_buf_va), (int)(unicode_bytes / sizeof(WCHAR)));
     if (result > 0) {
         BRIDGE_MEM16(dst_va + 0) = (uint16_t)(result * sizeof(WCHAR));
@@ -5630,9 +6458,8 @@ static void bridge_RtlUnicodeStringToAnsiString(void)
         }
     }
 
-    result = WideCharToMultiByte(CP_ACP, 0,
-        (const WCHAR*)XBOX_TO_NATIVE(s_buf_va), (int)(s_len / sizeof(WCHAR)),
-        (char*)XBOX_TO_NATIVE(d_buf_va), (int)ansi_bytes, NULL, NULL);
+    result = l1_wc2mb((const WCHAR*)XBOX_TO_NATIVE(s_buf_va), (int)(s_len / sizeof(WCHAR)),
+        (char*)XBOX_TO_NATIVE(d_buf_va), (int)ansi_bytes);
     if (result > 0) {
         BRIDGE_MEM16(dst_va + 0) = (uint16_t)result;
         if ((uint16_t)result < d_max)
@@ -5652,6 +6479,10 @@ static void bridge_RtlUnicodeStringToAnsiString(void)
  * token -- same shape as NtCreateEvent. DUPLICATE_CLOSE_SOURCE also closes
  * the native handle behind the source token, which is why the source token is
  * NOT consumed here (the OS handle it wraps is gone after this call). */
+static uint32_t ob_make_handle(uint32_t handle_va, uint32_t body);
+static void ob_close_handle(uint32_t body);
+static HANDLE bridge_take_handle(uint32_t token);
+
 static void bridge_NtDuplicateObject(void)
 {
     uint32_t target_va = STACK_ARG(1);
@@ -5662,6 +6493,18 @@ static void bridge_NtDuplicateObject(void)
     if (!target_va) {
         g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
         return;
+    }
+    {   /* One the title created: another handle to the object, the old closed if asked */
+        uint32_t own = ob_from_handle(STACK_ARG(0));
+        if (own) {
+            InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(own - 0x10));
+            if (STACK_ARG(2) & 1) {
+                bridge_take_handle(STACK_ARG(0));
+                ob_close_handle(own);
+            }
+            g_eax = ob_make_handle(target_va, own);
+            return;
+        }
     }
     if (STACK_ARG(2) & 0x1) opts |= DUPLICATE_CLOSE_SOURCE;
     if (STACK_ARG(2) & 0x2) opts |= DUPLICATE_SAME_ACCESS;
@@ -5675,7 +6518,8 @@ static void bridge_NtDuplicateObject(void)
                     STACK_ARG(0), src, (unsigned long)GetLastError());
             fflush(stderr);
         }
-        g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
+        BRIDGE_MEM32(target_va) = 0;   /* as the kernel */
+        g_eax = 0xC0000008u;           /* STATUS_INVALID_HANDLE */
         return;
     }
     g_eax = (uint32_t)bridge_write_handle(target_va, dup);
@@ -5767,6 +6611,7 @@ static void bridge_RtlAppendUnicodeStringToString(void)
     if ((uint32_t)d_len + s_len > d_max) { g_eax = (uint32_t)STATUS_BUFFER_TOO_SMALL; return; }
     memcpy((char *)XBOX_TO_NATIVE(d_buf) + d_len, XBOX_TO_NATIVE(s_buf), s_len);
     BRIDGE_MEM16(dst_va + 0) = (uint16_t)(d_len + s_len);
+    if ((uint32_t)d_len + s_len < d_max) BRIDGE_MEM16(d_buf + ((uint32_t)d_len & ~1u) + s_len) = 0;   /* as the kernel */
     g_eax = 0;   /* STATUS_SUCCESS */
 }
 
@@ -5787,6 +6632,7 @@ static void bridge_RtlAppendUnicodeToString(void)
     if ((uint32_t)d_len + add_bytes > d_max) { g_eax = (uint32_t)STATUS_BUFFER_TOO_SMALL; return; }
     memcpy((char *)XBOX_TO_NATIVE(d_buf) + d_len, XBOX_TO_NATIVE(src_va), add_bytes);
     BRIDGE_MEM16(dst_va + 0) = (uint16_t)(d_len + add_bytes);
+    if ((uint32_t)d_len + add_bytes < d_max) BRIDGE_MEM16(d_buf + ((uint32_t)d_len & ~1u) + add_bytes) = 0;   /* as the kernel */
     g_eax = 0;   /* STATUS_SUCCESS */
 }
 
@@ -5815,13 +6661,37 @@ static void bridge_RtlCompareString(void)
     diff = 0;
     for (i = 0; i < common; i++) {
         int a = p1[i], b = p2[i];
-        if (nocase) { a = tolower(a); b = tolower(b); }
+        if (nocase) { a = l1_lower(a); b = l1_lower(b); }
         if (a != b) { diff = a - b; break; }
     }
     if (!diff)
         diff = (int)l1 - (int)l2;
     g_eax = (uint32_t)(int32_t)diff;
 }
+
+#include "kernel_case.h"
+
+static uint16_t case_map(const KernelCaseRun *r, int n, uint16_t c)
+{
+    for (int i = 0; i < n; i++)
+        if (c >= r[i].first && c <= r[i].last && ((c - r[i].first) % r[i].step) == 0)
+            return (uint16_t)(c + r[i].delta);
+    return c;
+}
+static uint16_t case_upper(uint16_t c)
+{
+    if (c < 0x80) return c >= 'a' && c <= 'z' ? (uint16_t)(c - 0x20) : c;
+    return case_map(kCaseUpper, (int)(sizeof kCaseUpper / sizeof kCaseUpper[0]), c);
+}
+static uint16_t case_lower(uint16_t c)
+{
+    if (c < 0x80) return c >= 'A' && c <= 'Z' ? (uint16_t)(c + 0x20) : c;
+    return case_map(kCaseLower, (int)(sizeof kCaseLower / sizeof kCaseLower[0]), c);
+}
+
+/* As the kernel: base 0 is 10 unless "0x", "0o" or "0b" follows (lower case, and no bare leading-zero octal); other
+ * bases only 2, 8, 10, 16; anything at or below a space is skipped first; no overflow check, the value wraps. */
+static int rtl_int_base(uint32_t base) { return base == 2 || base == 8 || base == 10 || base == 16; }
 
 /* 271: LONG RtlCompareUnicodeString(PXBOX_UNICODE_STRING, PXBOX_UNICODE_STRING, BOOLEAN) */
 static void bridge_RtlCompareUnicodeString(void)
@@ -5844,7 +6714,7 @@ static void bridge_RtlCompareUnicodeString(void)
     diff = 0;
     for (i = 0; i < common / 2; i++) {
         int a = p1[i], b = p2[i];
-        if (nocase) { a = towlower((wint_t)a); b = towlower((wint_t)b); }
+        if (nocase) { a = case_lower((uint16_t)a); b = case_lower((uint16_t)b); }
         if (a != b) { diff = a - b; break; }
     }
     if (!diff)
@@ -5872,8 +6742,8 @@ static void bridge_RtlEqualUnicodeString(void)
     for (i = 0; i < b1 / 2; i++) {
         int a = p1[i], b = p2[i];
         if (nocase) {
-            a = towlower((wint_t)a);
-            b = towlower((wint_t)b);
+            a = case_lower((uint16_t)a);
+            b = case_lower((uint16_t)b);
         }
         if (a != b) { g_eax = 0; return; }
     }
@@ -5890,7 +6760,12 @@ static void bridge_RtlCopyString(void)
     uint16_t d_max = 0, s_len = 0;
     uint32_t d_buf = 0, s_buf = 0, copy;
 
-    if (!dst_va || !src_va) { g_eax = 0; return; }
+    g_eax = 0;
+    if (!dst_va) return;
+    if (!src_va) {
+        BRIDGE_MEM16(dst_va) = 0;
+        return;
+    }
     d_max = BRIDGE_MEM16(dst_va + 2);
     d_buf = BRIDGE_MEM32(dst_va + 4);
     s_len = BRIDGE_MEM16(src_va + 0);
@@ -5942,7 +6817,7 @@ static void bridge_RtlUpperString(void)
         sp = (const uint8_t *)XBOX_TO_NATIVE(s_buf);
         dp = (uint8_t *)XBOX_TO_NATIVE(d_buf);
         for (i = 0; i < copy; i++)
-            dp[i] = (uint8_t)toupper(sp[i]);
+            dp[i] = (uint8_t)l1_upper(sp[i]);
     }
     BRIDGE_MEM16(dst_va + 0) = (uint16_t)copy;
     g_eax = 0;
@@ -5993,28 +6868,29 @@ static void bridge_RtlFreeUnicodeString(void)
 static void bridge_RtlDowncaseUnicodeChar(void)
 {
     uint32_t ch = STACK_ARG(0);
-    g_eax = (uint32_t)(uint16_t)towlower((wint_t)(uint16_t)ch);
+    g_eax = (uint32_t)(uint16_t)case_lower((uint16_t)ch);
 }
 
 /* 296: CHAR RtlLowerChar(CHAR Ch) */
 static void bridge_RtlLowerChar(void)
 {
-    uint32_t ch = STACK_ARG(0);
-    g_eax = (uint32_t)(uint8_t)tolower((int)(uint8_t)ch);
+    uint16_t u = case_lower((uint16_t)(STACK_ARG(0) & 0xFF));
+    g_eax = u < 0x100 ? u : '?';
 }
 
 /* 313: WCHAR RtlUpcaseUnicodeChar(WCHAR Ch) */
 static void bridge_RtlUpcaseUnicodeChar(void)
 {
     uint32_t ch = STACK_ARG(0);
-    g_eax = (uint32_t)(uint16_t)towupper((wint_t)(uint16_t)ch);
+    g_eax = (uint32_t)(uint16_t)case_upper((uint16_t)ch);
 }
 
 /* 316: CHAR RtlUpperChar(CHAR Ch) */
 static void bridge_RtlUpperChar(void)
 {
-    uint32_t ch = STACK_ARG(0);
-    g_eax = (uint32_t)(uint8_t)toupper((int)(uint8_t)ch);
+    /* The Unicode mapping of the byte, '?' if it lands past Latin-1 (y-diaeresis does) */
+    uint16_t u = case_upper((uint16_t)(STACK_ARG(0) & 0xFF));
+    g_eax = u < 0x100 ? u : '?';
 }
 
 /* ── Rtl Upcase/Downcase string (ordinals 276, 314) ─────────
@@ -6054,7 +6930,7 @@ static void bridge_RtlDowncaseUnicodeString(void)
     sp = (const uint16_t *)XBOX_TO_NATIVE(s_buf);
     dp = (uint16_t *)XBOX_TO_NATIVE(d_buf);
     for (i = 0; i < (uint32_t)(s_len / 2); i++)
-        dp[i] = (uint16_t)towlower((wint_t)sp[i]);
+        dp[i] = (uint16_t)case_lower(sp[i]);
     dp[(uint32_t)(s_len / 2)] = 0;
     BRIDGE_MEM16(dst_va + 0) = s_len;
     g_eax = 0;   /* STATUS_SUCCESS */
@@ -6091,7 +6967,7 @@ static void bridge_RtlUpcaseUnicodeString(void)
     sp = (const uint16_t *)XBOX_TO_NATIVE(s_buf);
     dp = (uint16_t *)XBOX_TO_NATIVE(d_buf);
     for (i = 0; i < (uint32_t)(s_len / 2); i++)
-        dp[i] = (uint16_t)towupper((wint_t)sp[i]);
+        dp[i] = (uint16_t)case_upper(sp[i]);
     dp[(uint32_t)(s_len / 2)] = 0;
     BRIDGE_MEM16(dst_va + 0) = s_len;
     g_eax = 0;   /* STATUS_SUCCESS */
@@ -6102,96 +6978,44 @@ static void bridge_RtlUpcaseUnicodeString(void)
  * Length+1 bytes of buffer (the NUL goes at [Length]). */
 
 /* 292: NTSTATUS RtlIntegerToChar(ULONG Value, ULONG Base, ULONG Length, PCHAR String) */
-static void bridge_RtlIntegerToChar(void)
+/* The kernel's RtlIntegerToChar: base 0 is 10, then only 2, 8, 10, 16. A negative length pads with zeros to that many
+ * digits; a positive one is only room, and a digit count past it is STATUS_BUFFER_OVERFLOW. NUL if it fits. */
+static uint32_t rtl_int_to_char(uint32_t value, uint32_t base, int32_t length, char *out)
 {
     static const char digs[] = "0123456789ABCDEF";
-    uint32_t value = STACK_ARG(0);
-    uint32_t base  = STACK_ARG(1);
-    uint32_t len   = STACK_ARG(2);
-    uint32_t str_va = STACK_ARG(3);
     char tmp[40];
-    uint32_t i, n;
+    int n = 0, want;
 
-    if (!str_va) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-    if (base < 2 || base > 16) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
+    if (!base) base = 10;
+    if (!rtl_int_base(base)) return 0xC000000Du;
+    do { tmp[n++] = digs[value % base]; value /= base; } while (value);
+    want = length < 0 ? -length : length;
+    if (length < 0) while (n < want && n < (int)sizeof tmp) tmp[n++] = '0';
+    if (n > want) return 0x80000005u;
+    for (int i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    if (n < want) out[n] = 0;
+    return 0;
+}
 
-    n = 0;
-    {
-        uint32_t v = value;
-        if (v == 0)
-            tmp[n++] = '0';
-        while (v) {
-            tmp[n++] = digs[v % base];
-            v /= base;
-        }
-        for (i = 0; i < n / 2; i++) {
-            char t = tmp[i];
-            tmp[i] = tmp[n - 1 - i];
-            tmp[n - 1 - i] = t;
-        }
-    }
-    if (n > len) { g_eax = (uint32_t)STATUS_BUFFER_TOO_SMALL; return; }
-
-    for (i = 0; i < len - n; i++)
-        BRIDGE_MEM8(str_va + i) = (uint8_t)'0';
-    for (i = 0; i < n; i++)
-        BRIDGE_MEM8(str_va + (len - n + i)) = (uint8_t)tmp[i];
-    BRIDGE_MEM8(str_va + len) = 0;
-    g_eax = 0;   /* STATUS_SUCCESS */
+static void bridge_RtlIntegerToChar(void)
+{
+    g_eax = rtl_int_to_char(STACK_ARG(0), STACK_ARG(1), (int32_t)STACK_ARG(2), (char *)XBOX_TO_NATIVE(STACK_ARG(3)));
 }
 
 /* 293: NTSTATUS RtlIntegerToUnicodeString(ULONG Value, ULONG Base, PXBOX_UNICODE_STRING String) */
 static void bridge_RtlIntegerToUnicodeString(void)
 {
-    static const uint16_t digs[] = { '0','1','2','3','4','5','6','7','8','9',
-                                     'A','B','C','D','E','F' };
-    uint32_t value = STACK_ARG(0);
-    uint32_t base  = STACK_ARG(1);
-    uint32_t str_va = STACK_ARG(2);
-    uint16_t body[32], d_max;
-    uint32_t d_buf, i, n_body = 0, total;
-    uint32_t v;
-    int neg = 0;
-    uint16_t *dst;
-
-    if (!str_va) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-    if (base < 2 || base > 16) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-    d_max = BRIDGE_MEM16(str_va + 2);
-    d_buf = BRIDGE_MEM32(str_va + 4);
-    if (!d_buf) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-
-    if (base == 10 && (LONG)value < 0) {
-        neg = 1;
-        v = (uint32_t)(0u - value);
-    } else {
-        v = value;
-    }
-    if (v == 0)
-        body[n_body++] = digs[0];
-    while (v) {
-        body[n_body++] = digs[v % base];
-        v /= base;
-    }
-    for (i = 0; i < n_body / 2; i++) {
-        uint16_t t = body[i];
-        body[i] = body[n_body - 1 - i];
-        body[n_body - 1 - i] = t;
-    }
-
-    total = n_body + (uint32_t)neg;
-    if (total * 2 > d_max) { g_eax = (uint32_t)STATUS_BUFFER_TOO_SMALL; return; }
-
-    dst = (uint16_t *)XBOX_TO_NATIVE(d_buf);
-    {
-        uint32_t k = 0;
-        if (neg)
-            dst[k++] = (uint16_t)L'-';
-        for (i = 0; i < n_body; i++)
-            dst[k++] = body[i];
-        dst[k] = 0;
-    }
-    BRIDGE_MEM16(str_va + 0) = (uint16_t)(total * 2);
-    g_eax = 0;   /* STATUS_SUCCESS */
+    /* Through the text form, as the kernel: no sign, however large the value */
+    char text[16];
+    uint32_t str_va = STACK_ARG(2), n, max = BRIDGE_MEM16(str_va + 2), buf = BRIDGE_MEM32(str_va + 4), i;
+    uint32_t st = rtl_int_to_char(STACK_ARG(0), STACK_ARG(1), 16, text);
+    if ((int32_t)st < 0) { g_eax = st; return; }
+    for (n = 0; n < sizeof text && text[n]; n++) {}
+    if (n * 2 > max) { g_eax = 0x80000005u; return; }
+    for (i = 0; i < n; i++) BRIDGE_MEM16(buf + i * 2) = (uint8_t)text[i];
+    if (n * 2 + 2 <= max) BRIDGE_MEM16(buf + n * 2) = 0;
+    BRIDGE_MEM16(str_va) = (uint16_t)(n * 2);
+    g_eax = 0;
 }
 
 /* ── Rtl Memory (ordinals 284, 298, 320) ──────────────────── */
@@ -6248,12 +7072,11 @@ static void bridge_RtlMultiByteToUnicodeN(void)
 
     if (!uni_va && max_bytes) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
     chars = (int)(max_bytes / sizeof(WCHAR));
-    result = MultiByteToWideChar(CP_ACP, 0,
-        (const char *)XBOX_TO_NATIVE(mb_va), (int)mb_bytes,
+    result = l1_mb2wc((const char *)XBOX_TO_NATIVE(mb_va), (int)mb_bytes,
         uni_va ? (WCHAR *)XBOX_TO_NATIVE(uni_va) : NULL, chars);
     if (bytes_va)
         BRIDGE_MEM32(bytes_va) = result > 0 ? (uint32_t)(result * sizeof(WCHAR)) : 0;
-    g_eax = result > 0 ? 0 : (uint32_t)STATUS_UNSUCCESSFUL;
+    g_eax = 0  /* the kernel cannot fail: it converts what fits */;
 }
 
 /* 300: NTSTATUS RtlMultiByteToUnicodeSize(PULONG BytesInUnicodeString,
@@ -6265,8 +7088,7 @@ static void bridge_RtlMultiByteToUnicodeSize(void)
     uint32_t mb_bytes = STACK_ARG(2);
     int result;
 
-    result = MultiByteToWideChar(CP_ACP, 0,
-        (const char *)XBOX_TO_NATIVE(mb_va), (int)mb_bytes, NULL, 0);
+    result = l1_mb2wc((const char *)XBOX_TO_NATIVE(mb_va), (int)mb_bytes, NULL, 0);
     if (bytes_va)
         BRIDGE_MEM32(bytes_va) = result > 0 ? (uint32_t)(result * sizeof(WCHAR)) : 0;
     g_eax = result > 0 ? 0 : (uint32_t)STATUS_UNSUCCESSFUL;
@@ -6284,13 +7106,11 @@ static void bridge_RtlUnicodeToMultiByteN(void)
     int result;
 
     if (!mb_va && max_bytes) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-    result = WideCharToMultiByte(CP_ACP, 0,
-        (const WCHAR *)XBOX_TO_NATIVE(uni_va), (int)(uni_bytes / sizeof(WCHAR)),
-        mb_va ? (char *)XBOX_TO_NATIVE(mb_va) : NULL, (int)max_bytes,
-        NULL, NULL);
+    result = l1_wc2mb((const WCHAR *)XBOX_TO_NATIVE(uni_va), (int)(uni_bytes / sizeof(WCHAR)),
+        mb_va ? (char *)XBOX_TO_NATIVE(mb_va) : NULL, (int)max_bytes);
     if (bytes_va)
         BRIDGE_MEM32(bytes_va) = result > 0 ? (uint32_t)result : 0;
-    g_eax = result > 0 ? 0 : (uint32_t)STATUS_UNSUCCESSFUL;
+    g_eax = 0  /* the kernel cannot fail: it converts what fits */;
 }
 
 /* 311: NTSTATUS RtlUnicodeToMultiByteSize(PULONG BytesInMultiByteString,
@@ -6302,9 +7122,8 @@ static void bridge_RtlUnicodeToMultiByteSize(void)
     uint32_t uni_bytes = STACK_ARG(2);
     int result;
 
-    result = WideCharToMultiByte(CP_ACP, 0,
-        (const WCHAR *)XBOX_TO_NATIVE(uni_va), (int)(uni_bytes / sizeof(WCHAR)),
-        NULL, 0, NULL, NULL);
+    result = l1_wc2mb((const WCHAR *)XBOX_TO_NATIVE(uni_va), (int)(uni_bytes / sizeof(WCHAR)),
+        NULL, 0);
     if (bytes_va)
         BRIDGE_MEM32(bytes_va) = result > 0 ? (uint32_t)result : 0;
     g_eax = result > 0 ? 0 : (uint32_t)STATUS_UNSUCCESSFUL;
@@ -6334,18 +7153,16 @@ static void bridge_RtlUpcaseUnicodeToMultiByteN(void)
         {
             const uint16_t *sp = (const uint16_t *)XBOX_TO_NATIVE(uni_va);
             for (i = 0; i < wc; i++)
-                tmp[i] = (uint16_t)towupper((wint_t)sp[i]);
+                tmp[i] = (uint16_t)case_upper(sp[i]);
             tmp[wc] = 0;
         }
     }
-    result = WideCharToMultiByte(CP_ACP, 0,
-        tmp, (int)wc,
-        mb_va ? (char *)XBOX_TO_NATIVE(mb_va) : NULL, (int)max_bytes,
-        NULL, NULL);
+    result = l1_wc2mb(tmp, (int)wc,
+        mb_va ? (char *)XBOX_TO_NATIVE(mb_va) : NULL, (int)max_bytes);
     free(tmp);
     if (bytes_va)
         BRIDGE_MEM32(bytes_va) = result > 0 ? (uint32_t)result : 0;
-    g_eax = result > 0 ? 0 : (uint32_t)STATUS_UNSUCCESSFUL;
+    g_eax = 0  /* the kernel cannot fail: it converts what fits */;
 }
 
 /* ── Rtl String -> Integer (ordinals 267, 309) ────────────── */
@@ -6354,113 +7171,72 @@ static void bridge_RtlUpcaseUnicodeToMultiByteN(void)
  * Base 0 autodetects (0x -> 16, 0 -> 8, else 10), mirroring strtoul. */
 static void bridge_RtlCharToInteger(void)
 {
-    uint32_t str_va = STACK_ARG(0);
-    uint32_t base   = STACK_ARG(1);
-    uint32_t val_va = STACK_ARG(2);
-    const char *p;
-    unsigned long long acc = 0;
-    uint32_t base_ = base;
-    int neg = 0;
-    uint32_t st = 0;   /* STATUS_SUCCESS */
+    const char *p = (const char *)XBOX_TO_NATIVE(STACK_ARG(0));
+    uint32_t base = STACK_ARG(1), val_va = STACK_ARG(2), v = 0;
+    char sign, c;
 
-    if (!val_va) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-    if (base_ != 0 && (base_ < 2 || base_ > 16)) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-    if (!str_va) { BRIDGE_MEM32(val_va) = 0; g_eax = 0; return; }
-    p = (const char *)XBOX_TO_NATIVE(str_va);
-
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
-           *p == '\f' || *p == '\v')
-        p++;
-    if (*p == '-') { neg = 1; p++; }
-    else if (*p == '+') p++;
-
-    if (base_ == 0) {
-        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base_ = 16; p += 2; }
-        else if (p[0] == '0') { base_ = 8; }
-        else base_ = 10;
-    }
-
-    for (; *p; p++) {
-        int d, c = (unsigned char)*p;
-        if (c >= '0' && c <= '9') d = c - '0';
-        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
-        else break;
-        if (d >= (int)base_) break;
-        if (acc > (0xFFFFFFFFULL - (unsigned)d) / base_) {
-            st = (uint32_t)STATUS_INTEGER_OVERFLOW;
-            acc = 0xFFFFFFFFULL;
-            break;
+    if (base && !rtl_int_base(base)) { g_eax = 0xC000000Du; return; }
+    while (*p && *p <= ' ') p++;
+    sign = *p;
+    c = *p ? *p++ : 0;
+    if (c == '-' || c == '+') c = *p ? *p++ : 0;
+    if (!base) {
+        base = 10;
+        if (c == '0') {
+            c = *p ? *p++ : 0;
+            if (c == 'x') base = 16, c = *p ? *p++ : 0;
+            else if (c == 'o') base = 8, c = *p ? *p++ : 0;
+            else if (c == 'b') base = 2, c = *p ? *p++ : 0;
         }
-        acc = acc * base_ + (unsigned)d;
     }
-    if (neg)
-        acc = (unsigned long long)(uint32_t)(0u - (uint32_t)acc);
-    BRIDGE_MEM32(val_va) = (uint32_t)acc;
-    g_eax = st;
+    for (; c; c = *p ? *p++ : 0) {
+        uint32_t d;
+        if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+        else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+        else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+        else break;
+        if (d >= base) break;
+        v = v * base + d;
+    }
+    BRIDGE_MEM32(val_va) = sign == '-' ? 0u - v : v;
+    g_eax = 0;
 }
 
 /* 309: NTSTATUS RtlUnicodeStringToInteger(PXBOX_UNICODE_STRING Str, ULONG Base, PULONG Value) */
 static void bridge_RtlUnicodeStringToInteger(void)
 {
-    uint32_t str_va = STACK_ARG(0);
-    uint32_t base   = STACK_ARG(1);
-    uint32_t val_va = STACK_ARG(2);
-    uint16_t s_len;
-    uint32_t s_buf;
-    const uint16_t *wp;
-    unsigned long long acc = 0;
-    uint32_t base_ = base;
-    int neg = 0, i, nch;
-    uint32_t st = 0;   /* STATUS_SUCCESS */
+    uint32_t str_va = STACK_ARG(0), base = STACK_ARG(1), val_va = STACK_ARG(2), v = 0;
+    uint32_t n = BRIDGE_MEM16(str_va) / 2u, i = 0;
+    const uint16_t *w = (const uint16_t *)XBOX_TO_NATIVE(BRIDGE_MEM32(str_va + 4));
+    uint16_t sign, c;
+#define NEXTW() (i < n ? w[i++] : 0)
 
-    if (!val_va) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-    if (base_ != 0 && (base_ < 2 || base_ > 16)) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-    if (!str_va) { BRIDGE_MEM32(val_va) = 0; g_eax = 0; return; }
-    s_len = BRIDGE_MEM16(str_va + 0);
-    s_buf = BRIDGE_MEM32(str_va + 4);
-    if (!s_buf) { BRIDGE_MEM32(val_va) = 0; g_eax = 0; return; }
-    wp = (const uint16_t *)XBOX_TO_NATIVE(s_buf);
-    nch = s_len / 2;
-
-    i = 0;
-    while (i < nch && (wp[i] == (uint16_t)' ' || wp[i] == (uint16_t)'\t' ||
-                       wp[i] == (uint16_t)'\n' || wp[i] == (uint16_t)'\r'))
-        i++;
-    if (i < nch && wp[i] == (uint16_t)'-') { neg = 1; i++; }
-    else if (i < nch && wp[i] == (uint16_t)'+') i++;
-
-    if (base_ == 0) {
-        if (i + 1 < nch && wp[i] == (uint16_t)'0' &&
-            (wp[i + 1] == (uint16_t)'x' || wp[i + 1] == (uint16_t)'X')) {
-            base_ = 16;
-            i += 2;
-        } else if (i < nch && wp[i] == (uint16_t)'0') {
-            base_ = 8;
-        } else {
-            base_ = 10;
+    if (base && !rtl_int_base(base)) { g_eax = 0xC000000Du; return; }
+    while (i < n && w[i] <= ' ') i++;
+    sign = NEXTW();
+    c = sign;
+    if (c == '-' || c == '+') c = NEXTW();
+    if (!base) {
+        base = 10;
+        if (c == '0') {
+            c = NEXTW();
+            if (c == 'x') base = 16, c = NEXTW();
+            else if (c == 'o') base = 8, c = NEXTW();
+            else if (c == 'b') base = 2, c = NEXTW();
         }
     }
-
-    for (; i < nch; i++) {
-        uint16_t c = wp[i];
-        int d;
-        if (c >= (uint16_t)'0' && c <= (uint16_t)'9') d = c - (uint16_t)'0';
-        else if (c >= (uint16_t)'a' && c <= (uint16_t)'f') d = c - (uint16_t)'a' + 10;
-        else if (c >= (uint16_t)'A' && c <= (uint16_t)'F') d = c - (uint16_t)'A' + 10;
+    for (; c; c = NEXTW()) {
+        uint32_t d;
+        if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+        else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+        else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
         else break;
-        if (d >= (int)base_) break;
-        if (acc > (0xFFFFFFFFULL - (unsigned)d) / base_) {
-            st = (uint32_t)STATUS_INTEGER_OVERFLOW;
-            acc = 0xFFFFFFFFULL;
-            break;
-        }
-        acc = acc * base_ + (unsigned)d;
+        if (d >= base) break;
+        v = v * base + d;
     }
-    if (neg)
-        acc = (unsigned long long)(uint32_t)(0u - (uint32_t)acc);
-    BRIDGE_MEM32(val_va) = (uint32_t)acc;
-    g_eax = st;
+#undef NEXTW
+    BRIDGE_MEM32(val_va) = sign == '-' ? 0u - v : v;
+    g_eax = 0;
 }
 
 /* ── Rtl Byte swaps (ordinals 307, 318) ─────────────────────
@@ -6469,98 +7245,48 @@ static void bridge_RtlUnicodeStringToInteger(void)
 /* 307: ULONG RtlUlongByteSwap(ULONG Value) */
 static void bridge_RtlUlongByteSwap(void)
 {
-    uint32_t v = STACK_ARG(0);
-    g_eax = ((v & 0x000000FFu) << 24) |
-            ((v & 0x0000FF00u) << 8)  |
-            ((v & 0x00FF0000u) >> 8)  |
-            ((v & 0xFF000000u) >> 24);
+    uint32_t v = g_ecx;   /* fastcall */
+    g_eax = (v << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
 }
 
 /* 318: USHORT RtlUshortByteSwap(USHORT Value) */
 static void bridge_RtlUshortByteSwap(void)
 {
-    uint32_t v = STACK_ARG(0);
+    uint32_t v = g_ecx;   /* fastcall */
     g_eax = (uint32_t)(uint16_t)(((v & 0xFFu) << 8) | ((v >> 8) & 0xFFu));
-}
-
-/* ── Rtl Critical sections (ordinals 278, 295, 306) ─────────
- * 277/294 (plain Enter/Leave) are routed via the xbox_Rtl* wrappers already.
- *
- * TryEnter cannot reuse xbox_cs_shadow (it is private to kernel_rtl.c), so it
- * keeps its own keyed host-lock table: guest critical-section address -> host
- * CRITICAL_SECTION, created and probed under a guard.  Only the try path uses
- * it, so entering with Try and leaving with LeaveCriticalSection are both
- * routed at the shadow level and stay consistent on the host side. */
-
-#define BRIDGE_TRY_CS_SLOTS 512
-
-typedef struct {
-    uint32_t key;             /* guest critical section; 0 means free */
-    int      ready;
-    CRITICAL_SECTION cs;
-} BRIDGE_TRY_CS_SLOT;
-
-static BRIDGE_TRY_CS_SLOT g_try_cs[BRIDGE_TRY_CS_SLOTS];
-static CRITICAL_SECTION g_try_cs_guard;
-static int g_try_cs_guard_ready;
-
-static void bridge_try_cs_init_guard(void)
-{
-    /* First call in practice comes from the title's main thread during setup;
-     * a second InitializeCriticalSection on the same object is benign. */
-    if (!g_try_cs_guard_ready) {
-        InitializeCriticalSection(&g_try_cs_guard);
-        g_try_cs_guard_ready = 1;
-    }
-}
-
-static CRITICAL_SECTION *bridge_try_cs_shadow(uint32_t guest)
-{
-    size_t home, i;
-
-    bridge_try_cs_init_guard();
-    EnterCriticalSection(&g_try_cs_guard);
-    home = (size_t)((guest >> 4) % BRIDGE_TRY_CS_SLOTS);
-    for (i = 0; i < BRIDGE_TRY_CS_SLOTS; i++) {
-        BRIDGE_TRY_CS_SLOT *slot = &g_try_cs[(home + i) % BRIDGE_TRY_CS_SLOTS];
-        if (slot->key == guest) {
-            LeaveCriticalSection(&g_try_cs_guard);
-            return &slot->cs;
-        }
-        if (slot->key == 0) {
-            if (!slot->ready) {
-                InitializeCriticalSection(&slot->cs);
-                slot->ready = 1;
-            }
-            slot->key = guest;
-            LeaveCriticalSection(&g_try_cs_guard);
-            return &slot->cs;
-        }
-    }
-    LeaveCriticalSection(&g_try_cs_guard);
-    return NULL;
 }
 
 /* 278: VOID RtlEnterCriticalSectionAndRegion(PRTL_CRITICAL_SECTION) */
 static void bridge_RtlEnterCriticalSectionAndRegion(void)
 {
-    xbox_RtlEnterCriticalSection((PRTL_CRITICAL_SECTION)XBOX_TO_NATIVE(STACK_ARG(0)));
+    uint32_t cs_va = STACK_ARG(0);
+    InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(cs_va + 0x10));
+    xbox_RtlEnterCriticalSection((PRTL_CRITICAL_SECTION)XBOX_TO_NATIVE(cs_va));
+    cs_entered(cs_va);
     g_eax = 0;
 }
 
 /* 295: VOID RtlLeaveCriticalSectionAndRegion(PRTL_CRITICAL_SECTION) */
 static void bridge_RtlLeaveCriticalSectionAndRegion(void)
 {
-    xbox_RtlLeaveCriticalSection((PRTL_CRITICAL_SECTION)XBOX_TO_NATIVE(STACK_ARG(0)));
+    uint32_t cs_va = STACK_ARG(0);
+    cs_leaving(cs_va);
+    xbox_RtlLeaveCriticalSection((PRTL_CRITICAL_SECTION)XBOX_TO_NATIVE(cs_va));
     g_eax = 0;
 }
 
 /* 306: BOOLEAN RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION) */
 static void bridge_RtlTryEnterCriticalSection(void)
 {
-    CRITICAL_SECTION *cs = bridge_try_cs_shadow(STACK_ARG(0));
-    if (!cs) { g_eax = 0; return; }
-    g_eax = TryEnterCriticalSection(cs) ? 1 : 0;
+    extern BOOLEAN xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION);
+    uint32_t cs_va = STACK_ARG(0);
+    if (xbox_RtlTryEnterCriticalSection((PRTL_CRITICAL_SECTION)XBOX_TO_NATIVE(cs_va))) {
+        InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(cs_va + 0x10));
+        cs_entered(cs_va);
+        g_eax = 1;
+    } else {
+        g_eax = 0;
+    }
 }
 
 /* ── Rtl Misc stubs (ordinals 288, 297, 319, 321) ─────────── */
@@ -6579,6 +7305,15 @@ static void bridge_RtlGetCallersAddress(void)
 /* 297: VOID RtlMapGenericMask(PACCESS_MASK AccessMask, PRTL_GENERIC_MAPPING) */
 static void bridge_RtlMapGenericMask(void)
 {
+    /* AccessMask, GenericMapping: GENERIC_READ, WRITE, EXECUTE and ALL replaced
+     * by what the mapping says, those four bits cleared. */
+    uint32_t m = STACK_ARG(0), g = STACK_ARG(1);
+    uint32_t v = BRIDGE_MEM32(m);
+    if (v & 0x80000000u) v |= BRIDGE_MEM32(g + 0);
+    if (v & 0x40000000u) v |= BRIDGE_MEM32(g + 4);
+    if (v & 0x20000000u) v |= BRIDGE_MEM32(g + 8);
+    if (v & 0x10000000u) v |= BRIDGE_MEM32(g + 12);
+    BRIDGE_MEM32(m) = v & 0x0FFFFFFFu;
     g_eax = 0;
 }
 
@@ -6625,10 +7360,24 @@ static void bridge_RtlAssert(void)
 /* 265: VOID RtlCaptureContext(PCONTEXT Context) - stub: zero the x86 CONTEXT. */
 static void bridge_RtlCaptureContext(void)
 {
-    uint32_t ctx_va = STACK_ARG(0);
-
-    if (ctx_va)
-        memset(XBOX_TO_NATIVE(ctx_va), 0, 0x2CC);
+    /* The Xbox CONTEXT is smaller than Windows' (the registers end at +0x238):
+     * clearing 0x2CC bytes ran past it. Only what the real one writes. Registers a
+     * recompiled function holds locally read as their last published value. */
+    uint32_t c = STACK_ARG(0);
+    if (c) {
+        BRIDGE_MEM32(c + 0x21C) = g_eax;
+        BRIDGE_MEM32(c + 0x218) = g_ecx;
+        BRIDGE_MEM32(c + 0x214) = g_edx;
+        BRIDGE_MEM32(c + 0x210) = g_ebx;
+        BRIDGE_MEM32(c + 0x20C) = g_esi;
+        BRIDGE_MEM32(c + 0x208) = g_edi;
+        BRIDGE_MEM16(c + 0x228) = 0x08;
+        BRIDGE_MEM16(c + 0x234) = 0x10;
+        BRIDGE_MEM32(c + 0x22C) = 0x202;
+        BRIDGE_MEM32(c + 0x224) = BRIDGE_MEM32(g_esp);   /* the return address */
+        BRIDGE_MEM32(c + 0x220) = g_ebp;
+        BRIDGE_MEM32(c + 0x230) = g_esp + 8;
+    }
     g_eax = 0;
 }
 
@@ -6642,9 +7391,27 @@ static void bridge_RtlCaptureStackBackTrace(void)
 
 
 /* --- Ke Object Shadow Table --- */
-#define KE_SHADOW_SIZE 4096
+#define KE_SHADOW_FIRST 4096
 typedef struct { uint32_t guest_va; HANDLE host_handle; uint32_t in_use; } KE_SHADOW_SLOT;
-static KE_SHADOW_SLOT g_ke_shadow[KE_SHADOW_SIZE];
+static KE_SHADOW_SLOT *g_ke_shadow;   /* no limit on the console: grows, under g_ke_shadow_cs */
+static size_t g_ke_shadow_size;
+
+/* A free row, growing the table when there is none. Lock held. */
+static int ke_shadow_free_slot(void)
+{
+    size_t i, n;
+    KE_SHADOW_SLOT *grown;
+    for (i = 0; i < g_ke_shadow_size; i++)
+        if (!g_ke_shadow[i].in_use) return (int)i;
+    n = g_ke_shadow_size ? g_ke_shadow_size * 2 : KE_SHADOW_FIRST;
+    grown = (KE_SHADOW_SLOT *)realloc(g_ke_shadow, n * sizeof *grown);
+    if (!grown) return -1;
+    memset(grown + g_ke_shadow_size, 0, (n - g_ke_shadow_size) * sizeof *grown);
+    i = g_ke_shadow_size;
+    g_ke_shadow = grown;
+    g_ke_shadow_size = n;
+    return (int)i;
+}
 static CRITICAL_SECTION g_ke_shadow_cs;
 static int g_ke_shadow_init;
 
@@ -6653,8 +7420,6 @@ static void ke_shadow_init(void)
     if (g_ke_shadow_init)
         return;
     InitializeCriticalSection(&g_ke_shadow_cs);
-    /* Wipe any stale pointers from a prior lifecycle (defensive). */
-    memset(g_ke_shadow, 0, sizeof(g_ke_shadow));
     g_ke_shadow_init = 1;
 }
 
@@ -6672,7 +7437,7 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
     EnterCriticalSection(&g_ke_shadow_cs);
 
     /* Reuse an existing slot for this VA, if present. */
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
+    for (i = 0; i < g_ke_shadow_size; i++) {
         if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
             if (g_ke_shadow[i].host_handle && g_ke_shadow[i].host_handle != host)
                 CloseHandle(g_ke_shadow[i].host_handle);
@@ -6682,20 +7447,21 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
         }
     }
 
-    /* Otherwise find a free slot. */
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (!g_ke_shadow[i].in_use) {
-            g_ke_shadow[i].in_use      = 1;
-            g_ke_shadow[i].guest_va    = guest_va;
-            g_ke_shadow[i].host_handle = host;
+    /* Otherwise a free slot. */
+    {
+        int free_row = ke_shadow_free_slot();
+        if (free_row >= 0) {
+            g_ke_shadow[free_row].in_use      = 1;
+            g_ke_shadow[free_row].guest_va    = guest_va;
+            g_ke_shadow[free_row].host_handle = host;
             LeaveCriticalSection(&g_ke_shadow_cs);
             return;
         }
     }
 
-    /* Table full -- log and drop the new object. The caller's subsequent
+    /* Out of memory -- log and drop the new object. The caller's subsequent
      * waits will fall back to XBOX_TO_NATIVE and fail gracefully. */
-    fprintf(stderr, "  [KERNEL] Ke shadow table full; dropping VA 0x%08X\n",
+    fprintf(stderr, "  [KERNEL] Ke shadow: out of memory; dropping VA 0x%08X\n",
             guest_va);
     LeaveCriticalSection(&g_ke_shadow_cs);
     CloseHandle(host);
@@ -6713,7 +7479,7 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
     ke_shadow_init();
 
     EnterCriticalSection(&g_ke_shadow_cs);
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
+    for (i = 0; i < g_ke_shadow_size; i++) {
         if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
             h = g_ke_shadow[i].host_handle;
             break;
@@ -6734,7 +7500,7 @@ static void ke_shadow_remove(uint32_t guest_va)
     ke_shadow_init();
 
     EnterCriticalSection(&g_ke_shadow_cs);
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
+    for (i = 0; i < g_ke_shadow_size; i++) {
         if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
             if (g_ke_shadow[i].host_handle)
                 CloseHandle(g_ke_shadow[i].host_handle);
@@ -6790,22 +7556,22 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
 
     ke_shadow_init();
     EnterCriticalSection(&g_ke_shadow_cs);
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
+    for (i = 0; i < g_ke_shadow_size; i++) {
         if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
             h = g_ke_shadow[i].in_use == 2 ? g_ke_shadow[i].host_handle : NULL;
             LeaveCriticalSection(&g_ke_shadow_cs);
             return h;                              /* a KeInitializeEvent shadow: old path */
         }
     }
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (!g_ke_shadow[i].in_use) {
+    {
+        int free_row = ke_shadow_free_slot();
+        if (free_row >= 0) {
             h = CreateEventA(NULL, *type == 0, BRIDGE_MEM32(guest_va + 4) != 0, NULL);
             if (h) {
-                g_ke_shadow[i].in_use      = 2;
-                g_ke_shadow[i].guest_va    = guest_va;
-                g_ke_shadow[i].host_handle = h;
+                g_ke_shadow[free_row].in_use      = 2;
+                g_ke_shadow[free_row].guest_va    = guest_va;
+                g_ke_shadow[free_row].host_handle = h;
             }
-            break;
         }
     }
     LeaveCriticalSection(&g_ke_shadow_cs);
@@ -6871,10 +7637,10 @@ static void bridge_KeInterruptTime(void)
 static void bridge_KeSystemTime(void)
 {
     /* Refresh the 100ns-since-1601 clock before handing out the pointer. */
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
+    LARGE_INTEGER now_time;
+    xbox_KeQuerySystemTime(&now_time);
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = now_time.LowPart;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = (uint32_t)now_time.HighPart;
     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME;
 }
 
@@ -6964,26 +7730,79 @@ static void bridge_DbgUnLoadImageSymbols(void)
  */
 
 /* --- ExAcquireReadWriteLockExclusive (ordinal 12, 1 arg = 4 bytes) --- */
+/* ExReadWriteLock, the same fields and steps as the kernel's. A critical section
+ * stands in for its interrupts-off. */
+static CRITICAL_SECTION g_rw_cs;
+static INIT_ONCE g_rw_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK rw_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_rw_cs);
+    return TRUE;
+}
+#define RW_LOCK()   (InitOnceExecuteOnce(&g_rw_once, rw_init, NULL, NULL), EnterCriticalSection(&g_rw_cs))
+#define RW_UNLOCK() LeaveCriticalSection(&g_rw_cs)
+
+static void rw_wait(uint32_t obj)
+{
+    HANDLE h = ke_shadow_lookup(obj);
+    if (h) WaitForSingleObject(h, INFINITE);
+}
+
 static void bridge_ExAcquireReadWriteLockExclusive(void)
 {
-    (void)STACK_ARG(0);
+    uint32_t l = STACK_ARG(0);
+    int wait;
+    RW_LOCK();
+    BRIDGE_MEM32(l) = BRIDGE_MEM32(l) + 1;
+    wait = BRIDGE_MEM32(l) != 0;
+    if (wait) BRIDGE_MEM32(l + 4) = BRIDGE_MEM32(l + 4) + 1;
+    RW_UNLOCK();
+    if (wait) rw_wait(l + 0x10);
     g_eax = 0;
 }
 
 /* --- ExAcquireReadWriteLockShared (ordinal 13, 1 arg = 4 bytes) --- */
 static void bridge_ExAcquireReadWriteLockShared(void)
 {
-    (void)STACK_ARG(0);
+    uint32_t l = STACK_ARG(0);
+    int wait = 0;
+    RW_LOCK();
+    BRIDGE_MEM32(l) = BRIDGE_MEM32(l) + 1;
+    if (BRIDGE_MEM32(l) == 0 || (BRIDGE_MEM32(l + 0xC) != 0 && BRIDGE_MEM32(l + 4) == 0)) {
+        BRIDGE_MEM32(l + 0xC) = BRIDGE_MEM32(l + 0xC) + 1;
+    } else {
+        BRIDGE_MEM32(l + 8) = BRIDGE_MEM32(l + 8) + 1;
+        wait = 1;
+    }
+    RW_UNLOCK();
+    if (wait) rw_wait(l + 0x20);
     g_eax = 0;
 }
 
 /* --- ExInitializeReadWriteLock (ordinal 18, 1 arg = 4 bytes) --- */
 static void bridge_ExInitializeReadWriteLock(void)
 {
-    uint32_t lock_va = STACK_ARG(0);
-    if (lock_va)
-        memset(XBOX_TO_NATIVE(lock_va), 0, 24);
+    uint32_t l = STACK_ARG(0);
     g_eax = 0;
+    if (!l) return;
+    BRIDGE_MEM32(l) = 0xFFFFFFFFu;
+    BRIDGE_MEM32(l + 4) = 0;
+    BRIDGE_MEM32(l + 8) = 0;
+    BRIDGE_MEM32(l + 0xC) = 0;
+    /* WriterEvent: synchronization, not signalled. */
+    BRIDGE_MEM32(l + 0x10) = 0x00040001u;
+    BRIDGE_MEM32(l + 0x14) = 0;
+    BRIDGE_MEM32(l + 0x18) = l + 0x18;
+    BRIDGE_MEM32(l + 0x1C) = l + 0x18;
+    ke_shadow_insert(l + 0x10, CreateEventW(NULL, FALSE, FALSE, NULL));
+    /* ReaderSemaphore: count 0, limit 0x7FFFFFFF. */
+    BRIDGE_MEM32(l + 0x20) = 0x00050005u;
+    BRIDGE_MEM32(l + 0x24) = 0;
+    BRIDGE_MEM32(l + 0x28) = l + 0x28;
+    BRIDGE_MEM32(l + 0x2C) = l + 0x28;
+    BRIDGE_MEM32(l + 0x30) = 0x7FFFFFFFu;
+    ke_shadow_insert(l + 0x20, CreateSemaphoreW(NULL, 0, 0x7FFFFFFF, NULL));
 }
 
 /* --- ExInterlockedAddLargeInteger (ordinal 19, 3 args = 12 bytes)
@@ -7032,29 +7851,15 @@ static void bridge_ExInterlockedAddLargeInteger(void)
  * Addend (4) + Increment (4). Atomic add; per task spec, returns 0. */
 static void bridge_ExInterlockedAddLargeStatistic(void)
 {
-    uint32_t addend_va = STACK_ARG(0);
-    LONG increment = (LONG)STACK_ARG(1);
-    volatile LONG *p = (volatile LONG *)XBOX_TO_NATIVE(addend_va);
-
-    if (p) {
-        if (((uintptr_t)p & 7) == 0) {
-            volatile LONGLONG *qp = (volatile LONGLONG *)p;
-            LONGLONG cmp = *qp;
-            for (;;) {
-                LONGLONG desired = cmp + (LONGLONG)increment;
-                LONGLONG actual = InterlockedCompareExchange64(qp, desired, cmp);
-                if (actual == cmp)
-                    break;
-                cmp = actual;
-            }
-        } else {
-            LONGLONG val = ((LONGLONG)(uint32_t)p[1] << 32) | (uint32_t)p[0];
-            LONGLONG newv = val + (LONGLONG)increment;
-            p[0] = (LONG)(uint32_t)newv;
-            p[1] = (LONG)(uint32_t)((uint64_t)newv >> 32);
-        }
-    }
-    g_eax = 0;
+    /* fastcall: ecx Addend, edx Increment. 64-bit add of a 32-bit value. */
+    uint32_t a = g_ecx, inc = g_edx;
+    uint64_t v;
+    ex_lock();
+    v = ((uint64_t)BRIDGE_MEM32(a + 4) << 32) | BRIDGE_MEM32(a);
+    v += inc;
+    BRIDGE_MEM32(a) = (uint32_t)v;
+    BRIDGE_MEM32(a + 4) = (uint32_t)(v >> 32);
+    ex_unlock();
 }
 
 /* --- ExInterlockedCompareExchange64 (ordinal 21, 4 args = 16 bytes)
@@ -7067,51 +7872,89 @@ static void bridge_ExInterlockedAddLargeStatistic(void)
  * in edx:eax. */
 static void bridge_ExInterlockedCompareExchange64(void)
 {
-    LONGLONG old = 0;
-    volatile LONGLONG *qp;
-    LONGLONG exchange;
-    LONGLONG comparand;
-
-    exchange  = ((LONGLONG)(uint32_t)STACK_ARG(2) << 32)
-              | (LONGLONG)(uint32_t)STACK_ARG(1);
-    comparand = (LONGLONG)(uint32_t)STACK_ARG(3);
-    qp = (volatile LONGLONG *)XBOX_TO_NATIVE(STACK_ARG(0));
-
-    if (qp)
-        old = InterlockedCompareExchange64(qp, exchange, comparand);
-
+    /* fastcall: ecx Destination, edx -> Exchange, the stack -> Comparand. */
+    volatile LONGLONG *d = (volatile LONGLONG *)XBOX_TO_NATIVE(g_ecx);
+    LONGLONG x = (LONGLONG)(((uint64_t)BRIDGE_MEM32(g_edx + 4) << 32) | BRIDGE_MEM32(g_edx));
+    LONGLONG c = (LONGLONG)(((uint64_t)BRIDGE_MEM32(STACK_ARG(0) + 4) << 32) | BRIDGE_MEM32(STACK_ARG(0)));
+    LONGLONG old = InterlockedCompareExchange64(d, x, c);
     g_eax = (uint32_t)old;
     g_edx = (uint32_t)((uint64_t)old >> 32);
 }
 
 /* --- ExReadWriteRefurbInfo (ordinal 25, 3 args = 12 bytes) --- */
+/* ExReadWriteRefurbInfo(Info, Length, Write): 16 bytes the kernel keeps in a sector of the hard disk, its first DWORD
+ * the signature 'BRFR' that it writes itself; a read with no signature there gives zeros. Length must be 16. Here for
+ * "kernel_state.bin" (see xbox_state_save). */
 static void bridge_ExReadWriteRefurbInfo(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
+    extern void xbox_refurb_access(uint32_t saved[4], int write);
+    uint32_t saved[4];
+    uint32_t info = STACK_ARG(0), length = STACK_ARG(1), write = STACK_ARG(2) & 0xFF;
+    if (length != 16) { g_eax = 0xC000000Du; return; }
+    if (write) {
+        for (int i = 0; i < 4; i++) saved[i] = BRIDGE_MEM32(info + i * 4);
+        saved[0] = 0x52465242u;
+        xbox_refurb_access(saved, 1);
+    } else {
+        xbox_refurb_access(saved, 0);
+        for (int i = 0; i < 4; i++) BRIDGE_MEM32(info + i * 4) = saved[0] == 0x52465242u ? saved[i] : 0;
+    }
     g_eax = 0;
 }
 
 /* --- ExRaiseException (ordinal 26, 1 arg = 4 bytes) --- */
 static void bridge_ExRaiseException(void)
 {
-    (void)STACK_ARG(0);
+    /* Not dispatched without RECOMP_SEH=1: see bridge_raise. At least it shows. */
+    if (STACK_ARG(0) && bridge_seh_enabled()) { bridge_raise(STACK_ARG(0)); return; }
+    fprintf(stderr, "  [KERNEL] ExRaiseException: record 0x%08X, not dispatched\n", STACK_ARG(0));
+    fflush(stderr);
     g_eax = 0;
 }
 
 /* --- ExRaiseStatus (ordinal 27, 1 arg = 4 bytes) --- */
 static void bridge_ExRaiseStatus(void)
 {
-    (void)STACK_ARG(0);
+    /* Not dispatched without RECOMP_SEH=1: see bridge_raise. At least it shows. */
+    if (bridge_seh_enabled()) { bridge_raise_noncontinuable(STACK_ARG(0), 0); return; }
+    fprintf(stderr, "  [KERNEL] ExRaiseStatus: status 0x%08X, not dispatched\n", STACK_ARG(0));
+    fflush(stderr);
     g_eax = 0;
 }
 
 /* --- ExReleaseReadWriteLock (ordinal 28, 1 arg = 4 bytes) --- */
 static void bridge_ExReleaseReadWriteLock(void)
 {
-    (void)STACK_ARG(0);
+    uint32_t l = STACK_ARG(0);
+    uint32_t readers;
     g_eax = 0;
+    RW_LOCK();
+    BRIDGE_MEM32(l) = BRIDGE_MEM32(l) - 1;
+    if ((int32_t)BRIDGE_MEM32(l) < 0) {           /* nobody holds or waits */
+        BRIDGE_MEM32(l + 0xC) = 0;
+        RW_UNLOCK();
+        return;
+    }
+    if (BRIDGE_MEM32(l + 0xC) != 0) {             /* a reader left */
+        BRIDGE_MEM32(l + 0xC) = BRIDGE_MEM32(l + 0xC) - 1;
+        if (BRIDGE_MEM32(l + 0xC) != 0) {
+            RW_UNLOCK();
+            return;
+        }
+    } else if ((readers = BRIDGE_MEM32(l + 8)) != 0) {   /* a writer left, readers wait */
+        HANDLE h = ke_shadow_lookup(l + 0x20);
+        BRIDGE_MEM32(l + 0xC) = readers;
+        BRIDGE_MEM32(l + 8) = 0;
+        RW_UNLOCK();
+        if (h) ReleaseSemaphore(h, (LONG)readers, NULL);
+        return;
+    }
+    BRIDGE_MEM32(l + 4) = BRIDGE_MEM32(l + 4) - 1;   /* the next writer */
+    RW_UNLOCK();
+    {
+        HANDLE h = ke_shadow_lookup(l + 0x10);
+        if (h) SetEvent(h);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -7128,20 +7971,16 @@ static void bridge_ExReleaseReadWriteLock(void)
  * itself for an empty list). */
 static void bridge_ExfInterlockedInsertHeadList(void)
 {
-    uint32_t entry_va = STACK_ARG(0);
-    uint32_t head_va  = STACK_ARG(1);
-    volatile LONG *h_flink = (volatile LONG *)XBOX_TO_NATIVE(head_va);
-    uint32_t old_flink = 0;
-
-    if (h_flink) {
-        /* Atomically seat the new head; remember what used to be first. */
-        old_flink = (uint32_t)InterlockedExchange(h_flink, (LONG)entry_va);
-        BRIDGE_MEM32(entry_va + 0) = old_flink;  /* Entry->Flink = old first */
-        BRIDGE_MEM32(entry_va + 4) = head_va;    /* Entry->Blink = head       */
-        if (old_flink)
-            BRIDGE_MEM32(old_flink + 4) = entry_va; /* old first->Blink = Entry */
-    }
-    g_eax = old_flink;
+    /* fastcall: ecx ListHead, edx Entry. The old first entry, NULL if it was empty. */
+    uint32_t head = g_ecx, e = g_edx, first;
+    ex_lock();
+    first = BRIDGE_MEM32(head);
+    BRIDGE_MEM32(e) = first;
+    BRIDGE_MEM32(e + 4) = head;
+    BRIDGE_MEM32(head) = e;
+    BRIDGE_MEM32(first + 4) = e;
+    ex_unlock();
+    g_eax = first == head ? 0 : first;
 }
 
 /* --- ExfInterlockedInsertTailList (ordinal 33, 2 args = 8 bytes)
@@ -7151,20 +7990,16 @@ static void bridge_ExfInterlockedInsertHeadList(void)
  * "old Flink" but the canonical Xbox/NT behaviour is the old Blink. */
 static void bridge_ExfInterlockedInsertTailList(void)
 {
-    uint32_t entry_va = STACK_ARG(0);
-    uint32_t head_va  = STACK_ARG(1);
-    volatile LONG *h_blink = (volatile LONG *)XBOX_TO_NATIVE(head_va + 4);
-    uint32_t old_blink = 0;
-
-    if (h_blink) {
-        /* Atomically seat the new tail; remember what used to be last. */
-        old_blink = (uint32_t)InterlockedExchange(h_blink, (LONG)entry_va);
-        BRIDGE_MEM32(entry_va + 0) = head_va;     /* Entry->Flink = head      */
-        BRIDGE_MEM32(entry_va + 4) = old_blink;   /* Entry->Blink = old last  */
-        if (old_blink)
-            BRIDGE_MEM32(old_blink + 0) = entry_va; /* old last->Flink = Entry */
-    }
-    g_eax = old_blink;
+    /* fastcall: ecx ListHead, edx Entry. The old last entry, NULL if it was empty. */
+    uint32_t head = g_ecx, e = g_edx, last;
+    ex_lock();
+    last = BRIDGE_MEM32(head + 4);
+    BRIDGE_MEM32(e) = head;
+    BRIDGE_MEM32(e + 4) = last;
+    BRIDGE_MEM32(head + 4) = e;
+    BRIDGE_MEM32(last) = e;
+    ex_unlock();
+    g_eax = last == head ? 0 : last;
 }
 
 /* --- ExfInterlockedRemoveHeadList (ordinal 34, 1 arg = 4 bytes)
@@ -7172,33 +8007,19 @@ static void bridge_ExfInterlockedInsertTailList(void)
  * Returns the removed first entry, or 0 when the list is empty. */
 static void bridge_ExfInterlockedRemoveHeadList(void)
 {
-    uint32_t head_va = STACK_ARG(0);
-    volatile LONG *h_flink = (volatile LONG *)XBOX_TO_NATIVE(head_va);
-    uint32_t removed = 0;
-
-    if (h_flink) {
-        for (;;) {
-            uint32_t first = (uint32_t)*h_flink;
-            if (first == head_va) {   /* empty list */
-                removed = 0;
-                break;
-            }
-            /* Pull Entry = first; Entry's Flink becomes the new head, but only
-             * if the head still points at first (single-threaded: it does). */
-            {
-                uint32_t entry_flink = BRIDGE_MEM32(first + 0);
-                if (InterlockedCompareExchange(h_flink,
-                                              (LONG)entry_flink,
-                                              (LONG)first) == (LONG)first) {
-                    if (entry_flink)
-                        BRIDGE_MEM32(entry_flink + 4) = head_va;
-                    removed = first;
-                    break;
-                }
-            }
-        }
+    /* fastcall: ecx ListHead. The first entry, NULL if empty. */
+    uint32_t head = g_ecx, first;
+    ex_lock();
+    first = BRIDGE_MEM32(head);
+    if (first == head) {
+        first = 0;
+    } else {
+        uint32_t next = BRIDGE_MEM32(first);
+        BRIDGE_MEM32(head) = next;
+        BRIDGE_MEM32(next + 4) = head;
     }
-    g_eax = removed;
+    ex_unlock();
+    g_eax = first;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -7252,12 +8073,13 @@ static void bridge_HalWriteSMCScratchRegister(void)
  * fastcall: ecx=Destination, edx=Exchange, eax=Comparand-in/old-out. */
 static void bridge_InterlockedCompareExchange(void)
 {
+    /* ecx Destination, edx Exchange, the comparand on the stack. */
     LONG *dst = (LONG *)XBOX_TO_NATIVE(g_ecx);
     if (!dst) {
         g_eax = 0;
         return;
     }
-    g_eax = (uint32_t)InterlockedCompareExchange(dst, (LONG)g_edx, (LONG)g_eax);
+    g_eax = (uint32_t)InterlockedCompareExchange(dst, (LONG)g_edx, (LONG)STACK_ARG(0));
 }
 
 /* --- InterlockedDecrement (ordinal 52)
@@ -7311,23 +8133,52 @@ static void bridge_InterlockedExchangeAdd(void)
 /* --- InterlockedFlushSList (ordinal 56, fastcall) --- */
 static void bridge_InterlockedFlushSList(void)
 {
-    (void)g_ecx;
-    g_eax = 0;
+    uint32_t list = g_ecx;
+    volatile LONGLONG *h = (volatile LONGLONG *)XBOX_TO_NATIVE(list);
+    LONGLONG old;
+    do {
+        old = *h;
+        if ((uint32_t)old == 0) break;
+    } while (InterlockedCompareExchange64(h, 0, old) != old);
+    g_eax = (uint32_t)old;
+    g_edx = (uint32_t)((uint64_t)old >> 32);
 }
 
 /* --- InterlockedPopEntrySList (ordinal 57, fastcall) --- */
 static void bridge_InterlockedPopEntrySList(void)
 {
-    (void)g_ecx;
-    g_eax = 0;
+    uint32_t list = g_ecx;
+    volatile LONGLONG *h = (volatile LONGLONG *)XBOX_TO_NATIVE(list);
+    LONGLONG old;
+    for (;;) {
+        uint32_t next, hi;
+        old = *h;
+        if ((uint32_t)old == 0) break;
+        next = BRIDGE_MEM32((uint32_t)old);
+        hi = (uint32_t)((uint64_t)old >> 32) + 0xFFFFu;   /* Depth - 1, Sequence + 1 */
+        if (InterlockedCompareExchange64(h, (LONGLONG)(((uint64_t)hi << 32) | next), old) == old)
+            break;
+    }
+    g_eax = (uint32_t)old;
+    g_edx = (uint32_t)((uint64_t)old >> 32);
 }
 
 /* --- InterlockedPushEntrySList (ordinal 58, fastcall) --- */
 static void bridge_InterlockedPushEntrySList(void)
 {
-    (void)g_ecx;
-    (void)g_edx;
-    g_eax = 0;
+    uint32_t list = g_ecx, entry = g_edx;
+    volatile LONGLONG *h = (volatile LONGLONG *)XBOX_TO_NATIVE(list);
+    LONGLONG old;
+    do {
+        uint32_t hi;
+        old = *h;
+        BRIDGE_MEM32(entry) = (uint32_t)old;
+        hi = (uint32_t)((uint64_t)old >> 32) + 0x10001u;   /* Depth + 1, Sequence + 1 */
+        if (InterlockedCompareExchange64(h, (LONGLONG)(((uint64_t)hi << 32) | entry), old) == old)
+            break;
+    } while (1);
+    g_eax = (uint32_t)old;
+    g_edx = (uint32_t)((uint64_t)old >> 32);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -7339,73 +8190,23 @@ static void bridge_InterlockedPushEntrySList(void)
  * PIRP IoAllocateIrp(CCHAR StackSize, BOOLEAN ChargeQuota);
  * Allocates an IRP header plus StackSize IO_STACK_LOCATIONs from the guest
  * heap. Pair with IoFreeIrp (ordinal 72), which frees through the same heap. */
-static void bridge_IoAllocateIrp(void)
-{
-    uint32_t stack_size = STACK_ARG(0);
-    uint32_t charge_quota = STACK_ARG(1);
-    uint32_t total = 0x28 + stack_size * 0x20;  /* header + stack locations */
-    uint32_t va;
-
-    (void)charge_quota;
-    va = xbox_HeapAlloc(total, 16);
-    if (va)
-        memset((void *)((uintptr_t)va + g_xbox_mem_offset), 0, total);
-    else
-        fprintf(stderr, "  [KERNEL] IoAllocateIrp: %u bytes REFUSED\n", total);
-    g_eax = va;
-}
 
 /* --- IoBuildAsynchronousFsdRequest (ordinal 60, 7 args = 28 bytes) --- */
-static void bridge_IoBuildAsynchronousFsdRequest(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    g_eax = 0;
-}
 
 /* --- IoCheckShareAccess (ordinal 63, 5 args = 20 bytes) --- */
-static void bridge_IoCheckShareAccess(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    g_eax = 0;
-}
 
 /* --- IoFreeIrp (ordinal 72, 1 arg = 4 bytes) --- */
-static void bridge_IoFreeIrp(void)
-{
-    xbox_HeapFree(STACK_ARG(0));
-    g_eax = 0;
-}
 
 /* --- IoQueryFileInformation (ordinal 75, 5 args = 20 bytes) --- */
 static void bridge_IoQueryFileInformation(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    g_eax = 0xC000000D;  /* STATUS_INVALID_PARAMETER */
+    g_eax = 0xC0000002u;   /* STATUS_NOT_IMPLEMENTED: driver-level, no file objects here */
 }
 
 /* --- IoQueryVolumeInformation (ordinal 76, 5 args = 20 bytes) --- */
 static void bridge_IoQueryVolumeInformation(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    g_eax = 0xC000000D;  /* STATUS_INVALID_PARAMETER */
+    g_eax = 0xC0000002u;   /* STATUS_NOT_IMPLEMENTED: driver-level, no file objects here */
 }
 
 /* --- IoQueueThreadIrp (ordinal 77, 1 arg = 4 bytes) --- */
@@ -7416,21 +8217,8 @@ static void bridge_IoQueueThreadIrp(void)
 }
 
 /* --- IoRemoveShareAccess (ordinal 78, 2 args = 8 bytes) --- */
-static void bridge_IoRemoveShareAccess(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-}
 
 /* --- IoSetShareAccess (ordinal 80, 5 args = 20 bytes) --- */
-static void bridge_IoSetShareAccess(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-}
 
 /* --- IoDismountVolume (ordinal 90, 1 arg = 4 bytes) --- */
 static void bridge_IoDismountVolume(void)
@@ -7498,11 +8286,11 @@ static void bridge_KeInitializeEvent(void)
      *                +0x0C WaitListHead.Blink */
     BRIDGE_MEM8(guest_va + 0)  = (uint8_t)(event_type ? 1 : 0);
     BRIDGE_MEM8(guest_va + 1)  = 0;
-    BRIDGE_MEM8(guest_va + 2)  = 16;
-    BRIDGE_MEM8(guest_va + 3)  = 1;
+    BRIDGE_MEM8(guest_va + 2)  = 4;    /* Size, in dwords */
+    BRIDGE_MEM8(guest_va + 3)  = 0;
     BRIDGE_MEM32(guest_va + 4) = initial_state ? 1 : 0; /* SignalState */
-    BRIDGE_MEM32(guest_va + 8) = 0;  /* WaitListHead.Flink (self/empty) */
-    BRIDGE_MEM32(guest_va + 12) = 0; /* WaitListHead.Blink (self/empty) */
+    BRIDGE_MEM32(guest_va + 8)  = guest_va + 8;  /* empty WaitListHead points at itself */
+    BRIDGE_MEM32(guest_va + 12) = guest_va + 8;
 
     g_eax = 0;
 }
@@ -7523,16 +8311,17 @@ static void bridge_KeInitializeMutant(void)
 
     ke_shadow_insert(guest_va, h);
 
-    /* Mutant dispatcher header. SignalState semantics differ from events:
-     * a mutant is SIGNALLED (owned count 0) when its SignalState is 0.
-     * Win32 CreateMutex(initialOwner=TRUE) is owned, so SignalState=1. */
-    BRIDGE_MEM8(guest_va + 0)  = 19;   /* DispatcherObjectType */
+    /* As the real KeInitializeMutant: Type 2, Size 8 dwords. SignalState is 1
+     * when free and 0 when owned; Owner (+0x18) and Abandoned (+0x1C). */
+    BRIDGE_MEM8(guest_va + 0)  = 2;
     BRIDGE_MEM8(guest_va + 1)  = 0;
-    BRIDGE_MEM8(guest_va + 2)  = 16;
-    BRIDGE_MEM8(guest_va + 3)  = 1;
-    BRIDGE_MEM32(guest_va + 4) = initial_owner ? 1 : 0; /* SignalState */
-    BRIDGE_MEM32(guest_va + 8) = 0;   /* WaitListHead */
-    BRIDGE_MEM32(guest_va + 12) = 0;
+    BRIDGE_MEM8(guest_va + 2)  = 8;
+    BRIDGE_MEM8(guest_va + 3)  = 0;
+    BRIDGE_MEM32(guest_va + 4) = initial_owner ? 0 : 1;
+    BRIDGE_MEM32(guest_va + 8)  = guest_va + 8;
+    BRIDGE_MEM32(guest_va + 12) = guest_va + 8;
+    BRIDGE_MEM32(guest_va + 0x18) = 0;
+    BRIDGE_MEM8(guest_va + 0x1C) = 0;
 
     g_eax = 0;
 }
@@ -7554,13 +8343,15 @@ static void bridge_KeInitializeSemaphore(void)
 
     ke_shadow_insert(guest_va, h);
 
-    BRIDGE_MEM8(guest_va + 0)  = 18;   /* DispatcherObjectType */
+    /* As the real KeInitializeSemaphore: Type 5, Size 5 dwords, Limit at +0x10. */
+    BRIDGE_MEM8(guest_va + 0)  = 5;
     BRIDGE_MEM8(guest_va + 1)  = 0;
-    BRIDGE_MEM8(guest_va + 2)  = 16;
-    BRIDGE_MEM8(guest_va + 3)  = 1;
-    BRIDGE_MEM32(guest_va + 4) = (LONG)count; /* SignalState = count */
-    BRIDGE_MEM32(guest_va + 8) = 0;   /* WaitListHead */
-    BRIDGE_MEM32(guest_va + 12) = 0;
+    BRIDGE_MEM8(guest_va + 2)  = 5;
+    BRIDGE_MEM8(guest_va + 3)  = 0;
+    BRIDGE_MEM32(guest_va + 4) = (LONG)count;
+    BRIDGE_MEM32(guest_va + 8)  = guest_va + 8;
+    BRIDGE_MEM32(guest_va + 12) = guest_va + 8;
+    BRIDGE_MEM32(guest_va + 0x10) = limit;
 
     g_eax = 0;
 }
@@ -7580,19 +8371,20 @@ static void bridge_KePulseEvent(void)
         int type;
         HANDLE ge = ke_guest_event(guest_va, &type);
         if (ge) {
-            PulseEvent(ge);
-            BRIDGE_MEM32(guest_va + 4) = 0;
-            g_eax = 0;
+                    g_eax = BRIDGE_MEM32(guest_va + 4);   /* previous state */
+        PulseEvent(ge);
+        BRIDGE_MEM32(guest_va + 4) = 0;
             return;
         }
     }
     h = ke_shadow_lookup(guest_va);
+    if (h)
+        BRIDGE_MEM32(guest_va + 4) = 0;
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
+    g_eax = h ? bridge_event_state(h) : 0;   /* previous state */
     if (h)
         PulseEvent(h);
-
-    g_eax = 0; /* previous state unknown */
 }
 
 /* --- KeReleaseMutant (ordinal 131, 4 args = 16 bytes) --- */
@@ -7632,10 +8424,14 @@ static void bridge_KeReleaseSemaphore(void)
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
-    if (h)
-        ReleaseSemaphore(h, (LONG)adjustment, NULL);
-
-    g_eax = 0;
+    {
+        LONG prev = 0;
+        if (h && ReleaseSemaphore(h, (LONG)adjustment, &prev))
+            InterlockedExchangeAdd((volatile LONG *)&BRIDGE_MEM32(guest_va + 4), (LONG)adjustment);
+        else if (h && bridge_seh_enabled())
+            bridge_raise_noncontinuable(0xC0000047u, 0);   /* past its limit: raised, as the kernel */
+        g_eax = (uint32_t)prev;   /* previous count */
+    }
 }
 
 /* --- KeResetEvent (ordinal 138, 1 arg = 4 bytes) --- */
@@ -7648,25 +8444,29 @@ static void bridge_KeResetEvent(void)
         int type;
         HANDLE ge = ke_guest_event(guest_va, &type);
         if (ge) {
-            BRIDGE_MEM32(guest_va + 4) = 0;
-            ResetEvent(ge);
-            g_eax = 0;
+                    g_eax = BRIDGE_MEM32(guest_va + 4);   /* previous state */
+        BRIDGE_MEM32(guest_va + 4) = 0;
+        ResetEvent(ge);
             return;
         }
     }
     h = ke_shadow_lookup(guest_va);
+    if (h)
+        BRIDGE_MEM32(guest_va + 4) = 0;
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
+        g_eax = h ? bridge_event_state(h) : 0;   /* previous state */
     if (h)
         ResetEvent(h);
-
-    g_eax = 0;
 }
 
 /* --- KeResumeThread (ordinal 140, 1 arg = 4 bytes) --- */
 static void bridge_KeResumeThread(void)
 {
-    HANDLE hThread = bridge_resolve_handle(STACK_ARG(0));
+    /* The real one takes a KTHREAD: our stand-in object first. */
+    HANDLE hThread = bridge_thread_host(STACK_ARG(0), NULL);
+    if (!hThread)
+        hThread = bridge_resolve_handle(STACK_ARG(0));
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
@@ -7679,7 +8479,10 @@ static void bridge_KeResumeThread(void)
 /* --- KeSuspendThread (ordinal 152, 1 arg = 4 bytes) --- */
 static void bridge_KeSuspendThread(void)
 {
-    HANDLE hThread = bridge_resolve_handle(STACK_ARG(0));
+    /* The real one takes a KTHREAD: our stand-in object first. */
+    HANDLE hThread = bridge_thread_host(STACK_ARG(0), NULL);
+    if (!hThread)
+        hThread = bridge_resolve_handle(STACK_ARG(0));
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
@@ -7692,8 +8495,9 @@ static void bridge_KeSuspendThread(void)
 /* --- KeAlertResumeThread (ordinal 92, 1 arg = 4 bytes) --- */
 static void bridge_KeAlertResumeThread(void)
 {
-    (void)STACK_ARG(0);
-    g_eax = 0;
+    /* Alerts and resumes: the alert has no host equal for a suspended thread. */
+    HANDLE h = bridge_thread_host(STACK_ARG(0), NULL);
+    g_eax = h ? (uint32_t)ResumeThread(h) : 0;
 }
 
 /* --- KeBoostPriorityThread (ordinal 94, 2 args = 8 bytes) --- */
@@ -7730,75 +8534,83 @@ static void bridge_KeInitializeApc(void)
 }
 
 /* --- KeInitializeDeviceQueue (ordinal 106, 1 arg = 4 bytes) --- */
-static void bridge_KeInitializeDeviceQueue(void)
-{
-    uint32_t queue_va = STACK_ARG(0);
-
-    if (queue_va) {
-        BRIDGE_MEM8(queue_va + 0)  = 0;
-        BRIDGE_MEM8(queue_va + 1)  = 0;
-        BRIDGE_MEM8(queue_va + 2)  = 0;
-        BRIDGE_MEM8(queue_va + 3)  = 0;
-        BRIDGE_MEM32(queue_va + 4) = 0;  /* DeviceLock */
-        BRIDGE_MEM32(queue_va + 8) = 0;  /* DeviceListHead.Flink */
-        BRIDGE_MEM32(queue_va + 12) = 0; /* DeviceListHead.Blink */
-    }
-    g_eax = 0;
-}
 
 /* --- KeInitializeQueue (ordinal 111, 2 args = 8 bytes) --- */
+/* KQUEUE: Type 4, Size 10 dwords, SignalState +4 (entries waiting), WaitList +8,
+ * EntryList +0x10, CurrentCount +0x18, MaximumCount +0x1C, ThreadList +0x20, as the
+ * kernel lays it out. A host semaphore counts the entries for waiters. Not modelled:
+ * the kernel holding back waiters once MaximumCount threads run. */
+static CRITICAL_SECTION g_queue_cs;
+static INIT_ONCE g_queue_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK queue_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_queue_cs);
+    return TRUE;
+}
+#define QUEUE_LOCK()   (InitOnceExecuteOnce(&g_queue_once, queue_init, NULL, NULL), EnterCriticalSection(&g_queue_cs))
+#define QUEUE_UNLOCK() LeaveCriticalSection(&g_queue_cs)
+
+static void queue_insert(int at_head)
+{
+    uint32_t q = STACK_ARG(0), e = STACK_ARG(1), head = q + 0x10, prev;
+    HANDLE h = ke_shadow_lookup(q);
+    QUEUE_LOCK();
+    prev = BRIDGE_MEM32(q + 4);
+    BRIDGE_MEM32(q + 4) = prev + 1;
+    if (at_head) {
+        uint32_t next = BRIDGE_MEM32(head);
+        BRIDGE_MEM32(e) = next;
+        BRIDGE_MEM32(e + 4) = head;
+        BRIDGE_MEM32(next + 4) = e;
+        BRIDGE_MEM32(head) = e;
+    } else {
+        uint32_t last = BRIDGE_MEM32(head + 4);
+        BRIDGE_MEM32(e) = head;
+        BRIDGE_MEM32(e + 4) = last;
+        BRIDGE_MEM32(last) = e;
+        BRIDGE_MEM32(head + 4) = e;
+    }
+    QUEUE_UNLOCK();
+    if (h) ReleaseSemaphore(h, 1, NULL);
+    g_eax = prev;
+}
+
 static void bridge_KeInitializeQueue(void)
 {
-    uint32_t queue_va = STACK_ARG(0);
+    uint32_t q = STACK_ARG(0);
     uint32_t count = STACK_ARG(1);
 
-    if (queue_va) {
-        BRIDGE_MEM8(queue_va + 0)  = 0;
-        BRIDGE_MEM8(queue_va + 1)  = 0;
-        BRIDGE_MEM8(queue_va + 2)  = 0;
-        BRIDGE_MEM8(queue_va + 3)  = 1;
-        BRIDGE_MEM32(queue_va + 4) = 0;  /* Count */
-        BRIDGE_MEM32(queue_va + 8) = 0;  /* EntryCount */
-        BRIDGE_MEM32(queue_va + 12) = (LONG)count; /* MaximumCount */
-        BRIDGE_MEM32(queue_va + 16) = 0; /* ThreadListHead */
-        BRIDGE_MEM32(queue_va + 20) = 0; /* ThreadListHead */
-        BRIDGE_MEM32(queue_va + 24) = 0; /* Lock */
-        BRIDGE_MEM32(queue_va + 28) = 0; /* Lock */
-    }
-    g_eax = queue_va;
+    g_eax = 0;
+    if (!q) return;
+    BRIDGE_MEM8(q + 0) = 4;
+    BRIDGE_MEM8(q + 2) = 0x0A;
+    BRIDGE_MEM32(q + 4) = 0;
+    BRIDGE_MEM32(q + 8) = q + 8;
+    BRIDGE_MEM32(q + 0xC) = q + 8;
+    BRIDGE_MEM32(q + 0x10) = q + 0x10;
+    BRIDGE_MEM32(q + 0x14) = q + 0x10;
+    BRIDGE_MEM32(q + 0x18) = 0;
+    BRIDGE_MEM32(q + 0x1C) = count ? count : 1;
+    BRIDGE_MEM32(q + 0x20) = q + 0x20;
+    BRIDGE_MEM32(q + 0x24) = q + 0x20;
+    ke_shadow_insert(q, CreateSemaphoreW(NULL, 0, 0x7FFFFFFF, NULL));
 }
 
 /* --- KeInsertByKeyDeviceQueue (ordinal 114, 3 args = 12 bytes) --- */
-static void bridge_KeInsertByKeyDeviceQueue(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    g_eax = 0;
-}
 
 /* --- KeInsertDeviceQueue (ordinal 115, 2 args = 8 bytes) --- */
-static void bridge_KeInsertDeviceQueue(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    g_eax = 0;
-}
 
 /* --- KeInsertHeadQueue (ordinal 116, 2 args = 8 bytes) --- */
 static void bridge_KeInsertHeadQueue(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    g_eax = 0;
+    queue_insert(1);
 }
 
 /* --- KeInsertQueue (ordinal 117, 2 args = 8 bytes) --- */
 static void bridge_KeInsertQueue(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    g_eax = 0;
+    queue_insert(0);
 }
 
 /* --- KeInsertQueueApc (ordinal 118, 4 args = 16 bytes) --- */
@@ -7820,7 +8632,7 @@ static void bridge_KeInsertQueueApc(void)
 /* --- KeIsExecutingDpc (ordinal 121, 0 args = 0 bytes) --- */
 static void bridge_KeIsExecutingDpc(void)
 {
-    g_eax = 0;
+    g_eax = t_in_dpc;
 }
 
 /* --- KeLeaveCriticalRegion (ordinal 122, 0 args = 0 bytes) --- */
@@ -7832,37 +8644,653 @@ static void bridge_KeLeaveCriticalRegion(void)
 /* --- KeRaiseIrqlToSynchLevel (ordinal 130, 0 args = 0 bytes) --- */
 static void bridge_KeRaiseIrqlToSynchLevel(void)
 {
-    g_eax = 0;  /* PASSIVE_LEVEL; IRQL is not modelled */
+    g_eax = (uint32_t)xbox_KfRaiseIrql(0x1C);   /* SYNCH_LEVEL, returns the old one */
 }
 
 /* --- KeRemoveByKeyDeviceQueue (ordinal 133, 2 args = 8 bytes) --- */
-static void bridge_KeRemoveByKeyDeviceQueue(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    g_eax = 0;
-}
 
 /* --- KeRemoveDeviceQueue (ordinal 134, 1 arg = 4 bytes) --- */
-static void bridge_KeRemoveDeviceQueue(void)
+
+/* --- KeRemoveEntryDeviceQueue (ordinal 135, 2 args = 8 bytes) --- */
+/* ── The I/O manager's requests ──────────────────────────────
+ *
+ * The kernel's IRPs, device objects and device queues, in guest memory and in the kernel's layout, so a driver in a
+ * title sees what it would on a console. The host answers files itself, so no request of ours passes through here.
+ *
+ * Calling a title's driver routines is behind RECOMP_IO_REQUESTS=1: those functions did nothing until now, and titles
+ * that import them may hold driver code that expects hardware. Off, they behave as before.
+ *
+ * IRP: +0 Type (6), +2 Size, +4 Flags, +8 ThreadListEntry, +0x10 IoStatus, +0x18 StackCount, +0x19 CurrentLocation,
+ * +0x1A PendingReturned, +0x1C UserIosb, +0x20 UserEvent, +0x28 UserApc routine, +0x2C its context, +0x30 UserBuffer,
+ * +0x38 locked length, +0x3C DeviceQueueEntry, +0x50 Thread, +0x5C CurrentStackLocation, +0x60 FileObject; stack
+ * locations of 0x28 bytes follow from +0x68.
+ * Stack location: +0 Major, +1 Minor, +3 Control, +4..+0x13 Parameters, +0x18 DeviceObject, +0x1C FileObject,
+ * +0x20 CompletionRoutine, +0x24 its context.
+ * Device: +4 ReferenceCount, +8 DriverObject, +0xC mounted volume, +0x10 CurrentIrp, +0x14 Flags, +0x18 Extension,
+ * +0x1C DeviceType, +0x1D start-I/O flags, +0x1E StackSize, +0x1F DeletePending, +0x28 DeviceQueue, +0x34 lock event.
+ * Driver: +0 StartIo, +4 DeleteDevice, +8 Dismount, +0xC MajorFunction[]. */
+#define IRP_STACK_SIZE 0x28u
+
+static int io_requests_on(void)
 {
-    (void)STACK_ARG(0);
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_IO_REQUESTS"); on = e && *e == '1'; }
+    return on;
+}
+
+/* Calls stdcall guest code; its result */
+static uint32_t bridge_call_guest(uint32_t routine, int argc, const uint32_t *argv)
+{
+    recomp_func_t fn = recomp_lookup(routine);
+    uint32_t esp = g_esp, r;
+    if (!fn) fn = recomp_lookup_manual(routine);
+    if (!fn) fn = recomp_lookup_kernel(routine);
+    if (!fn) {
+        fprintf(stderr, "  [KERNEL] driver routine 0x%08X not in dispatch\n", routine);
+        return 0xC0000001u;
+    }
+    for (int i = argc - 1; i >= 0; i--) { g_esp -= 4; BRIDGE_MEM32(g_esp) = argv[i]; }
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    fn();
+    r = g_eax;
+    g_esp = esp;
+    return r;
+}
+
+static void bridge_set_event_va(uint32_t va)
+{
+    int type;
+    HANDLE h = ke_guest_event(va, &type);
+    if (h) BRIDGE_MEM32(va + 4) = 1;
+    else h = ke_shadow_lookup(va);
+    if (h) SetEvent(h);
+}
+
+static void irp_init(uint32_t irp, uint32_t size, uint32_t stack)
+{
+    memset(XBOX_TO_NATIVE(irp), 0, size);
+    BRIDGE_MEM16(irp) = 6;
+    BRIDGE_MEM16(irp + 2) = (uint16_t)size;
+    BRIDGE_MEM32(irp + 8) = irp + 8;
+    BRIDGE_MEM32(irp + 0xC) = irp + 8;
+    BRIDGE_MEM8(irp + 0x18) = (uint8_t)stack;
+    BRIDGE_MEM8(irp + 0x19) = (uint8_t)(stack + 1);
+    BRIDGE_MEM32(irp + 0x5C) = irp + 0x68 + (int32_t)(int8_t)stack * IRP_STACK_SIZE;
+}
+
+static uint32_t irp_alloc(uint32_t stack)
+{
+    uint32_t size = ((int32_t)(int8_t)stack * IRP_STACK_SIZE + 0x68) & 0xFFFF;
+    uint32_t irp = pool_alloc(size);
+    if (irp) irp_init(irp, size, stack);
+    return irp;
+}
+
+static void irp_free(uint32_t irp)
+{
+    if (BRIDGE_MEM16(irp) != 6) {
+        fprintf(stderr, "  [KERNEL] IoFreeIrp: 0x%08X is not an IRP (bug check 0x44 on a console)\n", irp);
+        bridge_bugcheck_end(0x44);
+        return;
+    }
+    BRIDGE_MEM16(irp) = 0;
+    xbox_HeapFree(irp);
+}
+
+static void bridge_IoAllocateIrp(void) { g_eax = irp_alloc(STACK_ARG(0) & 0xFF); }
+
+static void bridge_IoInitializeIrp(void) { irp_init(STACK_ARG(0), STACK_ARG(1) & 0xFFFF, STACK_ARG(2) & 0xFF); }
+
+static void bridge_IoFreeIrp(void) { irp_free(STACK_ARG(0)); }
+
+static void bridge_IoMarkIrpMustComplete(void)
+{
+    uint32_t stack = BRIDGE_MEM32(STACK_ARG(0) + 0x5C);
+    BRIDGE_MEM8(stack + 3) |= 2;
+}
+
+/* The request's stack location for the next driver; calls its routine for this major function */
+static uint32_t irp_call_driver(uint32_t device, uint32_t irp)
+{
+    uint32_t stack, argv[2];
+    int8_t loc = (int8_t)(BRIDGE_MEM8(irp + 0x19) - 1);
+    BRIDGE_MEM8(irp + 0x19) = (uint8_t)loc;
+    if (loc <= 0) {
+        fprintf(stderr, "  [KERNEL] IofCallDriver: IRP 0x%08X out of stack locations (bug check 0x35 on a console)\n", irp);
+        bridge_bugcheck_end(0x35);
+        return 0xC0000001u;
+    }
+    stack = BRIDGE_MEM32(irp + 0x5C) - IRP_STACK_SIZE;
+    BRIDGE_MEM32(irp + 0x5C) = stack;
+    BRIDGE_MEM32(stack + 0x18) = device;
+    argv[0] = device, argv[1] = irp;
+    return bridge_call_guest(BRIDGE_MEM32(BRIDGE_MEM32(device + 8) + 0xC + BRIDGE_MEM8(stack) * 4), 2, argv);
+}
+
+static void bridge_IofCallDriver(void)
+{
+    g_eax = io_requests_on() ? irp_call_driver(g_ecx, g_edx) : 0;
+}
+
+/* Unwinds the stack locations, calling completion routines, then finishes the request for its caller */
+static void irp_complete(uint32_t irp)
+{
+    uint8_t count = BRIDGE_MEM8(irp + 0x18) + 1;
+    int8_t loc = (int8_t)BRIDGE_MEM8(irp + 0x19);
+    uint32_t stack, flags;
+
+    if (loc > (int8_t)count || BRIDGE_MEM16(irp) != 6) {
+        fprintf(stderr, "  [KERNEL] IofCompleteRequest: bad IRP 0x%08X (bug check 0x44 on a console)\n", irp);
+        bridge_bugcheck_end(0x44);
+        return;
+    }
+    stack = BRIDGE_MEM32(irp + 0x5C);
+    loc++;
+    BRIDGE_MEM8(irp + 0x19) = (uint8_t)loc;
+    BRIDGE_MEM32(irp + 0x5C) = stack + IRP_STACK_SIZE;
+    while (loc <= (int8_t)count) {
+        uint8_t control = BRIDGE_MEM8(stack + 3);
+        int status_bad = (int32_t)BRIDGE_MEM32(irp + 0x10) < 0;
+        BRIDGE_MEM8(irp + 0x1A) = control & 1;
+        if (status_bad ? (control & 0x80) : (control & 0x40)) {
+            uint32_t routine = BRIDGE_MEM32(stack + 0x20), argv[3];
+            argv[0] = loc == (int8_t)count ? 0 : BRIDGE_MEM32(BRIDGE_MEM32(irp + 0x5C) + 0x18);
+            argv[1] = irp;
+            argv[2] = BRIDGE_MEM32(stack + 0x24);
+            memset(XBOX_TO_NATIVE(stack), 0, 0x14);
+            BRIDGE_MEM32(stack + 0x1C) = 0;
+            if (bridge_call_guest(routine, 3, argv) == 0xC0000016u)  /* STATUS_MORE_PROCESSING_REQUIRED */
+                return;
+        } else {
+            if ((control & 1) && loc <= (int8_t)BRIDGE_MEM8(irp + 0x18))
+                BRIDGE_MEM8(BRIDGE_MEM32(irp + 0x5C) + 3) |= 1;
+            memset(XBOX_TO_NATIVE(stack), 0, 0x14);
+            BRIDGE_MEM32(stack + 0x1C) = 0;
+        }
+        BRIDGE_MEM32(irp + 0x5C) += IRP_STACK_SIZE;
+        stack += IRP_STACK_SIZE;
+        loc++;
+        BRIDGE_MEM8(irp + 0x19) = (uint8_t)loc;
+    }
+    flags = BRIDGE_MEM32(irp + 4);
+    if (flags & 0x42) {  /* paging or associated: the status and event, freed if asked */
+        uint32_t iosb = BRIDGE_MEM32(irp + 0x1C);
+        BRIDGE_MEM32(iosb) = BRIDGE_MEM32(irp + 0x10);
+        BRIDGE_MEM32(iosb + 4) = BRIDGE_MEM32(irp + 0x14);
+        bridge_set_event_va(BRIDGE_MEM32(irp + 0x20));
+        if (flags & 2) irp_free(irp);
+        return;
+    }
+    if (flags & 0x200) BRIDGE_MEM8(irp + 5) &= 0xFD;  /* pages stay locked here: nothing to unlock */
+    if ((flags & 0x80) && !BRIDGE_MEM8(irp + 0x1A))   /* deferred, not pending: the caller finishes it */
+        return;
+    /* What the kernel does in a kernel APC on the requesting thread. No request here has a file object. */
+    {
+        uint32_t iosb = BRIDGE_MEM32(irp + 0x1C), event = BRIDGE_MEM32(irp + 0x20), apc = BRIDGE_MEM32(irp + 0x28);
+        if (iosb) {
+            BRIDGE_MEM32(iosb) = BRIDGE_MEM32(irp + 0x10);
+            BRIDGE_MEM32(iosb + 4) = BRIDGE_MEM32(irp + 0x14);
+        }
+        if (event) bridge_set_event_va(event);
+        if (apc) bridge_call_user_apc(apc, BRIDGE_MEM32(irp + 0x2C), iosb, 0);
+        irp_free(irp);
+    }
+}
+
+static void bridge_IofCompleteRequest(void)
+{
+    if (io_requests_on()) irp_complete(g_ecx);
+}
+
+static void bridge_IoInvalidDeviceRequest(void)
+{
+    uint32_t irp = STACK_ARG(1);
+    BRIDGE_MEM32(irp + 0x10) = 0xC0000010u;
+    if (io_requests_on()) irp_complete(irp);
+    g_eax = 0xC0000010u;
+}
+
+/* Share access: the access in the file object's flags (+2: 2 read, 4 write, 8 delete, 0x10.. shared), counts in the
+ * record: OpenCount, Readers, Writers, Deleters, SharedRead, SharedWrite, SharedDelete */
+static uint8_t share_flags(uint32_t access, uint32_t share, uint32_t file)
+{
+    uint8_t f = (uint8_t)(((access & 0x21) ? 2 : 0) | ((access & 6) ? 4 : 0) | ((access & 0x10000) ? 8 : 0));
+    f |= BRIDGE_MEM8(file + 2) & 0xF1;
+    BRIDGE_MEM8(file + 2) = f;
+    if (f & 0xE) {
+        f = (uint8_t)((f & 0x8F) | ((share & 7) << 4));
+        BRIDGE_MEM8(file + 2) = f;
+    }
+    return f;
+}
+
+static void bridge_IoCheckShareAccess(void)
+{
+    uint32_t file = STACK_ARG(2), rec = STACK_ARG(3), update = STACK_ARG(4) & 0xFF;
+    uint8_t f = share_flags(STACK_ARG(0), STACK_ARG(1), file), open;
+    g_eax = 0;
+    if (!(f & 0xE)) return;
+    open = BRIDGE_MEM8(rec);
+    if (open == 0xFF ||
+        ((f & 2) && BRIDGE_MEM8(rec + 4) < open) || ((f & 4) && BRIDGE_MEM8(rec + 5) < open) ||
+        ((f & 8) && BRIDGE_MEM8(rec + 6) < open) ||
+        (BRIDGE_MEM8(rec + 1) && !(f & 0x10)) || (BRIDGE_MEM8(rec + 2) && !(f & 0x20)) ||
+        (BRIDGE_MEM8(rec + 3) && !(f & 0x40))) {
+        g_eax = 0xC0000043u;   /* STATUS_SHARING_VIOLATION */
+        return;
+    }
+    if (update) {
+        BRIDGE_MEM8(rec) = open + 1;
+        for (int i = 0; i < 6; i++)
+            BRIDGE_MEM8(rec + 1 + i) += (f >> (i + 1)) & 1;
+    }
+}
+
+static void bridge_IoSetShareAccess(void)
+{
+    uint32_t rec = STACK_ARG(3);
+    uint8_t f = share_flags(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2));
+    BRIDGE_MEM8(rec) = (f & 0xE) ? 1 : 0;
+    for (int i = 0; i < 6; i++)
+        BRIDGE_MEM8(rec + 1 + i) = (f & 0xE) ? (f >> (i + 1)) & 1 : 0;
+}
+
+static void bridge_IoRemoveShareAccess(void)
+{
+    uint8_t f = BRIDGE_MEM8(STACK_ARG(0) + 2);
+    uint32_t rec = STACK_ARG(1);
+    if (!(f & 0xE)) return;
+    BRIDGE_MEM8(rec) -= 1;
+    for (int i = 0; i < 6; i++)
+        if ((f >> (i + 1)) & 1) BRIDGE_MEM8(rec + 1 + i) -= 1;
+}
+
+/* Device queue: +0 Type (0x14), +2 Size (0xC), +3 Busy, +4 list head. Entry: +0 list, +8 key, +0xC Inserted. */
+static uint32_t devq_insert(uint32_t q, uint32_t e)
+{
+    uint32_t r = 0;
+    ex_lock();
+    if (BRIDGE_MEM8(q + 3) == 1) {
+        uint32_t head = q + 4, last = BRIDGE_MEM32(head + 4);
+        BRIDGE_MEM32(e) = head;
+        BRIDGE_MEM32(e + 4) = last;
+        BRIDGE_MEM32(last) = e;
+        BRIDGE_MEM32(head + 4) = e;
+        r = 1;
+    } else {
+        BRIDGE_MEM8(q + 3) = 1;
+    }
+    BRIDGE_MEM8(e + 0xC) = (uint8_t)r;
+    ex_unlock();
+    return r;
+}
+
+static uint32_t devq_insert_key(uint32_t q, uint32_t e, uint32_t key)
+{
+    uint32_t r = 0;
+    ex_lock();
+    BRIDGE_MEM32(e + 8) = key;
+    if (BRIDGE_MEM8(q + 3) == 1) {
+        uint32_t head = q + 4, at = BRIDGE_MEM32(head), prev;
+        while (at != head && key >= BRIDGE_MEM32(at + 8)) at = BRIDGE_MEM32(at);
+        prev = BRIDGE_MEM32(at + 4);
+        BRIDGE_MEM32(e) = at;
+        BRIDGE_MEM32(e + 4) = prev;
+        BRIDGE_MEM32(prev) = e;
+        BRIDGE_MEM32(at + 4) = e;
+        r = 1;
+    } else {
+        BRIDGE_MEM8(q + 3) = 1;
+    }
+    BRIDGE_MEM8(e + 0xC) = (uint8_t)r;
+    ex_unlock();
+    return r;
+}
+
+static void devq_unlink(uint32_t e)
+{
+    uint32_t n = BRIDGE_MEM32(e), p = BRIDGE_MEM32(e + 4);
+    BRIDGE_MEM32(p) = n;
+    BRIDGE_MEM32(n + 4) = p;
+    BRIDGE_MEM8(e + 0xC) = 0;
+}
+
+static uint32_t devq_remove(uint32_t q)
+{
+    uint32_t head = q + 4, e;
+    ex_lock();
+    e = BRIDGE_MEM32(head);
+    if (e == head) { BRIDGE_MEM8(q + 3) = 0; e = 0; }
+    else devq_unlink(e);
+    ex_unlock();
+    return e;
+}
+
+static uint32_t devq_remove_key(uint32_t q, uint32_t key)
+{
+    uint32_t head = q + 4, e, first;
+    ex_lock();
+    first = e = BRIDGE_MEM32(head);
+    if (e == head) {
+        BRIDGE_MEM8(q + 3) = 0;
+        e = 0;
+    } else {
+        while (e != head && key > BRIDGE_MEM32(e + 8)) e = BRIDGE_MEM32(e);
+        if (e == head) e = first;   /* none that far along: the first */
+        devq_unlink(e);
+    }
+    ex_unlock();
+    return e;
+}
+
+static void bridge_KeInitializeDeviceQueue(void)
+{
+    uint32_t q = STACK_ARG(0);
+    BRIDGE_MEM16(q) = 0x14;
+    BRIDGE_MEM8(q + 2) = 0xC;
+    BRIDGE_MEM8(q + 3) = 0;
+    BRIDGE_MEM32(q + 4) = q + 4;
+    BRIDGE_MEM32(q + 8) = q + 4;
+}
+
+static void bridge_KeInsertDeviceQueue(void) { g_eax = devq_insert(STACK_ARG(0), STACK_ARG(1)); }
+static void bridge_KeInsertByKeyDeviceQueue(void) { g_eax = devq_insert_key(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2)); }
+static void bridge_KeRemoveDeviceQueue(void) { g_eax = devq_remove(STACK_ARG(0)); }
+static void bridge_KeRemoveByKeyDeviceQueue(void) { g_eax = devq_remove_key(STACK_ARG(0), STACK_ARG(1)); }
+
+static void bridge_KeRemoveEntryDeviceQueue(void)
+{
+    uint32_t e = STACK_ARG(0);
+    uint8_t was;
+    ex_lock();
+    was = BRIDGE_MEM8(e + 0xC);
+    if (was == 1) devq_unlink(e);
+    ex_unlock();
+    g_eax = was;
+}
+
+/* Starting packets: the driver's StartIo runs for one request at a time; one finishing inside StartIo is held until
+ * StartIo returns (+0x1D: 1 in StartIo, 2 next wanted, 4 by key, key at +0x44). */
+static void device_start(uint32_t dev, uint32_t irp)
+{
+    uint32_t argv[2];
+    BRIDGE_MEM32(dev + 0x10) = irp;
+    if (!irp) return;
+    BRIDGE_MEM8(dev + 0x1D) |= 1;
+    argv[0] = dev, argv[1] = irp;
+    bridge_call_guest(BRIDGE_MEM32(BRIDGE_MEM32(dev + 8)), 2, argv);
+    BRIDGE_MEM8(dev + 0x1D) &= 0xFE;
+}
+
+static void device_start_next(uint32_t dev, int by_key, uint32_t key)
+{
+    uint32_t e = by_key ? devq_remove_key(dev + 0x28, key) : devq_remove(dev + 0x28);
+    device_start(dev, e ? e - 0x3C : 0);
+}
+
+static void device_drain(uint32_t dev)
+{
+    do {
+        BRIDGE_MEM8(dev + 0x1D) &= 0xFD;
+        if (BRIDGE_MEM8(dev + 0x1D) & 4) device_start_next(dev, 1, BRIDGE_MEM32(dev + 0x44));
+        else device_start_next(dev, 0, 0);
+    } while (BRIDGE_MEM8(dev + 0x1D) & 2);
+}
+
+static void bridge_IoStartPacket(void)
+{
+    uint32_t dev = STACK_ARG(0), irp = STACK_ARG(1), key = STACK_ARG(2), queued;
+    if (!io_requests_on()) return;
+    queued = key ? devq_insert_key(dev + 0x28, irp + 0x3C, BRIDGE_MEM32(key)) : devq_insert(dev + 0x28, irp + 0x3C);
+    if (!queued) {
+        device_start(dev, irp);
+        if (BRIDGE_MEM8(dev + 0x1D) & 2) device_drain(dev);
+    }
+}
+
+static void bridge_IoStartNextPacket(void)
+{
+    uint32_t dev = STACK_ARG(0);
+    if (!io_requests_on()) return;
+    if (BRIDGE_MEM8(dev + 0x1D) & 1) {
+        BRIDGE_MEM8(dev + 0x1D) = (uint8_t)((BRIDGE_MEM8(dev + 0x1D) & 0xFB) | 2);
+    } else {
+        device_start_next(dev, 0, 0);
+        if (BRIDGE_MEM8(dev + 0x1D) & 2) device_drain(dev);
+    }
+}
+
+static void bridge_IoStartNextPacketByKey(void)
+{
+    uint32_t dev = STACK_ARG(0), key = STACK_ARG(1);
+    if (!io_requests_on()) return;
+    if (BRIDGE_MEM8(dev + 0x1D) & 1) {
+        BRIDGE_MEM8(dev + 0x1D) |= 6;
+        BRIDGE_MEM32(dev + 0x44) = key;
+    } else {
+        device_start_next(dev, 1, key);
+        if (BRIDGE_MEM8(dev + 0x1D) & 2) device_drain(dev);
+    }
+}
+
+/* Devices. Named devices: the name is not kept (no object directory here). */
+#define XBOX_DEVICE_OBJECT_SIZE 0x48u
+
+static void bridge_IoCreateDevice(void)
+{
+    uint32_t ext = STACK_ARG(1), name = STACK_ARG(2), type = STACK_ARG(3), exclusive = STACK_ARG(4) & 0xFF;
+    uint32_t out = STACK_ARG(5), total = ((ext + 7) & ~7u) + XBOX_DEVICE_OBJECT_SIZE, dev = pool_alloc(total), flags = 0x10;
+
+    if (!dev) {
+        if (out) BRIDGE_MEM32(out) = 0;
+        g_eax = 0xC000009Au;
+        return;
+    }
+    memset(XBOX_TO_NATIVE(dev), 0, total);
+    BRIDGE_MEM16(dev) = 3;
+    BRIDGE_MEM16(dev + 2) = (uint16_t)(ext + XBOX_DEVICE_OBJECT_SIZE);
+    BRIDGE_MEM8(dev + 0x1C) = (uint8_t)type;
+    if (type == 7 || type == 0x3A || type == 2 || type == 0x3B) {   /* a disk or file system: its lock */
+        BRIDGE_MEM8(dev + 0x34) = 1;
+        BRIDGE_MEM8(dev + 0x36) = 4;
+        BRIDGE_MEM32(dev + 0x38) = 1;
+        BRIDGE_MEM32(dev + 0x3C) = dev + 0x3C;
+        BRIDGE_MEM32(dev + 0x40) = dev + 0x3C;
+    } else {
+        BRIDGE_MEM32(dev + 0xC) = dev;
+    }
+    if (exclusive) flags |= 2;
+    if (name) flags |= 8;
+    BRIDGE_MEM32(dev + 0x14) = flags;
+    BRIDGE_MEM32(dev + 0x18) = ext ? dev + XBOX_DEVICE_OBJECT_SIZE : 0;
+    BRIDGE_MEM8(dev + 0x1E) = 1;
+    BRIDGE_MEM32(dev + 8) = STACK_ARG(0);
+    BRIDGE_MEM16(dev + 0x28) = 0x14;
+    BRIDGE_MEM8(dev + 0x2A) = 0xC;
+    BRIDGE_MEM32(dev + 0x2C) = dev + 0x2C;
+    BRIDGE_MEM32(dev + 0x30) = dev + 0x2C;
+    if (out) BRIDGE_MEM32(out) = dev;
     g_eax = 0;
 }
 
-/* --- KeRemoveEntryDeviceQueue (ordinal 135, 2 args = 8 bytes) --- */
-static void bridge_KeRemoveEntryDeviceQueue(void)
+static void bridge_IoDeleteDevice(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
+    uint32_t dev = STACK_ARG(0);
+    BRIDGE_MEM8(dev + 0x1F) = 1;
+    if (!BRIDGE_MEM32(dev + 4)) {
+        uint32_t driver = BRIDGE_MEM32(dev + 8), del = driver ? BRIDGE_MEM32(driver + 4) : 0;
+        if (del && io_requests_on()) bridge_call_guest(del, 1, &dev);
+        else xbox_HeapFree(dev);
+    }
     g_eax = 0;
 }
+
+/* Building requests */
+static uint32_t irp_build_fsd(uint32_t major, uint32_t dev, uint32_t buffer, uint32_t length, uint32_t offset_va, uint32_t iosb)
+{
+    uint32_t irp = irp_alloc(BRIDGE_MEM8(dev + 0x1E));
+    if (irp) {
+        uint32_t stack = BRIDGE_MEM32(irp + 0x5C) - IRP_STACK_SIZE;
+        BRIDGE_MEM32(irp + 0x50) = bridge_thread_object(0xFFFFFFFEu);
+        BRIDGE_MEM8(stack) = (uint8_t)major;
+        if (major != 6 && major != 0xC) {
+            BRIDGE_MEM32(irp + 0x30) = buffer;
+            if ((BRIDGE_MEM32(dev + 0x14) & 4) && length) {  /* direct I/O: pages count as locked */
+                BRIDGE_MEM8(irp + 5) |= 2;
+                BRIDGE_MEM32(irp + 0x38) = length;
+            }
+            BRIDGE_MEM32(stack + 4) = length;
+            BRIDGE_MEM32(stack + 0xC) = BRIDGE_MEM32(offset_va);
+            BRIDGE_MEM32(stack + 0x10) = BRIDGE_MEM32(offset_va + 4);
+        }
+        BRIDGE_MEM32(irp + 0x1C) = iosb;
+    }
+    return irp;
+}
+
+static void bridge_IoBuildAsynchronousFsdRequest(void)
+{
+    g_eax = irp_build_fsd(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2), STACK_ARG(3), STACK_ARG(4), STACK_ARG(5));
+}
+
+static void bridge_IoBuildSynchronousFsdRequest(void)
+{
+    uint32_t irp = irp_build_fsd(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2), STACK_ARG(3), STACK_ARG(4), STACK_ARG(6));
+    if (irp) BRIDGE_MEM32(irp + 0x20) = STACK_ARG(5);
+    g_eax = irp;
+}
+
+static uint32_t irp_build_control(uint32_t ctl, uint32_t dev, uint32_t in, uint32_t in_len, uint32_t out, uint32_t out_len,
+                                  uint32_t internal, uint32_t event, uint32_t iosb)
+{
+    uint32_t irp = irp_alloc(BRIDGE_MEM8(dev + 0x1E));
+    if (irp) {
+        uint32_t stack = BRIDGE_MEM32(irp + 0x5C) - IRP_STACK_SIZE;
+        BRIDGE_MEM32(irp + 0x30) = out;
+        BRIDGE_MEM8(stack) = (internal & 0xFF) ? 0xB : 0xA;
+        BRIDGE_MEM32(stack + 4) = out_len;
+        BRIDGE_MEM32(stack + 8) = in;
+        BRIDGE_MEM32(stack + 0xC) = in_len;
+        BRIDGE_MEM32(stack + 0x10) = ctl;
+        if (out_len && ((ctl & 3) == 1 || (ctl & 3) == 2)) {
+            BRIDGE_MEM8(irp + 5) |= 2;
+            BRIDGE_MEM32(irp + 0x38) = out_len;
+        }
+        BRIDGE_MEM32(irp + 0x1C) = iosb;
+        BRIDGE_MEM32(irp + 0x20) = event;
+        BRIDGE_MEM32(irp + 0x50) = bridge_thread_object(0xFFFFFFFEu);
+    }
+    return irp;
+}
+
+static void bridge_IoBuildDeviceIoControlRequest(void)
+{
+    g_eax = irp_build_control(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2), STACK_ARG(3), STACK_ARG(4), STACK_ARG(5),
+                              STACK_ARG(6), STACK_ARG(7), STACK_ARG(8));
+}
+
+/* Synchronous requests wait on an event and an IO_STATUS_BLOCK in guest memory (on the kernel's stack, there). Blocks
+ * are reused, never freed, since an event's address stays tied to its host event. */
+struct io_wait_block { struct io_wait_block *next; uint32_t va; };
+static struct io_wait_block *g_io_wait_free;
+
+static struct io_wait_block *io_wait_get(void)
+{
+    struct io_wait_block *b;
+    ex_lock();
+    b = g_io_wait_free;
+    if (b) g_io_wait_free = b->next;
+    ex_unlock();
+    if (!b) {
+        uint32_t va = xbox_HeapAlloc(0x18, 16);
+        b = va ? (struct io_wait_block *)malloc(sizeof *b) : NULL;
+        if (!b) return NULL;
+        b->va = va;
+        memset(XBOX_TO_NATIVE(va), 0, 0x18);
+        BRIDGE_MEM8(va + 2) = 4;
+        BRIDGE_MEM32(va + 8) = va + 8;
+        BRIDGE_MEM32(va + 0xC) = va + 8;
+        ke_shadow_insert(va, CreateEventW(NULL, TRUE, FALSE, NULL));
+    }
+    ResetEvent(ke_shadow_lookup(b->va));
+    BRIDGE_MEM32(b->va + 0x10) = 0;
+    BRIDGE_MEM32(b->va + 0x14) = 0;
+    return b;
+}
+
+static void io_wait_put(struct io_wait_block *b)
+{
+    ex_lock();
+    b->next = g_io_wait_free;
+    g_io_wait_free = b;
+    ex_unlock();
+}
+
+static uint32_t irp_run_sync(uint32_t dev, uint32_t irp, struct io_wait_block *b)
+{
+    uint32_t st;
+    if (!irp) return 0xC000009Au;
+    st = irp_call_driver(dev, irp);
+    if (st == 0x103u) {   /* STATUS_PENDING */
+        WaitForSingleObject(ke_shadow_lookup(b->va), INFINITE);
+        st = BRIDGE_MEM32(b->va + 0x10);
+    }
+    return st;
+}
+
+static void bridge_IoSynchronousFsdRequest(void)
+{
+    struct io_wait_block *b;
+    uint32_t dev = STACK_ARG(1), irp;
+    if (!io_requests_on()) { g_eax = 0; return; }
+    b = io_wait_get();
+    if (!b) { g_eax = 0xC000009Au; return; }
+    irp = irp_build_fsd(STACK_ARG(0), dev, STACK_ARG(2), STACK_ARG(3), STACK_ARG(4), b->va + 0x10);
+    if (irp) BRIDGE_MEM32(irp + 0x20) = b->va;
+    g_eax = irp_run_sync(dev, irp, b);
+    io_wait_put(b);
+}
+
+static void bridge_IoSynchronousDeviceIoControlRequest(void)
+{
+    /* Control, Device, In, InLen, Out, OutLen, Returned, Internal */
+    struct io_wait_block *b;
+    uint32_t dev = STACK_ARG(1), returned = STACK_ARG(6), irp, st;
+    if (!io_requests_on()) { g_eax = 0; return; }
+    b = io_wait_get();
+    if (!b) { g_eax = 0xC000009Au; return; }
+    irp = irp_build_control(STACK_ARG(0), dev, STACK_ARG(2), STACK_ARG(3), STACK_ARG(4), STACK_ARG(5), STACK_ARG(7),
+                            b->va, b->va + 0x10);
+    st = irp_run_sync(dev, irp, b);
+    if (returned) BRIDGE_MEM32(returned) = BRIDGE_MEM32(b->va + 0x14);
+    io_wait_put(b);
+    g_eax = st;
+}
+
 
 /* --- KeRemoveQueue (ordinal 136, 1 arg = 4 bytes) --- */
 static void bridge_KeRemoveQueue(void)
 {
-    (void)STACK_ARG(0);
-    g_eax = 0;
+    /* Queue, WaitMode, Timeout: the entry, or a wait status in its place. */
+    uint32_t q = STACK_ARG(0), head = q + 0x10;
+    HANDLE h = ke_shadow_lookup(q);
+    NTSTATUS st;
+    uint32_t e;
+
+    if (!h) { g_eax = 0x102u; return; }   /* STATUS_TIMEOUT */
+    st = xbox_KeWaitForSingleObject(h, 0, (KPROCESSOR_MODE)STACK_ARG(1), FALSE,
+                                    STACK_ARG(2) ? XBOX_TO_NATIVE(STACK_ARG(2)) : NULL);
+    if (st != 0) { g_eax = (uint32_t)st; return; }
+    QUEUE_LOCK();
+    e = BRIDGE_MEM32(head);
+    {
+        uint32_t next = BRIDGE_MEM32(e);
+        BRIDGE_MEM32(head) = next;
+        BRIDGE_MEM32(next + 4) = head;
+    }
+    BRIDGE_MEM32(q + 4) = BRIDGE_MEM32(q + 4) - 1;
+    QUEUE_UNLOCK();
+    g_eax = e;
 }
 
 /* --- KeRemoveQueueDpc (ordinal 137, 1 arg = 4 bytes) ---
@@ -7873,8 +9301,21 @@ static void bridge_KeRemoveQueue(void)
 /* --- KeRundownQueue (ordinal 141, 1 arg = 4 bytes) --- */
 static void bridge_KeRundownQueue(void)
 {
-    (void)STACK_ARG(0);
-    g_eax = 0;
+    /* Hands back what is left: the entries still linked, without the list head. */
+    uint32_t q = STACK_ARG(0), head = q + 0x10, first;
+    HANDLE h = ke_shadow_lookup(q);
+    QUEUE_LOCK();
+    first = BRIDGE_MEM32(head);
+    if (first == head) {
+        first = 0;
+    } else {
+        uint32_t last = BRIDGE_MEM32(head + 4);
+        BRIDGE_MEM32(last) = first;
+        BRIDGE_MEM32(first + 4) = last;
+    }
+    QUEUE_UNLOCK();
+    if (h) while (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) { }
+    g_eax = first;
 }
 
 /* --- KeSetEventBoostPriority (ordinal 146, 2 args = 8 bytes) --- */
@@ -7886,7 +9327,19 @@ static void bridge_KeSetEventBoostPriority(void)
 
     (void)increment;
 
+    {   /* An event the title built itself, as in KeSetEvent */
+        int type;
+        HANDLE ge = ke_guest_event(guest_va, &type);
+        if (ge) {
+            BRIDGE_MEM32(guest_va + 4) = 1;
+            SetEvent(ge);
+            g_eax = 0;
+            return;
+        }
+    }
     h = ke_shadow_lookup(guest_va);
+    if (h)
+        BRIDGE_MEM32(guest_va + 4) = 1;
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
@@ -7898,9 +9351,9 @@ static void bridge_KeSetEventBoostPriority(void)
 /* --- KeSetPriorityProcess (ordinal 147, 2 args = 8 bytes) --- */
 static void bridge_KeSetPriorityProcess(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    g_eax = 0;
+    /* The previous base priority, as the kernel. Threads keep theirs: the host's are ours to choose. */
+    static LONG base = 8;
+    g_eax = (uint32_t)InterlockedExchange(&base, (LONG)(int8_t)STACK_ARG(1));
 }
 
 /* --- KeSetPriorityThread (ordinal 148, 2 args = 8 bytes) --- */
@@ -7908,16 +9361,19 @@ static void bridge_KeSetPriorityThread(void)
 {
     /* Absolute priority: Xbox normal is 8, realtime starts at 16. */
     uint32_t obj = STACK_ARG(0);
-    if (bridge_thread_host(obj, NULL))
-        bridge_apply_priority("KeSetPriorityThread", obj, (LONG)STACK_ARG(1) - 8);
     g_eax = 8;
+    if (bridge_thread_host(obj, NULL)) {
+        g_eax = (uint32_t)KTHREAD_PRIORITY(obj);   /* the old one, as the kernel */
+        BRIDGE_MEM8(obj + 0x32) = (uint8_t)STACK_ARG(1);
+        bridge_apply_priority("KeSetPriorityThread", obj, (LONG)STACK_ARG(1) - 8);
+    }
 }
 
 /* --- KeTestAlertThread (ordinal 155, 1 arg = 4 bytes) --- */
 static void bridge_KeTestAlertThread(void)
 {
-    (void)STACK_ARG(0);
-    g_eax = 0;
+    /* Runs what is queued for this thread; TRUE if anything was. */
+    g_eax = SleepEx(0, TRUE) == WAIT_IO_COMPLETION;
 }
 
 /* --- KiBugCheckData (ordinal 162, 0 args = 0 bytes) --- */
@@ -7929,7 +9385,7 @@ static void bridge_KiBugCheckData(void)
 /* --- KiUnlockDispatcherDatabase (ordinal 163, 1 arg = 4 bytes) --- */
 static void bridge_KiUnlockDispatcherDatabase(void)
 {
-    (void)STACK_ARG(0);
+    xbox_KfLowerIrql((KIRQL)g_ecx);   /* fastcall: the IRQL to go back to, in CL */
     g_eax = 0;
 }
 
@@ -7938,21 +9394,26 @@ static void bridge_KiUnlockDispatcherDatabase(void)
  * report PASSIVE_LEVEL. */
 static void bridge_KeGetCurrentIrql(void)
 {
-    g_eax = 0;  /* PASSIVE_LEVEL */
+    g_eax = (uint32_t)xbox_CurrentIrql();
 }
 
 /* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */
 static void bridge_KeGetCurrentThread(void)
 {
-    g_eax = 0;
+    /* The stand-in KTHREAD, the same one ObReferenceObjectByHandle gives. */
+    g_eax = bridge_thread_object(0xFFFFFFFEu);
 }
 
 /* --- KeSetDisableBoostThread (ordinal 144, 2 args = 8 bytes) --- */
 static void bridge_KeSetDisableBoostThread(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
+    /* The old setting. There is no boost here to disable. */
+    uint32_t obj = STACK_ARG(0);
     g_eax = 0;
+    if (bridge_thread_host(obj, NULL)) {
+        g_eax = BRIDGE_MEM8(obj + 0x73);
+        BRIDGE_MEM8(obj + 0x73) = (uint8_t)STACK_ARG(1);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -7963,8 +9424,16 @@ static void bridge_KeSetDisableBoostThread(void)
 /* --- MmIsAddressValid (ordinal 174, 1 arg = 4 bytes) --- */
 static void bridge_MmIsAddressValid(void)
 {
-    (void)STACK_ARG(0);
-    g_eax = 1;  /* assume every guest address is valid */
+    /* The real one reads its page tables. Here: what is mapped for the guest. */
+    uint32_t a = STACK_ARG(0);
+    uint64_t ram = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+    uint32_t vi[7];
+    if (a >= 0x10000u && a < ram)
+        g_eax = 1;
+    else if ((a >= 0x80000000u && a < 0x84000000u) || a >= 0xFD000000u)
+        g_eax = 1;
+    else
+        g_eax = guest_vmem_query(a, vi) && vi[4] == 0x1000u;
 }
 
 /* --- MmDbgAllocateMemory (ordinal 374, 2 args = 8 bytes)
@@ -8032,21 +9501,39 @@ static void bridge_MmDbgWriteCheck(void)
 static void bridge_NtCancelTimer(void)
 {
     HANDLE h = bridge_resolve_handle(STACK_ARG(0));
-    (void)STACK_ARG(1);
-
-    if (h)
-        CancelWaitableTimer(h);
-    g_eax = 0;  /* STATUS_SUCCESS */
+    uint32_t prev = STACK_ARG(1);
+    struct { LONGLONG remaining; BOOLEAN state; } info = {0, 0};
+    if (!h) { g_eax = 0xC0000008u; return; }
+    CancelWaitableTimer(h);
+    if (prev) {
+        bridge_nt_query("NtQueryTimer", STACK_ARG(0), &info, sizeof info);
+        BRIDGE_MEM8(prev) = info.state;
+    }
+    g_eax = 0;
 }
 
 /* --- NtCreateIoCompletion (ordinal 191, 4 args = 16 bytes) --- */
+/* Asks the host's native query of that name about a handle: class 0, the basic
+ * information, which is what the console's two-argument call returns. */
+static uint32_t bridge_nt_query(const char *name, uint32_t token, void *buf, ULONG len)
+{
+    typedef LONG (WINAPI *query_fn)(HANDLE, ULONG, void *, ULONG, ULONG *);
+    HANDLE h = bridge_resolve_handle(token);
+    query_fn f = (query_fn)bridge_nt_fn(name);
+    if (!h) return 0xC0000008u;   /* STATUS_INVALID_HANDLE */
+    if (!f) return 0xC0000002u;   /* STATUS_NOT_IMPLEMENTED */
+    return (uint32_t)f(h, 0, buf, len, NULL);
+}
+
 static void bridge_NtCreateIoCompletion(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    g_eax = 0;
+    typedef LONG (WINAPI *create_fn)(HANDLE *, ULONG, void *, ULONG);
+    create_fn f = (create_fn)bridge_nt_fn("NtCreateIoCompletion");
+    HANDLE h = NULL;
+    if (!f) { g_eax = 0xC0000002u; return; }
+    g_eax = (uint32_t)f(&h, 0x001F0003u /* IO_COMPLETION_ALL_ACCESS */, NULL, STACK_ARG(3));
+    if (g_eax == 0)
+        g_eax = (uint32_t)bridge_write_handle(STACK_ARG(0), h);
 }
 
 /* --- NtCreateTimer (ordinal 194, 3 args = 12 bytes)
@@ -8059,9 +9546,16 @@ static void bridge_NtCreateTimer(void)
     HANDLE h;
 
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
 
-    h = CreateWaitableTimerW(NULL, TRUE, NULL);
+    if (STACK_ARG(2) > 1) {
+        g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    /* 0 NotificationTimer stays signalled, 1 SynchronizationTimer resets. */
+    {
+        WCHAR wname[256];
+        h = CreateWaitableTimerW(NULL, STACK_ARG(2) == 0, bridge_object_name(STACK_ARG(1), wname, 256));
+    }
     if (!h) {
         fprintf(stderr, "  [KERNEL] NtCreateTimer: CreateWaitableTimerW failed (error %u)\n",
                 GetLastError());
@@ -8074,10 +9568,9 @@ static void bridge_NtCreateTimer(void)
 /* --- NtOpenDirectoryObject (ordinal 201, 3 args = 12 bytes) --- */
 static void bridge_NtOpenDirectoryObject(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    g_eax = 0;
+    /* Handle, Attributes: no object directories here. */
+    if (STACK_ARG(0)) BRIDGE_MEM32(STACK_ARG(0)) = 0;
+    g_eax = 0xC0000034u;   /* STATUS_OBJECT_NAME_NOT_FOUND */
 }
 
 /* --- NtProtectVirtualMemory (ordinal 204, 4 args = 16 bytes)
@@ -8095,166 +9588,238 @@ static void bridge_NtProtectVirtualMemory(void)
     uint32_t size    = size_ptr ? BRIDGE_MEM32(size_ptr) : 0;
     DWORD old = 0;
 
-    if (VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
+    /* As the kernel: a bad protection, a bad range, then the pages not committed. Base and size come back in whole
+     * pages. */
+    if (!nt_protect_ok(new_prot)) { g_eax = 0xC0000045u; return; }
+    if (base_va > 0x7FFEFFFFu || size == 0 || size > 0x7FFEFFFFu - base_va) { g_eax = 0xC000000Du; return; }
+    {
+        uint32_t last = (base_va + size - 1) | 0xFFF, first = base_va & ~0xFFFu;
+        if (!VirtualProtect(XBOX_TO_NATIVE(first), last - first + 1, (DWORD)new_prot, &old)) {
+            g_eax = 0xC000002Du;   /* STATUS_NOT_COMMITTED */
+            return;
+        }
+        BRIDGE_MEM32(base_ptr) = first;
+        BRIDGE_MEM32(size_ptr) = last - first + 1;
         if (old_ptr)
             BRIDGE_MEM32(old_ptr) = (uint32_t)old;
-        g_eax = 0;  /* STATUS_SUCCESS */
-    } else {
-        g_eax = 0xC0000005u;  /* STATUS_ACCESS_VIOLATION */
+        g_eax = 0;
     }
 }
 
 /* --- NtQueueApcThread (ordinal 206, 5 args = 20 bytes) --- */
 static void bridge_NtQueueApcThread(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
+    HANDLE th = bridge_resolve_handle(STACK_ARG(0));
+    struct bridge_user_apc *a;
+    if (!th) { g_eax = 0xC0000008u; return; }
+    a = (struct bridge_user_apc *)malloc(sizeof *a);
+    if (!a) { g_eax = 0xC0000017u; return; }   /* STATUS_NO_MEMORY */
+    a->routine = STACK_ARG(1);
+    a->ctx = STACK_ARG(2);
+    a->a1 = STACK_ARG(3);
+    a->a2 = STACK_ARG(4);
+    a->once = 1;
+    if (!QueueUserAPC(bridge_user_apc_host, th, (ULONG_PTR)a)) {
+        free(a);
+        g_eax = 0xC0000001u;
+        return;
+    }
     g_eax = 0;
 }
 
 /* --- NtQueryDirectoryObject (ordinal 208, 7 args = 28 bytes) --- */
 static void bridge_NtQueryDirectoryObject(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    g_eax = 0;
+    /* Handle, Buffer, Length, ReturnSingleEntry, &Context, &Returned. The kernel wants room for a header; our only
+     * directory handle is the empty one NtCreateDirectoryObject gives. */
+    if (STACK_ARG(2) < 0xC) { g_eax = 0xC000000Du; return; }
+    if (STACK_ARG(0) != 0xBEEF0010u) { g_eax = 0xC0000008u; return; }
+    if (STACK_ARG(5)) BRIDGE_MEM32(STACK_ARG(5)) = 0;
+    g_eax = 0x8000001Au;   /* STATUS_NO_MORE_ENTRIES */
 }
 
 /* --- NtQueryEvent (ordinal 209, 4 args = 16 bytes) --- */
 static void bridge_NtQueryEvent(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    g_eax = 0;
+    LONG info[2] = {0, 0};
+    g_eax = bridge_nt_query("NtQueryEvent", STACK_ARG(0), info, sizeof info);
+    if (g_eax == 0) {
+        BRIDGE_MEM32(STACK_ARG(1)) = (uint32_t)info[0];   /* EventType */
+        BRIDGE_MEM32(STACK_ARG(1) + 4) = (uint32_t)info[1];   /* EventState */
+    }
 }
 
 /* --- NtQueryIoCompletion (ordinal 212, 5 args = 20 bytes) --- */
 static void bridge_NtQueryIoCompletion(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    g_eax = 0;
+    LONG depth = 0;
+    g_eax = bridge_nt_query("NtQueryIoCompletion", STACK_ARG(0), &depth, sizeof depth);
+    if (g_eax == 0)
+        BRIDGE_MEM32(STACK_ARG(1)) = (uint32_t)depth;
 }
 
 /* --- NtQueryMutant (ordinal 213, 5 args = 20 bytes) --- */
 static void bridge_NtQueryMutant(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    g_eax = 0;
+    struct { LONG count; BOOLEAN owned, abandoned; } info = {0, 0, 0};
+    g_eax = bridge_nt_query("NtQueryMutant", STACK_ARG(0), &info, sizeof info);
+    if (g_eax == 0) {
+        BRIDGE_MEM32(STACK_ARG(1)) = (uint32_t)info.count;
+        BRIDGE_MEM8(STACK_ARG(1) + 4) = info.owned;
+        BRIDGE_MEM8(STACK_ARG(1) + 5) = info.abandoned;
+    }
 }
 
 /* --- NtQuerySemaphore (ordinal 214, 5 args = 20 bytes) --- */
 static void bridge_NtQuerySemaphore(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    g_eax = 0;
+    LONG info[2] = {0, 0};
+    g_eax = bridge_nt_query("NtQuerySemaphore", STACK_ARG(0), info, sizeof info);
+    if (g_eax == 0) {
+        BRIDGE_MEM32(STACK_ARG(1)) = (uint32_t)info[0];   /* CurrentCount */
+        BRIDGE_MEM32(STACK_ARG(1) + 4) = (uint32_t)info[1];   /* MaximumCount */
+    }
 }
 
 /* --- NtQueryTimer (ordinal 216, 5 args = 20 bytes) --- */
 static void bridge_NtQueryTimer(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    g_eax = 0;
+    struct { LONGLONG remaining; BOOLEAN state; } info = {0, 0};
+    g_eax = bridge_nt_query("NtQueryTimer", STACK_ARG(0), &info, sizeof info);
+    if (g_eax == 0) {
+        BRIDGE_MEM32(STACK_ARG(1)) = (uint32_t)info.remaining;
+        BRIDGE_MEM32(STACK_ARG(1) + 4) = (uint32_t)((uint64_t)info.remaining >> 32);
+        BRIDGE_MEM8(STACK_ARG(1) + 8) = info.state;
+    }
 }
 
 /* --- NtReadFileScatter (ordinal 220, 8 args = 32 bytes) --- */
+/* NtReadFileScatter / NtWriteFileGather: as NtReadFile / NtWriteFile, with the
+ * buffer given as one address per 4 KB page (Length bytes in all). */
+static void bridge_file_pages(int write)
+{
+    HANDLE   handle  = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t ios_va  = STACK_ARG(4), pages = STACK_ARG(5), length = STACK_ARG(6), off_va = STACK_ARG(7);
+    XBOX_IO_STATUS_BLOCK ios;
+    LARGE_INTEGER off = {0};
+    PLARGE_INTEGER poff = NULL;
+    uint32_t done = 0, i;
+    NTSTATUS st = 0;
+
+    if (!handle) { g_eax = 0xC0000008u; return; }
+    if (!pages || !bridge_buf_ok(pages, ((length + 4095u) / 4096u) * 4u, "file pages")) {
+        g_eax = 0xC000000Du;
+        return;
+    }
+    if (off_va) {
+        off.LowPart  = BRIDGE_MEM32(off_va);
+        off.HighPart = (LONG)BRIDGE_MEM32(off_va + 4);
+        if (off.QuadPart >= 0) poff = &off;
+    }
+    for (i = 0; done < length; i++) {
+        uint32_t page = BRIDGE_MEM32(pages + i * 4u);
+        uint32_t n = length - done < 4096u ? length - done : 4096u;
+        memset(&ios, 0, sizeof ios);
+        if (!bridge_buf_ok(page, n, "file pages")) { st = (NTSTATUS)0xC0000005L; break; }
+        st = write ? xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios, XBOX_TO_NATIVE(page), n, poff)
+                   : xbox_NtReadFile(handle, NULL, NULL, NULL, &ios, XBOX_TO_NATIVE(page), n, poff);
+        done += (uint32_t)ios.Information;
+        if (poff) off.QuadPart += (LONGLONG)ios.Information;
+        if (st != 0 || (uint32_t)ios.Information < n) break;
+    }
+    if (done && st == (NTSTATUS)0xC0000011L) st = 0;   /* a short read, not the end */
+    bridge_write_iostatus(ios_va, st, done);
+    bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3), ios_va);
+    g_eax = (uint32_t)st;
+}
+
 static void bridge_NtReadFileScatter(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    (void)STACK_ARG(7);
-    g_eax = 0;
+    bridge_file_pages(0);
 }
 
 /* --- NtRemoveIoCompletion (ordinal 223, 5 args = 20 bytes) --- */
 static void bridge_NtRemoveIoCompletion(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    g_eax = 0;
+    typedef LONG (WINAPI *remove_fn)(HANDLE, ULONG_PTR *, ULONG_PTR *, void *, void *);
+    remove_fn f = (remove_fn)bridge_nt_fn("NtRemoveIoCompletion");
+    HANDLE h = bridge_resolve_handle(STACK_ARG(0));
+    ULONG_PTR key = 0, ctx = 0;
+    struct { LONG_PTR status; ULONG_PTR info; } ios = {0, 0};
+    LONG st;
+    if (!h) { g_eax = 0xC0000008u; return; }
+    if (!f) { g_eax = 0xC0000002u; return; }
+    st = f(h, &key, &ctx, &ios, STACK_ARG(4) ? XBOX_TO_NATIVE(STACK_ARG(4)) : NULL);
+    g_eax = (uint32_t)st;
+    if (st == 0) {
+        BRIDGE_MEM32(STACK_ARG(1)) = (uint32_t)key;
+        BRIDGE_MEM32(STACK_ARG(2)) = (uint32_t)ctx;
+        BRIDGE_MEM32(STACK_ARG(3)) = (uint32_t)ios.status;
+        BRIDGE_MEM32(STACK_ARG(3) + 4) = (uint32_t)ios.info;
+    }
 }
 
 /* --- NtSetIoCompletion (ordinal 227, 5 args = 20 bytes) --- */
 static void bridge_NtSetIoCompletion(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    g_eax = 0;
+    typedef LONG (WINAPI *set_fn)(HANDLE, ULONG_PTR, ULONG_PTR, LONG, ULONG_PTR);
+    set_fn f = (set_fn)bridge_nt_fn("NtSetIoCompletion");
+    HANDLE h = bridge_resolve_handle(STACK_ARG(0));
+    if (!h) { g_eax = 0xC0000008u; return; }
+    if (!f) { g_eax = 0xC0000002u; return; }
+    g_eax = (uint32_t)f(h, STACK_ARG(1), STACK_ARG(2), (LONG)STACK_ARG(3), STACK_ARG(4));
 }
 
 /* --- NtSetTimerEx (ordinal 229, 8 args = 32 bytes) --- */
 static void bridge_NtSetTimerEx(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    (void)STACK_ARG(7);
-    g_eax = 0;
+    /* Handle, DueTime, ApcRoutine, ApcMode, ApcContext, Resume, Period, PreviousState */
+    HANDLE h = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t apc = STACK_ARG(2), prev = STACK_ARG(7);
+    LONG period = (LONG)STACK_ARG(6);
+    LARGE_INTEGER due;
+    struct { LONGLONG remaining; BOOLEAN state; } info = {0, 0};
+    struct bridge_user_apc *a = NULL;
+    if (period < 0) { g_eax = 0xC000000Du; return; }
+    if (!h) { g_eax = 0xC0000008u; return; }
+    if (prev) bridge_nt_query("NtQueryTimer", STACK_ARG(0), &info, sizeof info);
+    due.LowPart = BRIDGE_MEM32(STACK_ARG(1));
+    due.HighPart = (LONG)BRIDGE_MEM32(STACK_ARG(1) + 4);
+    if (apc) {
+        a = (struct bridge_user_apc *)malloc(sizeof *a);
+        if (!a) { g_eax = 0xC000009Au; return; }
+        a->routine = apc;
+        a->ctx = STACK_ARG(4);
+        a->a1 = a->a2 = 0;
+        a->once = period == 0;
+    }
+    if (!SetWaitableTimer(h, &due, period, a ? bridge_timer_apc_host : NULL, a, FALSE)) {
+        free(a);
+        g_eax = 0xC0000001u;
+        return;
+    }
+    if (prev) BRIDGE_MEM8(prev) = info.state;
+    g_eax = (uint8_t)STACK_ARG(5) ? 0x40000025u : 0;   /* STATUS_TIMER_RESUME_IGNORED */
 }
 
 /* --- NtSignalAndWaitForSingleObjectEx (ordinal 230, 5 args = 20 bytes) --- */
 static void bridge_NtSignalAndWaitForSingleObjectEx(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    g_eax = 0;
+    HANDLE sig = bridge_resolve_handle(STACK_ARG(0));
+    HANDLE wait = bridge_resolve_handle(STACK_ARG(1));
+
+    if (!sig || !wait) {
+        g_eax = 0xC0000008u;   /* STATUS_INVALID_HANDLE */
+        return;
+    }
+    g_eax = (uint32_t)xbox_NtSignalAndWaitForSingleObjectEx(sig, wait, (BOOLEAN)STACK_ARG(3),
+                                                            XBOX_TO_NATIVE(STACK_ARG(4)));
 }
 
 /* --- NtWriteFileGather (ordinal 237, 8 args = 32 bytes) --- */
 static void bridge_NtWriteFileGather(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    (void)STACK_ARG(7);
-    g_eax = 0;
+    bridge_file_pages(1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -8263,64 +9828,301 @@ static void bridge_NtWriteFileGather(void)
  */
 
 /* --- ObCreateObject (ordinal 239, 7 args = 28 bytes) --- */
-static void bridge_ObCreateObject(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    g_eax = 0;
-}
 
 /* --- ObInsertObject (ordinal 241, 6 args = 24 bytes) --- */
-static void bridge_ObInsertObject(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    g_eax = 0;
-}
 
 /* --- ObMakeTemporaryObject (ordinal 242, 1 arg = 4 bytes) --- */
-static void bridge_ObMakeTemporaryObject(void)
-{
-    (void)STACK_ARG(0);
-    g_eax = 0;
-}
 
 /* --- ObOpenObjectByName (ordinal 243, 4 args = 16 bytes) --- */
-static void bridge_ObOpenObjectByName(void)
-{
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    g_eax = 0;
-}
 
 /* --- ObOpenObjectByPointer (ordinal 244, 5 args = 20 bytes) --- */
-static void bridge_ObOpenObjectByPointer(void)
+
+/* --- ObReferenceObjectByPointer (ordinal 248, 1 arg = 4 bytes) --- */
+/* ── Objects a title creates itself ──────────────────────────
+ *
+ * The kernel's header in front of the object: +0 reference count, +4 handle count, +8 type, +0xC flags (1 named,
+ * 2 permanent, 4 in a directory), 0x10 bytes before the body. A named one has 0x10 more before that, its ANSI name at
+ * +8 and the text after the body. Types: +0 allocate, +4 free, +8 close, +0xC delete, +0x18 pool tag.
+ *
+ * Everything else called an object here is a stand-in or a host object with no header, so only addresses in this list
+ * are touched. Names live in one flat list, not the kernel's directories: a name means the same with any root. */
+
+static uint32_t bridge_call_guest(uint32_t routine, int argc, const uint32_t *argv);
+
+static struct ob_managed *ob_find(uint32_t body)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
+    struct ob_managed *m;
+    ex_lock();
+    for (m = g_ob_list; m && m->body != body; m = m->next) {}
+    ex_unlock();
+    return m;
+}
+
+static struct ob_managed *ob_find_name(const char *name)
+{
+    struct ob_managed *m;
+    ex_lock();
+    for (m = g_ob_list; m && !(m->name && (OB_FLAGS(m->body) & 4) && !_stricmp(m->name, name)); m = m->next) {}
+    ex_unlock();
+    return m;
+}
+
+/* The object name in OBJECT_ATTRIBUTES, its last component; NULL with none */
+static char *ob_attr_name(uint32_t oa)
+{
+    uint32_t str = oa ? BRIDGE_MEM32(oa + 4) : 0, text;
+    uint16_t len;
+    char *out, *last;
+    if (!str) return NULL;
+    len = BRIDGE_MEM16(str);
+    text = BRIDGE_MEM32(str + 4);
+    if (!len || !text) return NULL;
+    out = (char *)malloc(len + 1u);
+    if (!out) return NULL;
+    memcpy(out, XBOX_TO_NATIVE(text), len);
+    out[len] = 0;
+    last = strrchr(out, '\\');
+    if (last) memmove(out, last + 1, strlen(last));
+    return out;
+}
+
+static void ob_deref(uint32_t body)
+{
+    struct ob_managed *m = ob_find(body), **pp;
+    uint32_t type, block, del, freer;
+    if (!m) return;
+    if (InterlockedDecrement((volatile LONG *)XBOX_TO_NATIVE(body - 0x10)) != 0) return;
+    type = OB_TYPE(body);
+    del = BRIDGE_MEM32(type + 0xC);
+    freer = BRIDGE_MEM32(type + 4);
+    block = (OB_FLAGS(body) & 1) ? body - 0x20 : body - 0x10;
+    if (del) bridge_call_guest(del, 1, &body);
+    ex_lock();
+    for (pp = &g_ob_list; *pp != m; pp = &(*pp)->next) {}
+    *pp = m->next;
+    ex_unlock();
+    free(m->name);
+    free(m);
+    if (freer) bridge_call_guest(freer, 1, &block);
+    else xbox_HeapFree(block);
+}
+
+/* Out of its name's place once nothing keeps it there */
+static void ob_maybe_unname(uint32_t body)
+{
+    if (!OB_HANDLES(body) && (OB_FLAGS(body) & 4) && !(OB_FLAGS(body) & 2)) {
+        OB_FLAGS(body) &= ~4u;
+        ob_deref(body);
+    }
+}
+
+/* From NtClose: a handle holds one reference and one handle count */
+static void ob_close_handle(uint32_t body)
+{
+    uint32_t type = OB_TYPE(body), closer = BRIDGE_MEM32(type + 8), argv[2];
+    uint32_t left = (uint32_t)InterlockedDecrement((volatile LONG *)XBOX_TO_NATIVE(body - 0xC));
+    argv[0] = body, argv[1] = left + 1;
+    if (closer) bridge_call_guest(closer, 2, argv);
+    ob_maybe_unname(body);
+    ob_deref(body);
+}
+
+static uint32_t ob_make_handle(uint32_t handle_va, uint32_t body)
+{
+    uint32_t st = (uint32_t)bridge_write_handle(handle_va, (HANDLE)(OB_HANDLE_TAG | body));
+    if ((int32_t)st >= 0)
+        InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(body - 0xC));
+    return st;
+}
+
+/* The object behind a handle, 0 if it is not one of these */
+static uint32_t ob_from_handle(uint32_t handle)
+{
+    uintptr_t h = (uintptr_t)bridge_handle_lookup(handle);
+    return (h & ~(uintptr_t)0xFFFFFFFFu) == OB_HANDLE_TAG ? (uint32_t)h : 0;
+}
+
+static void bridge_ObCreateObject(void)
+{
+    /* Type, Attributes, BodySize, &Object */
+    uint32_t type = STACK_ARG(0), oa = STACK_ARG(1), size = STACK_ARG(2), out = STACK_ARG(3);
+    char *name = NULL;
+    uint32_t alloc = type ? BRIDGE_MEM32(type) : 0, tag = type ? BRIDGE_MEM32(type + 0x18) : 0;
+    uint32_t total, block, body, argv[2];
+    struct ob_managed *m;
+
+    BRIDGE_MEM32(out) = 0;
+    if (oa && BRIDGE_MEM32(oa + 4)) {
+        name = ob_attr_name(oa);
+        if (!name || !*name) {
+            free(name);
+            g_eax = 0xC0000033u;   /* STATUS_OBJECT_NAME_INVALID */
+            return;
+        }
+    }
+    size = name ? (size + 3) & ~3u : size;
+    total = name ? size + 0x20 + (uint32_t)strlen(name) : size + 0x10;
+    argv[0] = total, argv[1] = tag;
+    /* The kernel's own types allocate from the pool (our copies of them hold no routine) */
+    block = alloc ? bridge_call_guest(alloc, 2, argv) : pool_alloc(total);
+    m = block ? (struct ob_managed *)malloc(sizeof *m) : NULL;
+    if (!m) {
+        free(name);
+        g_eax = 0xC000009Au;
+        return;
+    }
+    if (name) {
+        uint32_t text = block + 0x20 + size, n = (uint32_t)strlen(name);
+        BRIDGE_MEM32(block) = 0;
+        BRIDGE_MEM32(block + 4) = 0;
+        BRIDGE_MEM16(block + 8) = (uint16_t)n;
+        BRIDGE_MEM16(block + 0xA) = (uint16_t)n;
+        BRIDGE_MEM32(block + 0xC) = text;
+        memcpy(XBOX_TO_NATIVE(text), name, n);
+        body = block + 0x20;
+    } else {
+        body = block + 0x10;
+    }
+    OB_REFS(body) = 1;
+    OB_HANDLES(body) = 0;
+    OB_TYPE(body) = type;
+    OB_FLAGS(body) = name ? 1 : 0;
+    m->body = body;
+    m->name = name;
+    ex_lock();
+    m->next = g_ob_list;
+    g_ob_list = m;
+    ex_unlock();
+    BRIDGE_MEM32(out) = body;
     g_eax = 0;
 }
 
-/* --- ObReferenceObjectByPointer (ordinal 248, 1 arg = 4 bytes) --- */
+static void bridge_ObInsertObject(void)
+{
+    /* Object, Attributes, Extra handle references (ignored by the kernel's count here), &Handle. The caller's reference
+     * is used up, as on the console: on success it becomes the handle's or is dropped for an existing object. */
+    uint32_t body = STACK_ARG(0), oa = STACK_ARG(1), handle_va = STACK_ARG(3), use = body, st = 0;
+    struct ob_managed *m = ob_find(body);
+    if (handle_va) BRIDGE_MEM32(handle_va) = 0;
+    if (!m) {   /* not from ObCreateObject */
+        g_eax = 0xC0000002u;
+        return;
+    }
+    if (m->name) {
+        struct ob_managed *other = ob_find_name(m->name);
+        if (other) {
+            if (!(oa && (BRIDGE_MEM32(oa + 8) & 0x80))) {   /* OBJ_OPENIF */
+                ob_deref(body);
+                g_eax = 0xC0000035u;   /* STATUS_OBJECT_NAME_COLLISION */
+                return;
+            }
+            if (OB_TYPE(other->body) != OB_TYPE(body)) {
+                ob_deref(body);
+                g_eax = 0xC0000024u;
+                return;
+            }
+            use = other->body;
+            InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(use - 0x10));
+            ob_deref(body);
+            st = 0x40000000u;          /* STATUS_OBJECT_NAME_EXISTS */
+        } else {
+            OB_FLAGS(body) |= 4;
+            InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(body - 0x10));   /* the name holds one */
+        }
+    }
+    if (oa && (BRIDGE_MEM32(oa + 8) & 0x10))   /* OBJ_PERMANENT */
+        OB_FLAGS(use) |= 2;
+    {
+        uint32_t w = ob_make_handle(handle_va, use);
+        if ((int32_t)w < 0) {
+            ob_deref(use);
+            st = w;
+        }
+    }
+    g_eax = st;
+}
+
+static void bridge_ObOpenObjectByPointer(void)
+{
+    /* Object, Type, &Handle */
+    uint32_t body = STACK_ARG(0), type = STACK_ARG(1), handle_va = STACK_ARG(2);
+    if (handle_va) BRIDGE_MEM32(handle_va) = 0;
+    if (!ob_find(body)) {
+        g_eax = 0xC0000002u;   /* a stand-in has no header */
+        return;
+    }
+    if (OB_TYPE(body) != type) {
+        g_eax = 0xC0000024u;
+        return;
+    }
+    InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(body - 0x10));
+    g_eax = ob_make_handle(handle_va, body);
+    if ((int32_t)g_eax < 0) ob_deref(body);
+}
+
+static void bridge_ObOpenObjectByName(void)
+{
+    /* Attributes, Type, ParseContext, &Handle */
+    uint32_t oa = STACK_ARG(0), type = STACK_ARG(1), handle_va = STACK_ARG(3);
+    char *name = ob_attr_name(oa);
+    struct ob_managed *m = name ? ob_find_name(name) : NULL;
+    free(name);
+    if (handle_va) BRIDGE_MEM32(handle_va) = 0;
+    if (!m) {
+        g_eax = 0xC0000034u;
+        return;
+    }
+    if (type && OB_TYPE(m->body) != type) {
+        g_eax = 0xC0000024u;
+        return;
+    }
+    InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(m->body - 0x10));
+    g_eax = ob_make_handle(handle_va, m->body);
+    if ((int32_t)g_eax < 0) ob_deref(m->body);
+}
+
 static void bridge_ObReferenceObjectByPointer(void)
 {
-    (void)STACK_ARG(0);
+    uint32_t body = STACK_ARG(0), type = STACK_ARG(1);
+    g_eax = 0;
+    if (ob_find(body)) {
+        if (OB_TYPE(body) != type) g_eax = 0xC0000024u;
+        else InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(body - 0x10));
+    }
+}
+
+static void bridge_ObMakeTemporaryObject(void)
+{
+    uint32_t body = STACK_ARG(0);
+    if (ob_find(body)) {
+        OB_FLAGS(body) &= ~2u;
+        ob_maybe_unname(body);
+    }
     g_eax = 0;
 }
+
+static void bridge_ObfReferenceObject(void)
+{
+    uint32_t body = g_ecx;
+    if (ob_find(body))
+        g_eax = (uint32_t)InterlockedIncrement((volatile LONG *)XBOX_TO_NATIVE(body - 0x10));
+    else
+        g_eax = 0;
+}
+
+static void bridge_ObfDereferenceObject(void)
+{
+    ob_deref(g_ecx);
+    g_eax = 0;
+}
+
+/* A handle that is not valid is C0000008; one of the wrong kind, which the host's calls also fail on, C0000024 */
+static uint32_t bridge_handle_status(HANDLE h, uint32_t st)
+{
+    DWORD flags;
+    return st == 0xC0000008u && h && GetHandleInformation(h, &flags) ? 0xC0000024u : st;
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Ps (254, 256, 257)
@@ -8339,9 +10141,9 @@ static void bridge_ObReferenceObjectByPointer(void)
 static void bridge_PsCreateSystemThread(void)
 {
     uint32_t xbox_handle_ptr = STACK_ARG(0);
-    uint32_t start_context1  = STACK_ARG(4);
-    uint32_t start_context2  = STACK_ARG(5);
-    uint32_t start_routine   = STACK_ARG(6);
+    uint32_t start_context1  = STACK_ARG(3);   /* the routine's one argument */
+    uint32_t start_context2  = 0;
+    uint32_t start_routine   = STACK_ARG(2);
     int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
                         && (g_thread_call_count == 0);
 
@@ -8377,8 +10179,13 @@ static void bridge_PsCreateSystemThread(void)
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top);
-                    if (xbox_handle_ptr && th)
-                        bridge_write_handle(xbox_handle_ptr, th);
+                    if (!th) {
+                        g_eax = 0xC000009Au;   /* STATUS_INSUFFICIENT_RESOURCES */
+                        return;
+                    }
+                    if (STACK_ARG(1)) BRIDGE_MEM32(STACK_ARG(1)) = (uint32_t)GetThreadId(th);
+                    if (xbox_handle_ptr) bridge_write_handle(xbox_handle_ptr, th);
+                    ResumeThread(th);
                 }
             }
         } else {
@@ -8393,18 +10200,28 @@ static void bridge_PsCreateSystemThread(void)
  * Zeroes the caller's statistics structure. */
 static void bridge_PsQueryStatistics(void)
 {
+    /* A 12-byte record that says so: Length, ThreadCount, HandleCount. This used to clear 0x80 bytes of the caller. */
     uint32_t stats_va = STACK_ARG(0);
-    if (stats_va)
-        memset(XBOX_TO_NATIVE(stats_va), 0, 0x80);
+    if (BRIDGE_MEM32(stats_va) != 0xCu) {
+        g_eax = 0xC000000Du;
+        return;
+    }
+    BRIDGE_MEM32(stats_va + 4) = (uint32_t)s_thread_obj_count;
+    BRIDGE_MEM32(stats_va + 8) = 0;   /* not counted here */
     g_eax = 0;
 }
 
 /* --- PsSetCreateThreadNotifyRoutine (ordinal 257, 2 args = 8 bytes) --- */
 static void bridge_PsSetCreateThreadNotifyRoutine(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    g_eax = 0;
+    uint32_t i;
+    for (i = 0; i < 8; i++)
+        if (!s_thread_notify[i]) {
+            s_thread_notify[i] = STACK_ARG(0);
+            g_eax = 0;
+            return;
+        }
+    g_eax = 0xC000009Au;   /* STATUS_INSUFFICIENT_RESOURCES */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -8467,28 +10284,17 @@ static void bridge_RtlExtendedLargeIntegerDivide(void)
  * available, so a real division produces the identical quotient. */
 static void bridge_RtlExtendedMagicDivide(void)
 {
-    uint64_t dividend = ((uint64_t)(uint32_t)STACK_ARG(1) << 32)
-                      | (uint32_t)STACK_ARG(0);
-    uint32_t divisor = STACK_ARG(2);
-    uint32_t rem_ptr = STACK_ARG(3);
-    uint32_t remainder;
-    uint64_t quotient;
-
-    if (divisor == 0) {
-        if (rem_ptr)
-            BRIDGE_MEM32(rem_ptr) = 0;
-        g_eax = 0;
-        g_edx = 0;
-        return;
-    }
-
-    quotient  = dividend / divisor;
-    remainder = (uint32_t)(dividend % divisor);
-
-    if (rem_ptr)
-        BRIDGE_MEM32(rem_ptr) = remainder;
-    g_eax = (uint32_t)quotient;
-    g_edx = (uint32_t)(quotient >> 32);
+    /* Dividend[8], MagicDivisor[8], ShiftCount: the top 64 bits of the product,
+     * shifted, the dividend's sign kept. */
+    int64_t d = (int64_t)(((uint64_t)STACK_ARG(1) << 32) | STACK_ARG(0));
+    uint64_t m = ((uint64_t)STACK_ARG(3) << 32) | STACK_ARG(2);
+    uint32_t shift = STACK_ARG(4) & 0xFFu;
+    uint64_t u = d < 0 ? (uint64_t)0 - (uint64_t)d : (uint64_t)d;
+    uint64_t q = (uint64_t)(((unsigned __int128)u * m) >> 64);
+    q = shift >= 64 ? 0 : q >> shift;
+    if (d < 0) q = (uint64_t)0 - q;
+    g_eax = (uint32_t)q;
+    g_edx = (uint32_t)(q >> 32);
 }
 
 /* --- RtlFillMemoryUlong (ordinal 285, 3 args = 12 bytes)
@@ -8581,187 +10387,168 @@ static uint64_t bridge_va_next64(uint32_t *pos)
 static int bridge_format_printf(char *out, size_t cap, const char *fmt,
                                 uint32_t pos)
 {
-    size_t used = 0;
-    size_t i = 0;
+    /* As the kernel's printf. Conversions d i o u x X, p (eight upper-case hex digits), c C s S Z and n. e E f g G take
+     * their 8 bytes and print nothing: the kernel has no floating point here. An unknown conversion prints nothing.
+     * h, l, w, I32, I64 sizes; S and C are wide by default, s and c narrow, l and w make them wide, h narrow. Z is a
+     * string record: narrow, or wide with w or l. Past the buffer the result is -1 with no NUL, as _vsnprintf. */
+    size_t used = 0, i = 0;
+    int overflow = 0;
 
-    if (!out || cap == 0)
-        return 0;
+#define PUT(c) do { if (used < cap) out[used++] = (char)(c); else overflow = 1; } while (0)
 
-    while (fmt[i] && used + 1 < cap) {
+    if (!out)
+        cap = 0;
+    while (fmt[i] && !overflow) {
         if (fmt[i] != '%') {
-            out[used++] = fmt[i++];
+            PUT(fmt[i]);
+            i++;
             continue;
         }
         i++;
         if (fmt[i] == '%') {
-            out[used++] = '%';
+            PUT('%');
             i++;
             continue;
         }
-
         {
-            char flags[8];
-            int  nflags = 0;
-            char conv[32];
-            char *cp = conv;
-            int  width = 0, have_width = 0, width_star = 0;
-            int  prec  = 0, have_prec  = 0, prec_star  = 0;
-            char len = 0;          /* 0 none, 1 h, 2 hh, 3 l, 4 ll */
+            char flags[8], conv[32], num[96], *cp = conv;
+            int nflags = 0, width = 0, have_width = 0, prec = -1;
+            int size = 0;   /* 0 none, 1 h, 3 l, 4 I64, 5 w */
             char spec;
-            char tmp[512];
-            size_t tlen;
+            int left;
 
             while (fmt[i] && strchr("-+ 0#", fmt[i]) && nflags < 7)
                 flags[nflags++] = fmt[i++];
             flags[nflags] = 0;
-
-            if (fmt[i] == '*') { width_star = 1; have_width = 1; i++; }
-            else if (fmt[i] >= '0' && fmt[i] <= '9') {
+            if (fmt[i] == '*') {
+                width = (int32_t)bridge_va_next32(&pos);
                 have_width = 1;
+                i++;
+            } else {
                 while (fmt[i] >= '0' && fmt[i] <= '9') {
                     width = width * 10 + (fmt[i] - '0');
+                    have_width = 1;
                     i++;
                 }
             }
-
+            left = strchr(flags, '-') != NULL;
+            if (width < 0) { left = 1; width = -width; }
             if (fmt[i] == '.') {
                 i++;
-                have_prec = 1;
-                if (fmt[i] == '*') { prec_star = 1; i++; }
-                else while (fmt[i] >= '0' && fmt[i] <= '9') {
-                    prec = prec * 10 + (fmt[i] - '0');
+                prec = 0;
+                if (fmt[i] == '*') {
+                    prec = (int32_t)bridge_va_next32(&pos);
                     i++;
+                } else {
+                    while (fmt[i] >= '0' && fmt[i] <= '9') prec = prec * 10 + (fmt[i++] - '0');
                 }
             }
-
-            if (fmt[i] == 'h') { len = 1; i++; if (fmt[i] == 'h') { len = 2; i++; } }
-            else if (fmt[i] == 'l') { len = 3; i++; if (fmt[i] == 'l') { len = 4; i++; } }
-            else if (fmt[i] == 'q') { len = 4; i++; }
-            else if (fmt[i] == 'I' && fmt[i+1] == '6' && fmt[i+2] == '4') {
-                len = 4; i += 3;
-            }
-
+            if (fmt[i] == 'h') { size = 1; i++; }
+            else if (fmt[i] == 'l') { size = 3; i++; }
+            else if (fmt[i] == 'w') { size = 5; i++; }
+            else if (fmt[i] == 'I' && fmt[i + 1] == '6' && fmt[i + 2] == '4') { size = 4; i += 3; }
+            else if (fmt[i] == 'I' && fmt[i + 1] == '3' && fmt[i + 2] == '2') { i += 3; }
             spec = fmt[i];
             if (!spec)
                 break;
             i++;
 
-            *cp++ = '%';
-            if (nflags) { memcpy(cp, flags, (size_t)nflags); cp += nflags; }
-
-            if (width_star) {
-                int w = (int32_t)bridge_va_next32(&pos);
-                if (w < 0) { *cp++ = '-'; w = -w; }
-                cp += sprintf(cp, "%d", w);
-            } else if (have_width) {
-                cp += sprintf(cp, "%d", width);
-            }
-            if (have_prec) {
-                *cp++ = '.';
-                if (prec_star) {
-                    int p = (int32_t)bridge_va_next32(&pos);
-                    if (p < 0) p = 0;
-                    cp += sprintf(cp, "%d", p);
-                } else {
-                    cp += sprintf(cp, "%d", prec);
-                }
-            }
-            /* Single 'l' is a 32-bit long on the console; the host long is 32
-             * bits too, so 'l' is passed through for the d/i/u/o/x/X paths. */
-            if (len == 2) { *cp++ = 'h'; *cp++ = 'h'; }
-            else if (len == 1) { *cp++ = 'h'; }
-            else if (len == 4) { *cp++ = 'l'; *cp++ = 'l'; }
-
             switch (spec) {
-            case 'd': case 'i': {
-                if (len == 4) {
-                    long long v = (long long)bridge_va_next64(&pos);
-                    *cp++ = 'd'; *cp = 0;
-                    snprintf(tmp, sizeof tmp, conv, v);
+            case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': case 'p': {
+                unsigned long long v;
+                char c = spec == 'i' ? 'd' : spec == 'p' ? 'X' : spec;
+                if (spec == 'p') prec = 8;
+                v = size == 4 ? bridge_va_next64(&pos) : bridge_va_next32(&pos);
+                *cp++ = '%';
+                memcpy(cp, flags, (size_t)nflags), cp += nflags;
+                if (prec >= 0) cp += sprintf(cp, ".%d", prec);
+                *cp++ = 'l', *cp++ = 'l', *cp++ = c, *cp = 0;
+                if (c == 'd') {
+                    long long sv = size == 4 ? (long long)v : size == 1 ? (long long)(int16_t)v : (long long)(int32_t)v;
+                    snprintf(num, sizeof num, conv, sv);
                 } else {
-                    int v = (int)(int32_t)bridge_va_next32(&pos);
-                    *cp++ = 'd'; *cp = 0;
-                    snprintf(tmp, sizeof tmp, conv, v);
+                    if (size == 1) v &= 0xFFFF;
+                    snprintf(num, sizeof num, conv, v);
+                }
+                {
+                    size_t n = strlen(num), k;
+                    int pad = have_width && (size_t)width > n ? width - (int)n : 0;
+                    int zero = strchr(flags, '0') && !left && prec < 0;
+                    if (zero && pad) {   /* zeros go after any sign or prefix */
+                        size_t lead = (num[0] == '-' || num[0] == '+' || num[0] == ' ') ? 1 : 0;
+                        if (num[lead] == '0' && (num[lead + 1] == 'x' || num[lead + 1] == 'X')) lead += 2;
+                        for (k = 0; k < lead; k++) PUT(num[k]);
+                        while (pad-- > 0) PUT('0');
+                        for (k = lead; k < n; k++) PUT(num[k]);
+                    } else {
+                        if (!left) while (pad-- > 0) PUT(' ');
+                        for (k = 0; k < n; k++) PUT(num[k]);
+                        if (left) while (pad-- > 0) PUT(' ');
+                    }
                 }
                 break;
             }
-            case 'u': {
-                if (len == 4) {
-                    unsigned long long v = bridge_va_next64(&pos);
-                    *cp++ = 'u'; *cp = 0;
-                    snprintf(tmp, sizeof tmp, conv, v);
-                } else {
-                    unsigned int v = bridge_va_next32(&pos);
-                    *cp++ = 'u'; *cp = 0;
-                    snprintf(tmp, sizeof tmp, conv, v);
+            case 'c': case 'C': {
+                uint32_t v = bridge_va_next32(&pos);
+                int pad = have_width && width > 1 ? width - 1 : 0;
+                int wide = spec == 'C' ? size != 1 : (size == 3 || size == 5);
+                if (!left) while (pad-- > 0) PUT(' ');
+                PUT(wide ? ((v & 0xFFFF) < 0x100 ? v : '?') : v);
+                if (left) while (pad-- > 0) PUT(' ');
+                break;
+            }
+            case 's': case 'S': case 'Z': {
+                uint32_t va = bridge_va_next32(&pos);
+                int wide = spec == 'S' ? size != 1 : (size == 3 || size == 5);
+                int counted = -1, n = 0, k, pad;
+                if (spec == 'Z') {
+                    uint32_t text = va ? BRIDGE_MEM32(va + 4) : 0;
+                    if (text) {
+                        counted = (int)(int16_t)BRIDGE_MEM16(va);
+                        if (wide) counted /= 2;
+                    }
+                    va = text;
                 }
-                break;
-            }
-            case 'o': case 'x': case 'X': {
-                if (len == 4) {
-                    unsigned long long v = bridge_va_next64(&pos);
-                    *cp++ = spec; *cp = 0;
-                    snprintf(tmp, sizeof tmp, conv, v);
+                if (!va) { wide = 0; counted = 6; }
+                if (counted >= 0) {
+                    n = counted;
                 } else {
-                    unsigned int v = bridge_va_next32(&pos);
-                    *cp++ = spec; *cp = 0;
-                    snprintf(tmp, sizeof tmp, conv, v);
+                    while ((prec < 0 || n < prec) &&
+                           (wide ? BRIDGE_MEM16(va + (uint32_t)n * 2) : BRIDGE_MEM8(va + (uint32_t)n))) n++;
                 }
-                break;
-            }
-            case 'c': {
-                int v = (int)bridge_va_next32(&pos);
-                *cp++ = 'c'; *cp = 0;
-                snprintf(tmp, sizeof tmp, conv, v);
-                break;
-            }
-            case 's': {
-                uint32_t sva = bridge_va_next32(&pos);
-                const char *gs = sva ? (const char *)XBOX_TO_NATIVE(sva)
-                                     : "(null)";
-                *cp++ = 's'; *cp = 0;
-                snprintf(tmp, sizeof tmp, conv, gs);
-                break;
-            }
-            case 'p': {
-                /* 32-bit pointer as padded lower-case hex, like the x86 CRT */
-                unsigned int v = bridge_va_next32(&pos);
-                const char *pfx = strchr(flags, '#') ? "%#08x" : "%08x";
-                snprintf(tmp, sizeof tmp, pfx, v);
+                if (prec >= 0 && n > prec) n = prec;
+                pad = have_width && width > n ? width - n : 0;
+                if (!left) while (pad-- > 0) PUT(' ');
+                for (k = 0; k < n; k++) {
+                    uint32_t c;
+                    if (!va) c = (uint8_t)"(null)"[k];
+                    else if (wide) { c = BRIDGE_MEM16(va + (uint32_t)k * 2); if (c >= 0x100) c = '?'; }
+                    else c = BRIDGE_MEM8(va + (uint32_t)k);
+                    PUT(c);
+                }
+                if (left) while (pad-- > 0) PUT(' ');
                 break;
             }
             case 'n': {
                 uint32_t tva = bridge_va_next32(&pos);
-                if (tva)
-                    BRIDGE_MEM32(tva) = (uint32_t)used;   /* int written */
-                tlen = 0;
+                if (tva) {
+                    if (size == 1) BRIDGE_MEM16(tva) = (uint16_t)used;
+                    else BRIDGE_MEM32(tva) = (uint32_t)used;
+                }
                 break;
             }
-            case 'f': case 'e': case 'g': case 'E': case 'G': {
-                double v = (double)bridge_va_next64(&pos);
-                *cp++ = spec; *cp = 0;
-                snprintf(tmp, sizeof tmp, conv, v);
+            case 'e': case 'E': case 'f': case 'g': case 'G':
+                bridge_va_next64(&pos);
                 break;
-            }
             default:
-                /* Unsupported conversion: keep '%' and the specifier */
-                out[used++] = '%';
-                out[used++] = spec;
-                continue;
-            }
-
-            tlen = (spec == 'n') ? 0 : strlen(tmp);
-            {
-                size_t k;
-                for (k = 0; k < tlen && used + 1 < cap; k++)
-                    out[used++] = tmp[k];
+                break;
             }
         }
     }
+#undef PUT
 
-    if (used + 1 >= cap)
-        used = cap - 1;
-    out[used] = 0;
+    if (overflow) return -1;
+    if (used < cap) out[used] = 0;
     return (int)used;
 }
 
@@ -8790,8 +10577,7 @@ static void bridge_RtlSprintf(void)
         g_eax = 0;
         return;
     }
-    /* Unbounded like the CRT's vsprintf; a wide cap prevents a wild write. */
-    g_eax = bridge_format_printf(dst, 65536, fmt, g_esp + 8);
+    g_eax = bridge_format_printf(dst, 0x7FFFFFFF, fmt, g_esp + 8);   /* unbounded, as the kernel */
 }
 
 /* --- RtlVsnprintf (ordinal 363, __cdecl, caller cleans) --- */
@@ -8820,7 +10606,7 @@ static void bridge_RtlVsprintf(void)
         g_eax = 0;
         return;
     }
-    g_eax = bridge_format_printf(dst, 65536, fmt, list);
+    g_eax = bridge_format_printf(dst, 0x7FFFFFFF, fmt, list);   /* unbounded, as the kernel */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -8836,36 +10622,36 @@ static void bridge_RtlVsprintf(void)
 /* --- READ_PORT_BUFFER_UCHAR (ordinal 329, 3 args = 12 bytes) --- */
 static void bridge_READ_PORT_BUFFER_UCHAR(void)
 {
-    void *src = XBOX_TO_NATIVE(STACK_ARG(0));
+    /* The first argument is an I/O port, not an address: no device answers here, so a floating bus's all ones. */
     void *dst = XBOX_TO_NATIVE(STACK_ARG(1));
     uint32_t count = STACK_ARG(2);
 
-    if (src && dst)
-        memcpy(dst, src, count);
+    if (dst)
+        memset(dst, 0xFF, count);
     g_eax = 0;
 }
 
 /* --- READ_PORT_BUFFER_USHORT (ordinal 330, 3 args = 12 bytes) --- */
 static void bridge_READ_PORT_BUFFER_USHORT(void)
 {
-    void *src = XBOX_TO_NATIVE(STACK_ARG(0));
+    /* The first argument is an I/O port, not an address: no device answers here, so a floating bus's all ones. */
     void *dst = XBOX_TO_NATIVE(STACK_ARG(1));
     uint32_t count = STACK_ARG(2);
 
-    if (src && dst)
-        memcpy(dst, src, count * sizeof(uint16_t));
+    if (dst)
+        memset(dst, 0xFF, count * sizeof(uint16_t));
     g_eax = 0;
 }
 
 /* --- READ_PORT_BUFFER_ULONG (ordinal 331, 3 args = 12 bytes) --- */
 static void bridge_READ_PORT_BUFFER_ULONG(void)
 {
-    void *src = XBOX_TO_NATIVE(STACK_ARG(0));
+    /* The first argument is an I/O port, not an address: no device answers here, so a floating bus's all ones. */
     void *dst = XBOX_TO_NATIVE(STACK_ARG(1));
     uint32_t count = STACK_ARG(2);
 
-    if (src && dst)
-        memcpy(dst, src, count * sizeof(uint32_t));
+    if (dst)
+        memset(dst, 0xFF, count * sizeof(uint32_t));
     g_eax = 0;
 }
 
@@ -8897,15 +10683,15 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  29: return 16;  /* ExSaveNonVolatileSetting (4) */
     case  35: return  0;  /* FscGetCacheSize (void) */
     case  37: return  4;  /* FscSetCacheSize (1) */
-    case  38: return  4;  /* HalClearSoftwareInterrupt (1) */
-    case  39: return  8;  /* HalDisableSystemInterrupt (2) */
+    case  38: return  0;  /* HalClearSoftwareInterrupt (fastcall) */
+    case  39: return  4;  /* HalDisableSystemInterrupt (1) */
     case  42: return  0;  /* HalDiskSerialNumber - data export */
     case  44: return  8;  /* HalGetInterruptVector (2) */
     case  47: return  8;  /* HalRegisterShutdownNotification (2) */
     case  46: return 24;  /* HalReadWritePCISpace (6) */
     case  45: return 16;  /* HalReadSMBusValue (4) */
     case  50: return 16;  /* HalWriteSMBusValue (4) */
-    case  48: return  4;  /* HalRequestSoftwareInterrupt (1) */
+    case  48: return  0;  /* HalRequestSoftwareInterrupt (fastcall) */
     case  49: return  4;  /* HalReturnToFirmware (1) */
     case  61: return 36;  /* IoBuildDeviceIoControlRequest (9) */
     case  62: return 28;  /* IoBuildSynchronousFsdRequest (7) */
@@ -8917,9 +10703,9 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  73: return 12;  /* IoInitializeIrp (3) */
     case  74: return  8;  /* IoInvalidDeviceRequest (2) */
     case  79: return 20;  /* IoSetIoCompletion (5) */
-    case  81: return  8;  /* IoStartNextPacket (2) */
-    case  82: return 12;  /* IoStartNextPacketByKey (3) */
-    case  83: return 16;  /* IoStartPacket (4) */
+    case  81: return  4;  /* IoStartNextPacket (1) */
+    case  82: return  8;  /* IoStartNextPacketByKey (2) */
+    case  83: return 12;  /* IoStartPacket (3) */
     case  84: return 32;  /* IoSynchronousDeviceIoControlRequest (8) */
     case  85: return 20;  /* IoSynchronousFsdRequest (5) */
     case  86: return  0;  /* IofCallDriver (fastcall: args in ecx/edx) */
@@ -9046,9 +10832,9 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 261: return  8;  /* RtlAppendStringToString (2) */
     case 262: return  8;  /* RtlAppendUnicodeStringToString (2) */
     case 263: return  8;  /* RtlAppendUnicodeToString (2) */
-    case 264: return 12;  /* RtlAssert (3) */
+    case 264: return 16;  /* RtlAssert (4) */
     case 265: return  4;  /* RtlCaptureContext (1) */
-    case 266: return 20;  /* RtlCaptureStackBackTrace (5) */
+    case 266: return 16;  /* RtlCaptureStackBackTrace (4) */
     case 267: return 12;  /* RtlCharToInteger (3) */
     case 271: return 12;  /* RtlCompareUnicodeString (3) */
     case 272: return  8;  /* RtlCopyString (2) */
@@ -9070,7 +10856,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 299: return 20;  /* RtlMultiByteToUnicodeN (5) */
     case 300: return 12;  /* RtlMultiByteToUnicodeSize (3) */
     case 306: return  4;  /* RtlTryEnterCriticalSection (1) */
-    case 307: return  4;  /* RtlUlongByteSwap (1) */
+    case 307: return  0;  /* RtlUlongByteSwap (fastcall) */
     case 309: return 12;  /* RtlUnicodeStringToInteger (3) */
     case 310: return 20;  /* RtlUnicodeToMultiByteN (5) */
     case 311: return 12;  /* RtlUnicodeToMultiByteSize (3) */
@@ -9079,7 +10865,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 315: return 20;  /* RtlUpcaseUnicodeToMultiByteN (5) */
     case 316: return  4;  /* RtlUpperChar (1) */
     case 317: return  8;  /* RtlUpperString (2) */
-    case 318: return  4;  /* RtlUshortByteSwap (1) */
+    case 318: return  0;  /* RtlUshortByteSwap (fastcall) */
     case 319: return 12;  /* RtlWalkFrameChain (3) */
     case 320: return  8;  /* RtlZeroMemory (2) */
     case 321: return  0;  /* XboxEEPROMKey (void) */
@@ -9177,25 +10963,25 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     /* Dbg */
     case   6: return  4;  /* DbgBreakPointWithStatus (1) */
     case   7: return 12;  /* DbgLoadImageSymbols (3) */
-    case  10: return  8;  /* DbgPrompt (2) */
+    case  10: return 12;  /* DbgPrompt (3) */
     case  11: return 12;  /* DbgUnLoadImageSymbols (3) */
 
     /* Ex */
     case  12: return  4;  /* ExAcquireReadWriteLockExclusive (1) */
     case  13: return  4;  /* ExAcquireReadWriteLockShared (1) */
     case  18: return  4;  /* ExInitializeReadWriteLock (1) */
-    case  19: return 12;  /* ExInterlockedAddLargeInteger (3) */
-    case  20: return  8;  /* ExInterlockedAddLargeStatistic (2) */
-    case  21: return 16;  /* ExInterlockedCompareExchange64 (4) */
+    case  19: return 16;  /* ExInterlockedAddLargeInteger (Addend, Increment[8], Lock) */
+    case  20: return  0;  /* ExInterlockedAddLargeStatistic (fastcall) */
+    case  21: return  4;  /* ExInterlockedCompareExchange64 (fastcall, 1 on the stack) */
     case  25: return 12;  /* ExReadWriteRefurbInfo (3) */
     case  26: return  4;  /* ExRaiseException (1) */
     case  27: return  4;  /* ExRaiseStatus (1) */
     case  28: return  4;  /* ExReleaseReadWriteLock (1) */
 
     /* ExfInterlocked */
-    case  32: return  8;  /* ExfInterlockedInsertHeadList (2) */
-    case  33: return  8;  /* ExfInterlockedInsertTailList (2) */
-    case  34: return  4;  /* ExfInterlockedRemoveHeadList (1) */
+    case  32: return  0;  /* ExfInterlockedInsertHeadList (fastcall) */
+    case  33: return  0;  /* ExfInterlockedInsertTailList (fastcall) */
+    case  34: return  0;  /* ExfInterlockedRemoveHeadList (fastcall) */
 
     /* Fsc */
     case  36: return  0;  /* FscInvalidateIdleBlocks (void) */
@@ -9206,7 +10992,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 366: return  4;  /* HalWriteSMCScratchRegister (1) */
 
     /* Interlocked (fastcall, args in ecx/edx) */
-    case  51: return  0;  /* InterlockedCompareExchange (fastcall) */
+    case  51: return  4;  /* InterlockedCompareExchange (fastcall, 1 on the stack) */
     case  52: return  0;  /* InterlockedDecrement (fastcall) */
     case  53: return  0;  /* InterlockedIncrement (fastcall) */
     case  54: return  0;  /* InterlockedExchange (fastcall) */
@@ -9216,15 +11002,15 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  58: return  0;  /* InterlockedPushEntrySList (fastcall) */
 
     /* Io */
-    case  59: return  8;  /* IoAllocateIrp (2) */
-    case  60: return 28;  /* IoBuildAsynchronousFsdRequest (7) */
+    case  59: return  4;  /* IoAllocateIrp (1) */
+    case  60: return 24;  /* IoBuildAsynchronousFsdRequest (6) */
     case  63: return 20;  /* IoCheckShareAccess (5) */
     case  72: return  4;  /* IoFreeIrp (1) */
     case  75: return 20;  /* IoQueryFileInformation (5) */
     case  76: return 20;  /* IoQueryVolumeInformation (5) */
     case  77: return  4;  /* IoQueueThreadIrp (1) */
     case  78: return  8;  /* IoRemoveShareAccess (2) */
-    case  80: return 20;  /* IoSetShareAccess (5) */
+    case  80: return 16;  /* IoSetShareAccess (4) */
 
     /* Kd */
     case  88: return  0;  /* KdDebuggerEnabled (void) */
@@ -9236,7 +11022,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 101: return  0;  /* KeEnterCriticalRegion (void) */
     case 103: return  0;  /* KeGetCurrentIrql (void) */
     case 104: return  0;  /* KeGetCurrentThread (void) */
-    case 105: return 24;  /* KeInitializeApc (6) */
+    case 105: return 28;  /* KeInitializeApc (7) */
     case 106: return  4;  /* KeInitializeDeviceQueue (1) */
     case 108: return 12;  /* KeInitializeEvent (3) */
     case 110: return  8;  /* KeInitializeMutant (2) */
@@ -9256,7 +11042,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 133: return  8;  /* KeRemoveByKeyDeviceQueue (2) */
     case 134: return  4;  /* KeRemoveDeviceQueue (1) */
     case 135: return  8;  /* KeRemoveEntryDeviceQueue (2) */
-    case 136: return  4;  /* KeRemoveQueue (1) */
+    case 136: return 12;  /* KeRemoveQueue (3) */
     case 138: return  4;  /* KeResetEvent (1) */
     case 140: return  4;  /* KeResumeThread (1) */
     case 141: return  4;  /* KeRundownQueue (1) */
@@ -9266,7 +11052,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 152: return  4;  /* KeSuspendThread (1) */
     case 155: return  4;  /* KeTestAlertThread (1) */
     case 162: return  0;  /* KiBugCheckData (void/data) */
-    case 163: return  4;  /* KiUnlockDispatcherDatabase (1) */
+    case 163: return  0;  /* KiUnlockDispatcherDatabase (fastcall) */
 
     /* Mm */
     case 174: return  4;  /* MmIsAddressValid (1) */
@@ -9277,30 +11063,30 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 378: return  8;  /* MmDbgWriteCheck (2) */
 
     /* Nt */
-    case 201: return 12;  /* NtOpenDirectoryObject (3) */
-    case 208: return 28;  /* NtQueryDirectoryObject (7) */
-    case 209: return 16;  /* NtQueryEvent (4) */
-    case 212: return 20;  /* NtQueryIoCompletion (5) */
-    case 213: return 20;  /* NtQueryMutant (5) */
-    case 214: return 20;  /* NtQuerySemaphore (5) */
-    case 216: return 20;  /* NtQueryTimer (5) */
+    case 201: return  8;  /* NtOpenDirectoryObject (2) */
+    case 208: return 24;  /* NtQueryDirectoryObject (6) */
+    case 209: return  8;  /* NtQueryEvent (2) */
+    case 212: return  8;  /* NtQueryIoCompletion (2) */
+    case 213: return  8;  /* NtQueryMutant (2) */
+    case 214: return  8;  /* NtQuerySemaphore (2) */
+    case 216: return  8;  /* NtQueryTimer (2) */
 
     /* Ob */
-    case 239: return 28;  /* ObCreateObject (7) */
-    case 241: return 24;  /* ObInsertObject (6) */
+    case 239: return 16;  /* ObCreateObject (4) */
+    case 241: return 16;  /* ObInsertObject (4) */
     case 242: return  4;  /* ObMakeTemporaryObject (1) */
-    case 244: return 20;  /* ObOpenObjectByPointer (5) */
-    case 248: return  4;  /* ObReferenceObjectByPointer (1) */
+    case 244: return 12;  /* ObOpenObjectByPointer (3) */
+    case 248: return  8;  /* ObReferenceObjectByPointer (2) */
 
     /* Ps */
-    case 254: return 28;  /* PsCreateSystemThread (7) */
+    case 254: return 20;  /* PsCreateSystemThread (5) */
     case 256: return  4;  /* PsQueryStatistics (1) */
-    case 257: return  8;  /* PsSetCreateThreadNotifyRoutine (2) */
+    case 257: return  4;  /* PsSetCreateThreadNotifyRoutine (1) */
 
     /* Rtl */
     case 281: return 12;  /* RtlExtendedIntegerMultiply (3) */
     case 282: return 16;  /* RtlExtendedLargeIntegerDivide (4) */
-    case 283: return 16;  /* RtlExtendedMagicDivide (4) */
+    case 283: return 20;  /* RtlExtendedMagicDivide (Dividend[8], Divisor[8], Shift) */
     case 303: return  4;  /* RtlRaiseStatus (1) */
     case 361: return  0;  /* RtlSnprintf - __cdecl, caller cleans */
     case 362: return  0;  /* RtlSprintf - __cdecl, caller cleans */
@@ -9313,6 +11099,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 331: return 12;  /* READ_PORT_BUFFER_ULONG (3) */
     case 332: return 12;  /* WRITE_PORT_BUFFER_UCHAR (3) */
 
+
     /* Not 0: a genuine zero-argument function and an ordinal nobody has
      * written down are both "pop nothing", but only one of them is a
      * problem, and the warning below could not tell them apart -- it
@@ -9320,6 +11107,48 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     default:  return -1;  /* DATA exports or truly unknown */
     }
 }
+
+/* XcUpdateCrypto(New, Old): sixteen routines in this order, each non-zero one replacing the kernel's. A title's own
+ * then runs in place of ours. Old would get the kernel's routines to chain to: we have no guest addresses for ours, so
+ * it gets zeros. */
+static uint32_t g_xc_hook[16];
+static void bridge_XcUpdateCrypto(void)
+{
+    uint32_t in = STACK_ARG(0), out = STACK_ARG(1);
+    for (int i = 0; i < 16; i++) {
+        uint32_t v = in ? BRIDGE_MEM32(in + i * 4u) : 0;
+        if (v) g_xc_hook[i] = v;
+    }
+    if (out) memset(XBOX_TO_NATIVE(out), 0, 64);
+    g_eax = 0;
+}
+
+#define XC_HOOKED(i, argc, name) \
+    static void bridge_hooked_##name(void) { \
+        if (g_xc_hook[i]) { \
+            uint32_t a[8]; \
+            for (int k = 0; k < (argc); k++) a[k] = STACK_ARG(k); \
+            g_eax = bridge_call_guest(g_xc_hook[i], (argc), a); \
+            return; \
+        } \
+        bridge_##name(); \
+    }
+XC_HOOKED(0, 1, XcSHAInit)
+XC_HOOKED(1, 3, XcSHAUpdate)
+XC_HOOKED(2, 2, XcSHAFinal)
+XC_HOOKED(3, 3, XcRC4Key)
+XC_HOOKED(4, 3, XcRC4Crypt)
+XC_HOOKED(5, 7, XcHMAC)
+XC_HOOKED(6, 3, XcPKEncPublic)
+XC_HOOKED(7, 3, XcPKDecPrivate)
+XC_HOOKED(8, 1, XcPKGetKeyLen)
+XC_HOOKED(9, 3, XcVerifyPKCS1Signature)
+XC_HOOKED(10, 5, XcModExp)
+XC_HOOKED(11, 2, XcDESKeyParity)
+XC_HOOKED(12, 3, XcKeyTable)
+XC_HOOKED(13, 5, XcBlockCrypt)
+XC_HOOKED(14, 7, XcBlockCryptCBC)
+XC_HOOKED(15, 2, XcCryptService)
 
 static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 {
@@ -9502,8 +11331,8 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * buffer, every access translated through XBOX_TO_NATIVE, no allocation
      * and no host pointer returned. Unrouted, savegame/EEPROM code that used
      * RC4 silently did nothing. */
-    case 338: return bridge_XcRC4Key;
-    case 339: return bridge_XcRC4Crypt;
+    case 338: return bridge_hooked_XcRC4Key;
+    case 339: return bridge_hooked_XcRC4Crypt;
 
     /* Routed. The lesson of the block that used to sit here was that an
      * xbox_* existence does not make a wrapper mechanical: each candidate has
@@ -9589,11 +11418,11 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * archive it loads against a 20-byte digest in its own table
      * (sub_00034924) and calls HalReturnToFirmware(4) when the compare fails
      * -- so a no-op SHA does not corrupt anything, it reboots the console. */
-    case 335: return bridge_XcSHAInit;
-    case 336: return bridge_XcSHAUpdate;
-    case 337: return bridge_XcSHAFinal;
-    case 340: return bridge_XcHMAC;
-    case 346: return bridge_XcDESKeyParity;
+    case 335: return bridge_hooked_XcSHAInit;
+    case 336: return bridge_hooked_XcSHAUpdate;
+    case 337: return bridge_hooked_XcSHAFinal;
+    case 340: return bridge_hooked_XcHMAC;
+    case 346: return bridge_hooked_XcDESKeyParity;
 
     /* Routed. Each of these was checked against the memory-model bar
      * described above before being added: reads or writes only happen at
@@ -9671,15 +11500,15 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 169: return bridge_MmCreateKernelStack;
     case 170: return bridge_MmDeleteKernelStack;
 
-    case 341: return bridge_XcPKEncPublic;
-    case 342: return bridge_XcPKDecPrivate;
-    case 343: return bridge_XcPKGetKeyLen;
-    case 344: return bridge_XcVerifyPKCS1Signature;
-    case 345: return bridge_XcModExp;
-    case 347: return bridge_XcKeyTable;
-    case 348: return bridge_XcBlockCrypt;
-    case 349: return bridge_XcBlockCryptCBC;
-    case 350: return bridge_XcCryptService;
+    case 341: return bridge_hooked_XcPKEncPublic;
+    case 342: return bridge_hooked_XcPKDecPrivate;
+    case 343: return bridge_hooked_XcPKGetKeyLen;
+    case 344: return bridge_hooked_XcVerifyPKCS1Signature;
+    case 345: return bridge_hooked_XcModExp;
+    case 347: return bridge_hooked_XcKeyTable;
+    case 348: return bridge_hooked_XcBlockCrypt;
+    case 349: return bridge_hooked_XcBlockCryptCBC;
+    case 350: return bridge_hooked_XcCryptService;
     case 351: return bridge_XcUpdateCrypto;
 
     case 352: return bridge_RtlRip;
@@ -10441,8 +12270,17 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count)
     g_ordinal_remap_count = count;
 }
 
+int xbox_bridge_has_ordinal(ULONG ordinal)
+{
+    return bridge_for_ordinal(ordinal) != NULL;
+}
+
 void xbox_kernel_bridge_init(void)
 {
+    {
+        extern void xbox_state_load(void);
+        xbox_state_load();   /* what the console keeps across runs */
+    }
     int i;
     int resolved = 0;
     int bridged = 0;

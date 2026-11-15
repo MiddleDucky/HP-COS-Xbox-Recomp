@@ -42,6 +42,8 @@
 #include <xbox/xboxrecomp.h>
 #include <xbox/host_unwind.h>
 #include "single_instance.h"
+#include "edition.h"
+#include "build_info.h" /* generated in the build folder: HPCOS_GIT, XBOXRECOMP_GIT, HPCOS_BUILT */
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -604,7 +606,9 @@ static DWORD WINAPI stall_thread(LPVOID unused)
     QueryPerformanceFrequency(&freq);
     HANDLE game = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, g_stall_tid);
     if (!game) return 0;
-    const DWORD64 exe = (DWORD64)(uintptr_t)GetModuleHandleA(NULL);
+    /* the game's own module: this DLL, not hpcos.exe */
+    extern IMAGE_DOS_HEADER __ImageBase;
+    const DWORD64 exe = (DWORD64)(uintptr_t)&__ImageBase;
     unsigned stalls = 0, samples = 0;
     int64_t in_stall = 0;  /* the Swap the current stall waits after, 0 when none */
     int second_pass = 0;
@@ -958,8 +962,10 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
  * Header-only changes (a region-free patch) keep these and pass. */
 static int xbe_is_expected_edition(const uint8_t *x, size_t n)
 {
-    const uint32_t want_tid = 0x4541000Eu, want_entry = 0x0010E698u, want_sections = 13u;
-    const uint32_t want_text_va = 0x00011000u, want_text_size = 1177120u;
+    /* edition.h: this build's edition (hpcos.exe NTSC-US, hpcos_pal.exe PAL); the title ID, section count and code
+     * start are the same in both */
+    const uint32_t want_tid = 0x4541000Eu, want_entry = HPCOS_XBE_ENTRY, want_sections = 13u;
+    const uint32_t want_text_va = 0x00011000u, want_text_size = HPCOS_XBE_TEXT_SIZE;
     uint32_t tid = 0, entry = 0, sections = 0, text_va = 0, text_size = 0;
 #define XBE32(o) (*(const uint32_t *)(x + (o)))
     if (n >= 0x180 && XBE32(0) == 0x48454258u) {  /* "XBEH" */
@@ -979,11 +985,13 @@ static int xbe_is_expected_edition(const uint8_t *x, size_t n)
            tid, entry, sections, text_va, text_size, n, want_tid, want_entry, want_sections, want_text_va, want_text_size);
     char msg[640];
     snprintf(msg, sizeof msg,
-             "This recompile is made from the NTSC-US (USA) release of Harry Potter and the Chamber of Secrets.\n\n"
-             "The default.xbe in the 'game' folder is a different edition (title ID %08X, %zu bytes, %u sections),\n"
-             "whose code does not match, so it cannot run.\n\n"
-             "Please use the NTSC-US (USA) release (default.xbe: title ID %08X, 2174976 bytes).",
-             tid, n, sections, want_tid);
+             "This program is made from the " HPCOS_EDITION_NAME " release of Harry Potter and the Chamber of "
+             "Secrets.\n\n"
+             "The default.xbe in the 'game' folder is a different edition (title ID %08X, %zu bytes, %u sections, code "
+             "%u bytes),\nwhose code does not match, so it cannot run.\n\n"
+             "Start the game with hpcos_launcher.exe, which runs hpcos.exe for the NTSC-US (USA) release and "
+             "hpcos_pal.exe for the PAL (Europe) one. Other releases are not supported.",
+             tid, n, sections, text_size);
     MessageBoxA(NULL, msg, "Unsupported game version", MB_ICONERROR);
     return 0;
 }
@@ -1050,7 +1058,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         hpcos_SettingsInit();
     }
 
-    printf("=== YOUR_GAME_NAME - Static Recompilation ===\n");
+    /* RECOMP_DSP_ACK (the launcher and run_win.sh set 0x834D0810) zeroes that word whenever it is non-zero: the
+     * emulated APU's DSP command, for the XDK's DirectSound (RECOMP_HLE_DSOUND=0) only. With the host DirectSound
+     * (hle_dsound.c, the default) nothing is there but ordinary memory, and during the WB logo it is inside the
+     * movie's read buffer: 4 bytes of frames 10, 22, 42, 55, 82 and 125 zeroed before they were decoded, the
+     * decoder thrown off for the rest of those frames and the damage carried on to the next keyframe (issue #10) */
+    {
+        const char *hle = getenv("RECOMP_HLE_DSOUND"), *ack = getenv("RECOMP_DSP_ACK");
+        if (ack && *ack && !(hle && *hle == '0')) {
+            fprintf(stderr, "[PORT] RECOMP_DSP_ACK=%s left out: the host DirectSound is on (it is for "
+                            "RECOMP_HLE_DSOUND=0 only)\n", ack);
+            SetEnvironmentVariableA("RECOMP_DSP_ACK", NULL);
+            _putenv_s("RECOMP_DSP_ACK", "");
+        }
+    }
+
+    /* the window's title bar, "(XBOX Recomp) <name>": this XBE's certificate leaves its title empty */
+    {
+        extern void xbox_FramebufferWindowSetGameName(const char *utf8);
+        xbox_FramebufferWindowSetGameName("Harry Potter and the Chamber of Secrets");
+    }
+
+    /* the build this log came from (CMakeLists.txt, tools/build_info.cmake) */
+    printf("=== Harry Potter and the Chamber of Secrets - Static Recompilation ===\n");
+    printf("[VERSION] hpcos v%s " HPCOS_EDITION_NAME " (%s build, built %s), port %s, xboxrecomp %s\n", HPCOS_VERSION_STR,
+           HPCOS_BUILD_KIND, HPCOS_BUILT, HPCOS_GIT, XBOXRECOMP_GIT);
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */
@@ -1251,10 +1283,9 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
     return TRUE;
 }
 
-/* Console entry point (for debugging -- lets you see printf output) */
-int main(int argc, char **argv)
+/* The game is hpcos_ntsc.dll / hpcos_pal.dll: hpcos.exe (src/stub/stub.c) loads the one for the edition in game\
+ * and calls this, in its own process and on its main thread. Its only export (CMakeLists.txt). */
+__declspec(dllexport) int hpcos_GameMain(void)
 {
-    (void)argc;
-    (void)argv;
     return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
 }

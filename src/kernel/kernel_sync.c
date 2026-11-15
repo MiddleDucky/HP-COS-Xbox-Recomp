@@ -36,19 +36,16 @@ static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
     if (Timeout->QuadPart < 0) {
         /* Relative: negative 100ns units */
         LONGLONG relative_100ns = -Timeout->QuadPart;
-        DWORD ms = (DWORD)(relative_100ns / 10000);
-        if (ms == 0 && relative_100ns > 0)
-            ms = 1;
-        return ms;
+        return (DWORD)((relative_100ns + 9999) / 10000);   /* never early */
     }
 
     /* Absolute: compute delta from now */
     LARGE_INTEGER now;
-    GetSystemTimeAsFileTime((LPFILETIME)&now);
+    xbox_KeQuerySystemTime(&now);
     LONGLONG diff = Timeout->QuadPart - now.QuadPart;
     if (diff <= 0)
         return 0;
-    return (DWORD)(diff / 10000);
+    return (DWORD)((diff + 9999) / 10000);
 }
 
 /* ============================================================================
@@ -139,7 +136,7 @@ NTSTATUS __stdcall xbox_NtCreateSemaphore(
 
     (void)ObjectAttributes;
 
-    if (!SemaphoreHandle)
+    if (!SemaphoreHandle || MaximumCount <= 0 || InitialCount < 0 || InitialCount > MaximumCount)
         return STATUS_INVALID_PARAMETER;
 
     hSemaphore = CreateSemaphoreW(NULL, InitialCount, MaximumCount, NULL);
@@ -163,11 +160,15 @@ NTSTATUS __stdcall xbox_NtReleaseSemaphore(
     LONG ReleaseCount,
     PLONG PreviousCount)
 {
+    if (ReleaseCount <= 0)
+        return STATUS_INVALID_PARAMETER;
     if (!ReleaseSemaphore(SemaphoreHandle, ReleaseCount, PreviousCount)) {
+        DWORD err = GetLastError();
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
             "NtReleaseSemaphore: failed for handle %p (error %u)",
-            SemaphoreHandle, GetLastError());
-        return STATUS_INVALID_HANDLE;
+            SemaphoreHandle, err);
+        /* past its limit the kernel raises this and catches it itself */
+        return err == ERROR_TOO_MANY_POSTS ? (NTSTATUS)0xC0000047L : STATUS_INVALID_HANDLE;
     }
 
     return STATUS_SUCCESS;
@@ -184,11 +185,12 @@ static NTSTATUS xbox_wait_result_to_ntstatus(DWORD result, ULONG count)
 {
     if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + count)
         return (NTSTATUS)(STATUS_SUCCESS + (result - WAIT_OBJECT_0));
+    if (result >= WAIT_ABANDONED_0 && result < WAIT_ABANDONED_0 + count)
+        return (NTSTATUS)(STATUS_ABANDONED + (result - WAIT_ABANDONED_0));
 
     switch (result) {
         case WAIT_TIMEOUT:          return STATUS_TIMEOUT;
-        case WAIT_IO_COMPLETION:    return STATUS_ALERTED;
-        case WAIT_ABANDONED_0:      return STATUS_ABANDONED;
+        case WAIT_IO_COMPLETION:    return (NTSTATUS)0x000000C0L;   /* STATUS_USER_APC */
         case WAIT_FAILED:           return STATUS_UNSUCCESSFUL;
         default:                    return STATUS_UNSUCCESSFUL;
     }
@@ -221,6 +223,26 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
     (void)WaitMode;
 
     result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    return xbox_wait_result_to_ntstatus(result, 1);
+}
+
+/* Signals an event, mutant or semaphore, then waits, as one step. */
+NTSTATUS __stdcall xbox_NtSignalAndWaitForSingleObjectEx(
+    HANDLE SignalHandle, HANDLE WaitHandle, BOOLEAN Alertable, PLARGE_INTEGER Timeout)
+{
+    DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+#ifdef _WIN32
+    DWORD result = SignalObjectAndWait(SignalHandle, WaitHandle, ms, Alertable);
+    if (result == WAIT_FAILED) {
+        DWORD err = GetLastError();
+        return err == ERROR_INVALID_HANDLE ? (NTSTATUS)0xC0000024L   /* STATUS_OBJECT_TYPE_MISMATCH */
+                                           : STATUS_UNSUCCESSFUL;
+    }
+#else
+    DWORD result;
+    SetEvent(SignalHandle);
+    result = WaitForSingleObjectEx(WaitHandle, ms, Alertable);
+#endif
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -419,7 +441,7 @@ BOOLEAN __stdcall xbox_KeSetTimerEx(
         due_ms = 0;
     } else {
         LARGE_INTEGER now;
-        GetSystemTimeAsFileTime((LPFILETIME)&now);
+        xbox_KeQuerySystemTime(&now);
         LONGLONG diff = DueTime.QuadPart - now.QuadPart;
         due_ms = (diff > 0) ? (DWORD)(diff / 10000) : 0;
     }

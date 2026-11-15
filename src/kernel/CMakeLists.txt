@@ -21,6 +21,7 @@ set(KERNEL_SOURCES
     kernel_bridge.c
     xbox_memory_layout.c
     guest_vmem.c
+    guest_vad.c
     icall_feedback.c
     recomp_trace.c
     nv2a_pb_scan.c
@@ -28,6 +29,7 @@ set(KERNEL_SOURCES
     nv2a_vsh_interp.c
     nv2a_combiner.c
     nv2a_gpu_d3d11.c
+    system_info.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})

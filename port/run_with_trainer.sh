@@ -6,7 +6,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 export WINEPREFIX=${WINEPREFIX:-$HOME/.wine}
 export WINEDEBUG=${WINEDEBUG:--all}
 before=$(pgrep -x hpcos_trainer.e | sort)
-(cd "$here/run" && exec wine ./hpcos_trainer.exe) &
+(cd "$here/build-win-trace" && exec wine ./hpcos_trainer.exe) &
 sleep 2
 # Wine re-parents its processes (names cut to 15 characters): note the trainer's own PIDs (not one started elsewhere) to close it later
 mine=$(comm -13 <(echo "$before") <(pgrep -x hpcos_trainer.e | sort))

@@ -14,6 +14,11 @@ import sys
 
 # function, the lifted line, the fixed line
 FIXES = [
+    ("sub_00018D40",  # the movie player (name, skippable): with skip_intro the boot's Warner Bros. and EA logo
+                      # movies are not played (app.cpp hpcos_SkipMovie). cdecl and its return value unread by every
+                      # caller (each pops its two arguments), so a plain ret is the movie having ended
+     "loc_00018D40: ;\n",
+     "loc_00018D40: ;\n    { extern int hpcos_SkipMovie(const char *name); if (hpcos_SkipMovie((const char *)XBOX_PTR(MEM32(esp + 4)))) { eax = 0; esp += 4; return; } } /* hand-fixed: F10 Enhancements, skip the logo movies */\n"),
     ("sub_00105D57",  # willow hand state 6 (the right hand's solo strike): waits for event 0x67
      "    if (_flags /* jne: not equal / not zero */) { g_seh_ebp = ebp; sub_00106547(); return; }",
      "    if (eax != 0x67u /* jne: flags of the caller's cmp eax, 0x67 (0x105F3A) - hand-fixed, the lifted _flags was always 0 */) { g_seh_ebp = ebp; sub_00106547(); return; }"),
@@ -126,6 +131,14 @@ def main(gen):
                 failed = 1
             done = True
             break
+        addr = int(func[4:], 16)
+        if not done and "_flags /*" in old and any(
+                int(a, 16) < addr < int(b, 16)
+                for s in texts.values() for a, b in re.findall(r"^ \* Original: 0x(\w+) - 0x(\w+)", s, re.M)):
+            # a caller-flags entry that is not a function of its own in this XBE (PAL's copy of the [esi+0xB0]
+            # null check): it is lifted inside its caller, whose compare sets the flags, so there is nothing to fix
+            print("%s: inside its caller in this XBE: the compare reaches it, nothing to fix" % func)
+            done = True
         if not done:
             print("%s: function not found" % func)
             failed = 1

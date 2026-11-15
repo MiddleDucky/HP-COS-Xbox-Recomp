@@ -1091,6 +1091,35 @@ BUFFER(SetBufferData)
     return S_OK_;
 }
 
+/* debug, RECOMP_SND_DUMP=<folder>: each sound's data the first time a buffer plays it, as <folder>\\snd_<data>.wav (PCM;
+ * ADPCM as .raw), to match a sound heard in a recording against them; the [DSOUND] play lines and [SND] ids name the
+ * data address (2026-11-14, the ghosts' hurt sound) */
+static void snd_dump(const Voice *v)
+{
+    static const char *dir = (const char *)1;
+    static uint32_t done[1024];
+    static int n;
+    if (dir == (const char *)1) dir = getenv("RECOMP_SND_DUMP");
+    if (!dir || !*dir || !v->data || !v->bytes) return;
+    for (int i = 0; i < n; i++)
+        if (done[i] == v->data) return;
+    if (n < 1024) done[n++] = v->data;
+    char path[600];
+    int pcm = v->tag == 1;
+    snprintf(path, sizeof path, "%s\\snd_%08X.%s", dir, v->data, pcm ? "wav" : "raw");
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    if (pcm) {
+        uint32_t rate = v->freq ? v->freq : v->rate, ch = v->channels ? v->channels : 1, bits = v->bits ? v->bits : 16;
+        uint32_t hdr[11] = {0x46464952u, 36 + v->bytes, 0x45564157u, 0x20746D66u, 16,
+                            1u | (ch << 16), rate, rate * ch * bits / 8, (ch * bits / 8) | (bits << 16), 0x61746164u,
+                            v->bytes};
+        fwrite(hdr, 4, 11, f);
+    }
+    fwrite((const void *)XBOX_PTR(v->data), 1, v->bytes, f);
+    fclose(f);
+}
+
 /* Play(this, dwReserved1, dwReserved2, dwFlags): DSBPLAY_LOOPING = 1, DSBPLAY_FROMSTART = 2 */
 BUFFER(Play)
 {
@@ -1111,6 +1140,7 @@ BUFFER(Play)
         TRACE("%lu ms play %08X data %08X %u bytes x%u flags %X%s, bins (bin:mB)%s", (unsigned long)GetTickCount(),
               v->obj, v->data, v->bytes, v->channels, ARG(3), v->playing ? " (already playing)" : "", bins);
     }
+    snd_dump(v);
     v->playing = 1;
     v->looping = ARG(3) & 1;
     if (ARG(3) & 2) v->pos = 0;

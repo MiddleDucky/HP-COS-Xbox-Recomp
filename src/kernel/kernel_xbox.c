@@ -228,11 +228,168 @@ static ULONG console_language(void)
     return lang;
 }
 
+/* What a title has saved (ExSaveNonVolatileSetting), over the values we answer from the PC. The two EEPROM sections
+ * as the console lays them out, and which bytes were written. Kept for this run only: a console keeps them. */
+#define NV_USER    0
+#define NV_FACTORY 1
+static const BYTE kNvOffset[2][0x13] = {
+    {4, 8, 24, 40, 12, 28, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92},
+    {4, 16, 24, 40},
+};
+static BYTE g_nv_image[2][0x60], g_nv_written[2][0x60];
+static ULONG g_nv_game_region;
+static BOOL g_nv_game_region_set;
+static SRWLOCK g_nv_lock = SRWLOCK_INIT;
+
+/*
+ * What a console keeps across runs: settings in the EEPROM, refurb info in a hard
+ * disk sector, and its clock. Kept in kernel_state.bin next to the game, written
+ * only when a title changes one of them, so a title that never does leaves no file.
+ */
+#define XBOX_STATE_MAGIC 0x54534B58u   /* "XKST" */
+#define XBOX_STATE_VERSION 1u
+typedef struct {
+    ULONG magic, version;
+    BYTE  image[2][0x60], written[2][0x60];
+    ULONG game_region, game_region_set;
+    ULONG refurb[4];
+    LONGLONG time_bias;
+} XBOX_STATE_FILE;
+static ULONG g_refurb[4];
+extern LONGLONG xbox_time_bias(void);
+extern void xbox_time_bias_set(LONGLONG bias);
+
+void xbox_state_load(void)
+{
+    XBOX_STATE_FILE f;
+    FILE *fp = fopen("kernel_state.bin", "rb");
+    size_t got;
+    if (!fp) return;
+    got = fread(&f, 1, sizeof(f), fp);
+    fclose(fp);
+    if (got != sizeof(f) || f.magic != XBOX_STATE_MAGIC || f.version != XBOX_STATE_VERSION)
+        return;
+    AcquireSRWLockExclusive(&g_nv_lock);
+    memcpy(g_nv_image, f.image, sizeof(g_nv_image));
+    memcpy(g_nv_written, f.written, sizeof(g_nv_written));
+    g_nv_game_region = f.game_region;
+    g_nv_game_region_set = f.game_region_set != 0;
+    memcpy(g_refurb, f.refurb, sizeof(g_refurb));
+    ReleaseSRWLockExclusive(&g_nv_lock);
+    xbox_time_bias_set(f.time_bias);
+}
+
+void xbox_state_save(void)
+{
+    XBOX_STATE_FILE f;
+    FILE *fp;
+    memset(&f, 0, sizeof(f));
+    f.magic = XBOX_STATE_MAGIC;
+    f.version = XBOX_STATE_VERSION;
+    AcquireSRWLockShared(&g_nv_lock);
+    memcpy(f.image, g_nv_image, sizeof(g_nv_image));
+    memcpy(f.written, g_nv_written, sizeof(g_nv_written));
+    f.game_region = g_nv_game_region;
+    f.game_region_set = g_nv_game_region_set;
+    memcpy(f.refurb, g_refurb, sizeof(g_refurb));
+    ReleaseSRWLockShared(&g_nv_lock);
+    f.time_bias = xbox_time_bias();
+    /* whole or not at all: a new file put in place */
+    fp = fopen("kernel_state.tmp", "wb");
+    if (!fp) return;
+    if (fwrite(&f, 1, sizeof(f), fp) == sizeof(f)) {
+        fclose(fp);
+#ifdef _WIN32
+        MoveFileExA("kernel_state.tmp", "kernel_state.bin", MOVEFILE_REPLACE_EXISTING);
+#else
+        rename("kernel_state.tmp", "kernel_state.bin");
+#endif
+    } else {
+        fclose(fp);
+    }
+}
+
+void xbox_refurb_access(uint32_t saved[4], int write)
+{
+    if (write) {
+        AcquireSRWLockExclusive(&g_nv_lock);
+        memcpy(g_refurb, saved, sizeof(g_refurb));
+        ReleaseSRWLockExclusive(&g_nv_lock);
+        xbox_state_save();
+    } else {
+        AcquireSRWLockShared(&g_nv_lock);
+        memcpy(saved, g_refurb, sizeof(g_refurb));
+        ReleaseSRWLockShared(&g_nv_lock);
+    }
+}
+
+/* Where a setting lives; FALSE if not in a section (the whole-EEPROM and game region ones) */
+static BOOL nv_setting_place(ULONG index, ULONG *section, ULONG *offset)
+{
+    if (index == 0xFF || index == 0x1FF) {
+        *section = index == 0xFF ? NV_USER : NV_FACTORY, *offset = 0;
+        return TRUE;
+    }
+    if (index <= 0x12) *section = NV_USER, *offset = kNvOffset[NV_USER][index];
+    else if (index >= 0x100 && index <= 0x103) *section = NV_FACTORY, *offset = kNvOffset[NV_FACTORY][index - 0x100];
+    else return FALSE;
+    return TRUE;
+}
+
+static void nv_overlay(ULONG section, ULONG offset, ULONG len, BYTE *out)
+{
+    for (ULONG i = 0; i < len && offset + i < 0x60; i++)
+        if (g_nv_written[section][offset + i]) out[i] = g_nv_image[section][offset + i];
+}
+
+static void nv_checksum(BYTE *section, ULONG size)
+{
+    ULONGLONG sum = 0;
+    *(ULONG *)section = 0;
+    for (ULONG i = 0; i + 4 <= size; i += 4) sum += *(ULONG *)(section + i);
+    sum = (sum & 0xFFFFFFFFu) + (sum >> 32);
+    sum = (sum & 0xFFFFFFFFu) + (sum >> 32);
+    *(ULONG *)section = ~(ULONG)sum;
+}
+
+/* The kernel's tables of settings: how long each is and its type (3 binary, 4 DWORD). Indices below 0x100 are the
+ * user section of the EEPROM, 0x100 up the factory one; 0xFF and 0x1FF a whole section, 0xFFFF the whole EEPROM,
+ * 0xFFFE its first 0x30 bytes. 0 if the kernel has no such setting. */
+static ULONG nv_setting_size(ULONG index, ULONG *type)
+{
+    *type = 3;
+    switch (index) {
+    case XC_TZ_STD_NAME: case XC_TZ_STD_DATE: case XC_TZ_DLT_NAME: case XC_TZ_DLT_DATE:
+        return 4;
+    case 0xFF:   return 0x60;
+    case 0x100:  return 12;     /* serial number */
+    case 0x101:  return 6;      /* MAC address */
+    case 0x102:  return 16;     /* online key: only ever zeros here */
+    case 0x1FF:  return 0x30;
+    case 0xFFFF: return 0x100;
+    case 0xFFFE: return 0x30;
+    case 0x103: case 0x104:
+        *type = 4;
+        return 4;
+    default:
+        *type = 4;
+        return index <= 0x12 ? 4 : 0;
+    }
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
+    ULONG nv_type, nv_size = nv_setting_size(ValueIndex, &nv_type);
+    if (!nv_size)
+        return 0xC0000034L;  /* STATUS_OBJECT_NAME_NOT_FOUND, as the kernel */
+    if (ValueIndex == 0x104 || ValueIndex >= 0xFFFE)
+        if (ResultLength) *ResultLength = nv_size;
+    if (ValueLength < nv_size)
+        return 0xC0000023L;  /* STATUS_BUFFER_TOO_SMALL */
     if (!Value)
         return STATUS_INVALID_PARAMETER;
+    memset(Value, 0, ValueLength);  /* the kernel clears all of the caller's buffer first */
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
@@ -257,10 +414,13 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_AUDIO:
-        /* Stereo PCM matches the two-channel host output. 1 means mono;
-         * advertising AC3 requires an encoded-output path. */
+        /* Stereo PCM (0) matches two-channel host output. xboxrecomp: RECOMP_SPEAKERS=6 (a launcher's 5.1 option,
+         * its mixer opening six channels) reports the dashboard's surround with Dolby Digital (XC_AUDIO_FLAGS_SURROUND
+         * 0x2 | ENABLE_AC3 0x10000), so a title and its DSound library route to all six speakers as on a console on
+         * a 5.1 receiver; nothing is AC3-encoded here, the mixer hands the six channels to the host as PCM */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 0x00000000;
+            const char *sp = getenv("RECOMP_SPEAKERS");
+            *(PULONG)Value = sp && atoi(sp) == 6 ? 0x00010002 : 0x00000000;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -347,12 +507,15 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
          * title's local time: each field answered by its own index above, at its place in the console's layout.
          * Unhandled before, so it came back zeros - no time zone at all for that path. */
         static const struct { ULONG index, offset; } kUserBlock[] = {
-            {XC_TIMEZONE_BIAS, 0x00}, {XC_TZ_STD_NAME, 0x04}, {XC_TZ_DLT_NAME, 0x08}, {XC_TZ_STD_DATE, 0x14},
-            {XC_TZ_DLT_DATE, 0x18},   {XC_TZ_STD_BIAS, 0x24}, {XC_TZ_DLT_BIAS, 0x28}, {XC_LANGUAGE, 0x2C},
-            {XC_VIDEO, 0x30},         {XC_AUDIO, 0x34},       {XC_P_CONTROL_GAMES, 0x38},
-            {XC_P_CONTROL_MOVIES, 0x40}, {XC_MISC, 0x54},     {XC_DVD_REGION, 0x58},
+            /* offsets from the kernel's table; the section starts with its checksum */
+            {XC_TIMEZONE_BIAS, 0x04}, {XC_TZ_STD_NAME, 0x08}, {XC_TZ_DLT_NAME, 0x0C}, {XC_TZ_STD_DATE, 0x18},
+            {XC_TZ_DLT_DATE, 0x1C},   {XC_TZ_STD_BIAS, 0x28}, {XC_TZ_DLT_BIAS, 0x2C}, {XC_LANGUAGE, 0x30},
+            {XC_VIDEO, 0x34},         {XC_AUDIO, 0x38},       {XC_P_CONTROL_GAMES, 0x3C},
+            {XC_P_CONTROL_PASSWORD, 0x40}, {XC_P_CONTROL_MOVIES, 0x44}, {XC_ONLINE_IP_ADDRESS, 0x48},
+            {XC_ONLINE_DNS_ADDRESS, 0x4C}, {XC_ONLINE_DEFAULT_GATEWAY, 0x50}, {XC_ONLINE_SUBNET_MASK, 0x54},
+            {XC_MISC, 0x58},          {XC_DVD_REGION, 0x5C},
         };
-        const ULONG kUserBlockSize = 0x5C;
+        const ULONG kUserBlockSize = 0x60;
         memset(Value, 0, ValueLength);
         for (size_t i = 0; i < sizeof(kUserBlock) / sizeof(kUserBlock[0]); i++) {
             ULONG field = 0, t = 0, n = 0;
@@ -361,10 +524,10 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
             memcpy((BYTE *)Value + kUserBlock[i].offset, &field, 4);
         }
         /* misc bit 1: daylight saving off - a zone without it (Windows gives no daylight date) */
-        if (ValueLength >= 0x58) {
+        {
             HostTimeZone tz;
             host_time_zone(&tz);
-            if (!tz.dlt_date[0]) *(PULONG)((BYTE *)Value + 0x54) |= 2;
+            if (!tz.dlt_date[0]) *(PULONG)((BYTE *)Value + 0x58) |= 2;
         }
         if (Type) *Type = 3;  /* binary */
         if (ResultLength) *ResultLength = ValueLength < kUserBlockSize ? ValueLength : kUserBlockSize;
@@ -379,30 +542,65 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         }
         break;
 
-    default:
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
-            "ExQueryNonVolatileSetting: unhandled index 0x%02X", ValueIndex);
-        memset(Value, 0, ValueLength);
-        if (Type) *Type = 4;
-        if (ResultLength) *ResultLength = ValueLength;
+    default:  /* a setting the kernel has that we hold no value for (passwords, addresses, serial, keys): zeros */
         break;
     }
 
+    {
+        ULONG section, offset;
+        AcquireSRWLockShared(&g_nv_lock);
+        if (nv_setting_place(ValueIndex, &section, &offset)) {
+            nv_overlay(section, offset, nv_size, (BYTE *)Value);
+        } else if (ValueIndex == 0xFFFF) {
+            nv_overlay(NV_FACTORY, 0, 0x30, (BYTE *)Value + 0x30);
+            nv_overlay(NV_USER, 0, 0x60, (BYTE *)Value + 0x60);
+        } else if (ValueIndex == 0x104 && g_nv_game_region_set) {
+            *(PULONG)Value = g_nv_game_region;
+        }
+        ReleaseSRWLockShared(&g_nv_lock);
+    }
+    /* A whole section starts with its checksum: the inverse of the sum of its DWORDs, carries added back in */
+    if (ValueIndex == 0xFF) nv_checksum((BYTE *)Value, 0x60);
+    else if (ValueIndex == 0x1FF) nv_checksum((BYTE *)Value, 0x30);
+    else if (ValueIndex == 0xFFFF) nv_checksum((BYTE *)Value + 0x30, 0x30), nv_checksum((BYTE *)Value + 0x60, 0x60);
+    if (Type) *Type = nv_type;
+    if (ResultLength) *ResultLength = nv_size;
     return STATUS_SUCCESS;
 }
 
 NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
     ULONG ValueIndex, ULONG Type, PVOID Value, ULONG ValueLength)
 {
+    /* As the kernel: Type is not used; the whole EEPROM must be given whole, the game region as a DWORD, any other
+     * setting at most its own length, the rest of it cleared. */
+    ULONG type, section, offset, size = nv_setting_size(ValueIndex, &type);
     (void)Type;
-    (void)Value;
-    (void)ValueLength;
 
-    xbox_log(XBOX_LOG_INFO, XBOX_LOG_XBOX,
-        "ExSaveNonVolatileSetting: index=0x%02X len=%u (ignored - read-only on PC)",
-        ValueIndex, ValueLength);
+    if (ValueIndex == 0xFFFE) size = 0;  /* readable, not writable */
+    if (!size)
+        return 0xC0000034L;  /* STATUS_OBJECT_NAME_NOT_FOUND */
+    if (ValueIndex == 0xFFFF || ValueIndex == 0x104) {
+        if (ValueLength != size) return STATUS_INVALID_PARAMETER;
+    } else if (ValueLength > size) {
+        return STATUS_INVALID_PARAMETER;
+    }
 
-    /* Accept writes silently but don't persist them */
+    AcquireSRWLockExclusive(&g_nv_lock);
+    if (ValueIndex == 0x104) {
+        g_nv_game_region = *(PULONG)Value;
+        g_nv_game_region_set = TRUE;
+    } else if (ValueIndex == 0xFFFF) {
+        memcpy(g_nv_image[NV_FACTORY], (BYTE *)Value + 0x30, 0x30);
+        memset(g_nv_written[NV_FACTORY], 1, 0x30);
+        memcpy(g_nv_image[NV_USER], (BYTE *)Value + 0x60, 0x60);
+        memset(g_nv_written[NV_USER], 1, 0x60);
+    } else if (nv_setting_place(ValueIndex, &section, &offset)) {
+        memset(g_nv_image[section] + offset, 0, size);
+        if (ValueLength) memcpy(g_nv_image[section] + offset, Value, ValueLength);
+        memset(g_nv_written[section] + offset, 1, size);
+    }
+    ReleaseSRWLockExclusive(&g_nv_lock);
+    xbox_state_save();
     return STATUS_SUCCESS;
 }
 
@@ -416,8 +614,8 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
 ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
 {
     (void)Verify;
-    /* Return link up, 100 Mbps, full duplex */
-    return 0x01; /* XNET_ETHERNET_LINK_ACTIVE */
+    /* Link up (1), 100 Mbps (2), full duplex (8): the kernel's flags. This returned only the first. */
+    return 0x0B;
 }
 
 NTSTATUS __stdcall xbox_PhyInitialize(BOOLEAN ForceReset, PVOID Param2)

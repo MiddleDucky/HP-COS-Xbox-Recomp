@@ -48,6 +48,12 @@ struct Settings {
     // xboxrecomp: the vertex programs' lighting run again per pixel (shaders.cpp PerPixelFields): lights such as
     // Lumos lit smoothly over big floor triangles instead of in patches shaped by their corners. On by default
     bool per_pixel_lighting = true;
+    bool skip_intro = false;           // xboxrecomp: the Warner Bros. and EA logo movies at start not played (patch_gen.py, sub_00018D40)
+    bool cutscene_bars_hidden = false; // xboxrecomp: 16:9 cutscenes without their letterbox bars (d3d12.cpp CutsceneBar)
+    bool fog_disabled = false;         // xboxrecomp: the game's distance fog left out (d3d12.cpp FillSurfaceConstants)
+    bool loading_screens_4_3 = false;  // xboxrecomp: 16:9 loading screens kept 4:3 (hle_hud.c), not stretched over 16:9
+    bool wider_ledge_catch = true;     // xboxrecomp: a jump catches a ledge a little lower, higher or further (hle_trainer.c)
+    uint32_t ledge_climb_speed = 150;  // xboxrecomp: % of the game's speed for Harry pulling himself up a ledge (hle_trainer.c)
     uint32_t bloom_strength = 40;      // 0 to 100
     uint32_t sharpen = 0;              // 0 (off) to 100
     uint32_t saturation = 100;         // 0 to 200 %, 100 as the game
@@ -59,6 +65,9 @@ struct Settings {
     uint32_t grain = 0;                // 0 (off) to 100: moving film grain
     uint32_t fov = 100;                // xboxrecomp: field of view, % of the game's (hle_shots.c), 80 to 130
     bool vsync = true;                 // RECOMP_VSYNC
+    // xboxrecomp: AMD FSR 3.1 frame generation (gpu/fsr_fg.cpp): a generated frame between each two of the game's.
+    // Read when the swap chain is made, so it takes effect at the next start. Off by default (testing)
+    bool fsr_frame_generation = false; // RECOMP_FSR_FRAMEGEN
     uint32_t aniso = 0;                // RECOMP_ANISO, 0 as the game asks
     uint32_t msaa = 0;                 // RECOMP_MSAA samples, 0 off
     bool smaa = false;                 // RECOMP_SMAA, over the finished frame; combines with msaa
@@ -141,5 +150,8 @@ void CancelKeyCapture();
 // the window's display has Windows HDR on, from the renderer
 inline std::atomic<bool> g_hdr_display{false};
 inline std::atomic<float> g_fps{0};
+// xboxrecomp: FSR frame generation is generating (gpu/fsr_fg.cpp): g_fps counts the game's own frames, the swap chain
+// shows about twice that, which the counter says
+inline std::atomic<bool> g_fsr_generating{false};
 
 }  // namespace app

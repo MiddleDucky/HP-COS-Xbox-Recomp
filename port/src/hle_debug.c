@@ -526,12 +526,12 @@ void sub_00049440(void)
  * and what shows and clears its subtitle (2026-10-30). Built into the recompile with --exclude-manual: gen's body is
  * sub_0003BAC0_gen */
 extern void sub_0003BAC0_gen(void);
-extern uint32_t hpcos_PromptText(uint32_t text);
+extern uint32_t hpcos_PromptText(uint32_t text, uint32_t ret);
 void sub_0003BAC0(void)
 {
     static int on = -1;
     if (on < 0) on = getenv("RECOMP_TEXT_TRACE") && *getenv("RECOMP_TEXT_TRACE") != '0';
-    uint32_t id = on ? MEM32(g_esp + 4) : 0, ret = on ? MEM32(g_esp) : 0, up = 0;
+    uint32_t id = on ? MEM32(g_esp + 4) : 0, ret = MEM32(g_esp), up = 0;
     if (on) {  /* the next of the title's return addresses above, a call before it: who asked the asker */
         for (uint32_t i = 2; i < 64 && !up; i++) {
             uint32_t v = MEM32(g_esp + 4 * i);
@@ -539,7 +539,7 @@ void sub_0003BAC0(void)
         }
     }
     sub_0003BAC0_gen();
-    g_eax = hpcos_PromptText(g_eax);  /* hle_frontend.c: key names for the buttons with key prompts on */
+    g_eax = hpcos_PromptText(g_eax, ret);  /* hle_frontend.c: key names for the buttons with key prompts on */
     if (!on) return;
     enum { kSeen = 64 };
     static uint32_t seen_id[kSeen];
@@ -581,9 +581,12 @@ void sub_00020210(void)
 /* The music manager (0x1D3C20, EA PathFinder: a level's .mus/.mpf loaded by sub_0001CE70) switches with
  * sub_0001C9B0(state, arg) (__thiscall, ret 8). In the Basilisk fight (level 25, Chamber of Secrets, phase word
  * [0x527DFC] == 2) Harry picking up Gryffindor's sword asks for state 2 (0xD6992), the sword's theme, and dropping it
- * for state 1 (0xD68DB), the fight's music, so the theme stops whenever the sword is put down. Once the theme has
- * started it plays on, looping, for the rest of the fight: the switch back to 1 and every later state 2 (which would
- * start the theme over) are left out; any other state (the fight's end, a cutscene, another level) goes through. RECOMP_SWORD_MUSIC=0 keeps the Xbox's switching.
+ * for state 1 (0xD68DB), the fight's music, so the theme stops whenever the sword is put down. While the theme is
+ * the manager's state ([0x1D3C2C] == 2) it plays on, looping: the switch back to 1 and a state 2 again (which would
+ * start the theme over) are left out; any other state (the fight's end, a cutscene, another level) goes through.
+ * Keyed on the manager's state, not on the theme having played once in the fight: dying asks for state 3, the respawn
+ * loads CoS.mpf again (state -1) and asks for 2 (0xD3A9A), and that request has to go through or the fight is silent
+ * (2026-11-08). RECOMP_SWORD_MUSIC=0 keeps the Xbox's switching.
  * [MUSIC] logs every request: the state, its argument, the caller, the code above it, the level and the phase.
  *
  * A level script's request (opcode 84 of the interpreter sub_0006F010, returning to 0x7083B) for the state the manager
@@ -626,6 +629,19 @@ static int music_repeat_enabled(void)
     return on;
 }
 
+/* Level 23's ghosts: each time one hits Harry its code (0xEF0D5) asks the music for state 23, a cue that plays over the
+ * level's own (state 22) on every hit, the one the player hears as "the hurt sound" (2026-11-14). Left out: the level's
+ * music plays on. RECOMP_GHOST_HIT_MUSIC=1 lets it through, as the game */
+static int ghost_hit_music_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GHOST_HIT_MUSIC");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
 static int sword_music_enabled(void)
 {
     static int on = -1;
@@ -644,16 +660,16 @@ volatile int hpcos_chamber_finale;
 extern void sub_0001C9B0_gen(void);
 void sub_0001C9B0(void)
 {
-    static int sword_heard;  /* the sword's theme has played in this fight */
     uint32_t state = MEM32(g_esp + 4), arg = MEM32(g_esp + 8), ret = MEM32(g_esp);
     uint32_t level = MEM32(0x00527B78), phase = MEM16(0x00527DFC);
     int fight = level == LEVEL_CHAMBER && phase == PHASE_BASILISK;
-    if (!fight) sword_heard = 0;
-    int keep = fight && sword_heard && (state == MUSIC_FIGHT || state == MUSIC_SWORD) && sword_music_enabled();
+    int sword_playing = MEM32(0x1D3C24) && MEM32(0x1D3C2C) == MUSIC_SWORD;
+    int keep = fight && sword_playing && (state == MUSIC_FIGHT || state == MUSIC_SWORD) && sword_music_enabled();
     int repeat = ret == 0x0007083Bu && MEM32(0x1D3C24) && MEM32(0x1D3C2C) == state && !music_repeat_enabled();
     int hall = !hall_music_enabled() &&
                ((level == 27u && (ret == 0x000D838Bu || (ret == 0x000D833Bu && MEM32(0x1D3C2C) == state))) ||
                 (level == 29u && (ret == 0x000FC584u || (ret == 0x000FC537u && MEM32(0x1D3C2C) == state))));
+    int ghost = level == 23u && ret == 0x000EF0D5u && !ghost_hit_music_enabled();
     /* the title's return addresses on the stack above it (a call before each), to tell which code asked */
     char script[160] = " chain";
     for (uint32_t i = 1, n = 0, len = 6; i < 160 && n < 10; i++) {
@@ -668,12 +684,12 @@ void sub_0001C9B0(void)
             (int32_t)MEM32(0x1D3C2C), MEM32(0x1D3C24) ? "" : " (no music loaded: the request does nothing)",
             keep ? " (left out: the sword's theme plays on)"
             : repeat ? " (left out: a script asking for the state playing)"
-            : hall ? " (left out: the hall's music by distance)" : "");
-    if (keep || repeat || hall) {
+            : hall ? " (left out: the hall's music by distance)"
+            : ghost ? " (left out: the ghosts' cue on a hit)" : "");
+    if (keep || repeat || hall || ghost) {
         g_esp += 12;  /* ret 8 */
         return;
     }
-    if (fight && state == MUSIC_SWORD) sword_heard = 1;
     hpcos_chamber_finale = level == LEVEL_CHAMBER && state == MUSIC_FIGHT_WON;
     sub_0001C9B0_gen();
 }
@@ -810,6 +826,16 @@ static void pf_leave(int owned)
     if (InterlockedDecrement(&g_pf_depth) == 0) g_pf_owner_fn = 0, InterlockedExchange(&g_pf_owner, 0);
 }
 
+/* the generated bodies PF_WRAP calls, written out: --exclude-manual (the toolkit's manual_scan.py) finds a wrapped
+ * function by a line of its own declaring sub_X_gen, and does not see one built by the macro, so without these a
+ * regen (./regen.sh, ./regen.sh pal) leaves them unrenamed and the link fails */
+extern void sub_00124100_gen(void);
+extern void sub_00126290_gen(void);
+extern void sub_00126710_gen(void);
+extern void sub_00126B10_gen(void);
+extern void sub_00126D60_gen(void);
+extern void sub_00126E20_gen(void);
+extern void sub_00126F10_gen(void);
 #define PF_WRAP(addr, name) \
     extern void sub_##addr##_gen(void); \
     void sub_##addr(void) { int o = pf_enter(name); sub_##addr##_gen(); pf_leave(o); }

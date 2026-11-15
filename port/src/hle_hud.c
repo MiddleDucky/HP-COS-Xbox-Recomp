@@ -51,7 +51,8 @@ static int call_chain(uint32_t sp, uint32_t *out, int n)
 }
 
 /* HUD elements by the title's code that draws them (a return address in the chain above AddSprite) */
-enum { CENTRE, LEFT, RIGHT, BY_HALF, WIDE, BACKDROP, FRONT, COUNTER, BY_HEIGHT, QUIDDITCH_RIGHT, QUIDDITCH_MIDDLE };
+enum { CENTRE, LEFT, RIGHT, BY_HALF, WIDE, BACKDROP, FRONT, COUNTER, BY_HEIGHT, QUIDDITCH_RIGHT, QUIDDITCH_MIDDLE, PILLAR };
+extern int app_LoadingScreens43(void); /* renderer/app/app.cpp: Enhancements > Keep loading screens 4:3 */
 /* out to a 16:9 side: 80 / 0.75 = 106.67 rounded to whole pixels (the squeeze leaves it 0.25 px past the side) */
 #define SIDE_SHIFT 107.0f
 /* QUIDDITCH_RIGHT: the right team's crest ends at x 550, 90 from the 4:3 side, the left one's starts 29.5 from its
@@ -155,10 +156,14 @@ static int element_side(const uint32_t *chain, int depth, uint32_t sprite, uint3
         float lo, hi, top, bottom;
         sprite_span(sprite, 0, &lo, &hi);
         sprite_span(sprite, 4, &top, &bottom);
-        if (lo <= 1.0f && hi >= 639.0f && bottom - top > 200.0f) g_loading_frame = g_frame;
+        const int picture = lo <= 1.0f && hi >= 639.0f && bottom - top > 200.0f;
+        if (picture) g_loading_frame = g_frame;
+        /* Enhancements > Keep loading screens 4:3 (issue #24): the picture, its bar and the word squeezed as any 2D,
+         * in the 4:3 middle with black sides as the movies */
+        if (app_LoadingScreens43() && (picture || loading_screen())) return picture ? PILLAR : CENTRE;
         if (loading_screen() && bottom - top < 40.0f && top > 300.0f) return WIDE;
     }
-    if (loading_screen() && in_chain(chain, depth, 0x0004B2EDu)) return FRONT;
+    if (loading_screen() && in_chain(chain, depth, 0x0004B2EDu)) return app_LoadingScreens43() ? CENTRE : FRONT;
     if (in_chain(chain, depth, 0x0004D42Fu) && def && sprite_height(sprite) > 400.0f) {
         uint32_t tex = MEM32(def + 8);
         if (tex >= 0x22 && tex <= 0x24) {
@@ -309,12 +314,43 @@ void sub_0001A360(void)
         }
         return;
     }
+    {   /* The front end's legend buttons (Select, Exit) as the game's 2D objects (sub_00038A00, from 0x4D42F): pad
+         * presses add one each that is never taken away (38 piled on the A and on the B after some use, 2026-11-14).
+         * With the controller they lie exactly under the button letter the text draws, unseen; with key prompts that
+         * letter is the key's icon (d3d12.cpp PromptFontPicture) and the pile's rings showed round it. While key
+         * prompts are on they go off the screen: the key's icon is the legend's button */
+        extern int app_KeyboardPrompts(void);
+        uint32_t def = MEM32(sp + 4);
+        if (def && app_KeyboardPrompts() && in_chain(chain, depth, 0x00038A25u) && in_chain(chain, depth, 0x0004D42Fu)) {
+            uint32_t tex = MEM32(def + 8), s = SPRITE_POOL + index * SPRITE_BYTES;
+            float lo, hi, top, bottom;
+            sprite_span(s, 0, &lo, &hi);
+            sprite_span(s, 4, &top, &bottom);
+            if (tex >= 0x0C && tex <= 0x0F && hi - lo > 20.0f && hi - lo < 48.0f && bottom - top > 20.0f &&
+                bottom - top < 48.0f) {
+                for (int v = 0; v < 4; v++) {
+                    MEMF(s + v * VERTEX_BYTES) = -10000.0f;
+                    MEMF(s + v * VERTEX_BYTES + 4) = -10000.0f;
+                }
+                return;
+            }
+        }
+    }
     if (wide) {
         /* squeezed to 3/4 about the centre, a 4:3 side at x = 0 lands 80 pixels in; moved out by 80 / 0.75 first,
          * it lands on the screen's side */
         uint32_t s = SPRITE_POOL + index * SPRITE_BYTES;
         int side = element_side(chain, depth, s, MEM32(sp + 4));
-        if (side == WIDE) {
+        if (side == PILLAR) {
+            extern void hpcos_BlackSides(void); /* renderer/xdk/hle_d3d8.cpp */
+            hpcos_BlackSides();  /* what was in the frame beside the picture showed at its sides: black there */
+            /* the renderer leaves 2D spanning the frame's width at 16:9 (d3d12.cpp Squeeze2D: a backdrop fills the
+             * screen); drawn 1 px in from each side (0.3 %, unseen) it is squeezed to 4:3 as any 2D */
+            for (int v = 0; v < 4; v++) {
+                float x = MEMF(s + v * VERTEX_BYTES);
+                MEMF(s + v * VERTEX_BYTES) = 1.25f + x * (637.5f / 640.0f);
+            }
+        } else if (side == WIDE) {
             widen(s);
         } else if (side == BACKDROP) {
             g_front_frame = g_frame;

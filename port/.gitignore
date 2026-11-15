@@ -30,6 +30,11 @@ x64/
 
 # Generated recompiled code (regenerate from XBE with the recomp pipeline)
 src/recomp/gen/
+src/recomp/gen_pal/
+
+# ntsc2pal.py's working files (disassembly of both XBEs; made again by regen.sh)
+tools/edition/work_*/
+__pycache__/
 
 # Game files (user must provide their own legally-owned copies)
 game/

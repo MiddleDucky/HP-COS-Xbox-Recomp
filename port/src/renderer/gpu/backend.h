@@ -70,6 +70,10 @@ inline std::atomic<bool> g_shown_splash{false};  // the frame on screen was pres
 // the game side drew a 4:3 picture this frame (versus' loading page): the next Swap shows it 4:3, whatever drew after
 inline std::atomic<bool> g_splash_next{false};
 
+// xboxrecomp: a loading screen kept 4:3 in 16:9 (hle_hud.c, Enhancements > Keep loading screens 4:3) was drawn: the
+// frame's sides beside the squeezed picture are cleared black when it is shown (d3d12.cpp DrawSdrFrame)
+inline std::atomic<bool> g_black_sides{false};
+
 // F3: save the next frame, every draw and target, under captures
 inline std::atomic<bool> g_capture{false};
 

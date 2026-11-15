@@ -177,18 +177,15 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
     if (Interval->QuadPart < 0) {
         /* Negative = relative time in 100ns units. Convert to milliseconds. */
         LONGLONG relative_100ns = -Interval->QuadPart;
-        ms = (DWORD)(relative_100ns / 10000);
-        /* Ensure at least 1ms for very short intervals */
-        if (ms == 0 && relative_100ns > 0)
-            ms = 1;
+        ms = (DWORD)((relative_100ns + 9999) / 10000);   /* never early */
     } else {
         /* Positive = absolute time. Calculate relative delay from now. */
         LARGE_INTEGER now;
-        GetSystemTimeAsFileTime((LPFILETIME)&now);
+        xbox_KeQuerySystemTime(&now);
         LONGLONG diff = Interval->QuadPart - now.QuadPart;
         if (diff <= 0)
             return STATUS_SUCCESS; /* Already past */
-        ms = (DWORD)(diff / 10000);
+        ms = (DWORD)((diff + 9999) / 10000);
     }
 
     {
@@ -213,7 +210,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         if (Alertable) {
             DWORD result = SleepEx(ms, TRUE);
             if (result == WAIT_IO_COMPLETION)
-                st = STATUS_ALERTED;
+                st = (NTSTATUS)0x000000C0L;   /* STATUS_USER_APC */
         } else {
             Sleep(ms);
         }
@@ -340,8 +337,12 @@ NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode)
 
 NTSTATUS __stdcall xbox_NtYieldExecution(void)
 {
+#ifdef _WIN32
+    return SwitchToThread() ? STATUS_SUCCESS : (NTSTATUS)0x40000024L;   /* STATUS_NO_YIELD_PERFORMED */
+#else
     SwitchToThread();
     return STATUS_SUCCESS;
+#endif
 }
 
 /* ============================================================================
@@ -374,6 +375,11 @@ NTSTATUS __stdcall xbox_NtDuplicateObject(
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
             "NtDuplicateObject: DuplicateHandle failed (error %u)", GetLastError());
         return STATUS_UNSUCCESSFUL;
+    }
+
+    {
+        extern void xbox_file_handle_duplicated(HANDLE from, HANDLE to, BOOL closed_source);
+        xbox_file_handle_duplicated(SourceHandle, *TargetHandle, (Options & 0x1) != 0);
     }
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD,

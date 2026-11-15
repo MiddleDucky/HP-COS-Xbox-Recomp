@@ -27,14 +27,15 @@ INSTALLING
 
 1. Put the port's files in a folder of your choice:
        hpcos_launcher.exe
-       hpcos.exe
+       bin\            the game itself (hpcos.exe, hpcos_ntsc.dll, hpcos_pal.dll,
+                       AMD's FSR DLLs, shadercache\)
        README.txt
        CHANGES.txt
        licenses\
-       shadercache\base_shaders.bin
-       shadercache\base_pipelines.bin
 2. Copy the game files from your disc, or the .xiso / .iso file, into a
-   folder named "game" in the same folder as the executables. A disc image
+   folder named "game" beside hpcos_launcher.exe. Both the North American
+   (NTSC-US) and the European (PAL) disc play; the launcher tells them apart
+   and shows which one it found on its Game page. A disc image
    is unpacked into the game folder the first time you start the launcher;
    the image is left as it is and can be deleted afterwards.
    The launcher then checks every game file against the disc's once (a few
@@ -42,21 +43,27 @@ INSTALLING
    missing; "Verify game files" on its page checks them again.
 
 The port creates these itself on the first run:
-    hpcos.toml     your settings (the launcher and F10 change them)
-    saves\         your saved games
-    shadercache\   shaders and pipelines built on your PC
-    logs\runs\     a log of each start (the newest 10 are kept)
+    saves\             your saved games (beside the launcher)
+    bin\hpcos.toml     your settings (the launcher and F10 change them)
+    bin\shadercache\   shaders and pipelines built on your PC
+    bin\logs\runs\     a log of each start (the newest 10 are kept)
+
+Updating from an earlier version: copy the files above over the old ones and
+keep your saves\. A hpcos.toml and shadercache\ from before bin\ are moved
+into bin\ by the launcher the first time it starts; the old hpcos.exe beside
+the launcher is no longer used and can be deleted.
 
 
 PLAYING
 -------
 
-Start the game with hpcos_launcher.exe. Opening hpcos.exe directly only offers
-to open the launcher. Only one copy of the game runs at a time: starting it
+Start the game with hpcos_launcher.exe. Opening bin\hpcos.exe directly only
+offers to open the launcher. Only one copy of the game runs at a time: starting it
 again brings the running game to the front.
 
-The launcher sets the aspect ratio (4:3 or 16:9), display, graphics,
-controls and the language, then starts the game with Play. Language: the
+The launcher's page has the same settings as F10 in tabs (Game, Display,
+Graphics, Controls, ...): the aspect ratio, display, graphics, controls,
+the enhancements and the language, then Play starts the game. Language: the
 game starts in English (US or UK), French, German, Spanish or Italian, the
 languages the disc carries. If you turn its page off, the
 launcher starts the game straight away; hold Shift while opening it to see
@@ -93,11 +100,17 @@ OPTIONS (F10)
 -------------
 
 F10 opens the options over the game; most changes apply at once and are saved
-to hpcos.toml. "Defaults (this page)" resets the page you are on (Graphics,
-Controls, ...) and leaves the others; the aspect ratio stays. "Show the
-launcher at startup" turns the launcher's page on or off.
+to bin\hpcos.toml. Its title names the disc being played (NTSC-US or PAL).
+"Defaults (this page)" resets the page you are on (Graphics, Controls, ...)
+and leaves the others; the aspect ratio stays. The game's own Options menu
+and pause menu also have a "PC Settings" row that opens these settings.
 
 Graphics
+  Startup
+    Show the launcher at startup
+                         its settings page before the game starts (also at
+                         the bottom of F10; or hold Shift as the launcher
+                         starts)
   Display
     Aspect ratio         4:3, 16:9 (the game's camera widened; menus and the
                          inventory keep 4:3) or Stretch. Applies at the next
@@ -108,6 +121,10 @@ Graphics
     Resolution           the window's size, or the fullscreen mode; Desktop
                          uses the monitor's own
     Vsync                waits for the monitor's refresh (no tearing)
+    FSR 3.1 frame generation
+                         AMD's frame generation: a generated frame between
+                         each two of the game's, for a smoother picture (off
+                         by default; applies at the next start)
   Resolution
     Internal resolution  the lines the 3D is drawn at: 480 is the Xbox's own;
                          720 to 2160 sharpen it; "Follow window" matches the
@@ -193,9 +210,25 @@ Enhancements
     Per-pixel lighting   smooth light round Lumos and lamps instead of the
                          console's per-vertex patches (on by default); off
                          looks exactly as on the console
+  Cutscenes
+    Cutscenes without black bars
+                         in 16:9 the cutscenes fill the screen, without the
+                         bars at the top and bottom (off by default)
+  Fog
+    Disable fog          far scenery in full colour, no distance haze (off
+                         by default)
+  Loading screens
+    Keep loading screens 4:3
+                         in 16:9 the loading picture stays in the middle with
+                         black sides, as the movies (off: stretched to fill
+                         the screen)
+  Startup
+    Skip the Warner Bros. and EA logos
+                         the logo movies before the title screen are not
+                         played (off by default)
 
 Debug
-  Logs                   "Open logs folder" shows logs\runs; "Mark this
+  Logs                   "Open logs folder" shows bin\logs\runs; "Mark this
                          moment in the log" notes the time, so a problem can
                          be found in the log: send the log and the mark's
                          number with your report
@@ -216,11 +249,11 @@ The launcher says game files are damaged or missing
 
 "Failed to load default.xbe"
     The game files are missing: check that game\default.xbe exists beside
-    hpcos.exe (or that the .xiso / .iso is in the game folder).
+    hpcos_launcher.exe (or that the .xiso / .iso is in the game folder).
 
 The game will not start / closes at once
     Update your graphics driver (DirectX 12 is required). The newest log in
-    logs\runs says what happened; send it with your report.
+    bin\logs\runs says what happened; send it with your report.
 
 A short pause the first time you enter an area
     Shaders are being prepared for your graphics card; the loading picture
@@ -235,6 +268,8 @@ LICENCES AND SOURCE CODE
 The port's own code is under the MIT licence. It also contains:
   - the D3D12 renderer it is built on, by TGP482 and Joshhhuaaa (MIT)
   - Dear ImGui, the options panel (MIT)
+  - AMD FidelityFX frame generation DLLs (bin\amd_fidelityfx_*.dll), under
+    AMD's own licence
   - code from the xemu project (the Xbox audio processor emulation), which
     stays under the GNU Lesser General Public License, version 2.1 or later
 The licence texts and the list of third-party code are in the licenses folder

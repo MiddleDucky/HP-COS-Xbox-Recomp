@@ -470,6 +470,101 @@ static void harry_diff(uint32_t ent)
     }
 }
 
+/* [ANIM]: the animation slots' pool, for issue #21 (Harry in the A-pose on his broom at the start of Quidditch,
+ * now and then; once after losing the last match and trying again, once on a fresh boot with the save loaded).
+ * An object is animated through a 0x204-byte slot from a fixed pool (sub_00020B10 makes it, "EGanim_Heap"):
+ * 0x507828 the slot count, 0x50782C the slots, 0x507830 / 34 / 38 the free list's head, tail and count, 0x50783C /
+ * 40 / 44 the in-use list's. sub_00020D90 (start an animation on an object) asks sub_00020D30 for the object's slot
+ * (object +0x134); with none free that returns 0 and the object gets no animation update (+0xCC 0x20390 is set only
+ * with a slot) and no animation: drawn in its bind pose, the A-pose, and nothing logged. A slot goes back to the free
+ * list through sub_00020B80 (the object's +0x218, 0x20C90).
+ * Logged: a line per level (the pool when the level asks for its first slot, and at the next level how many slots it
+ * took, the fewest free and how many objects found none), and each object left without a slot (the first 20 in a
+ * level) with whether it is Harry's and the game's return addresses. Free and in-use slots not adding up to the pool,
+ * or the in-use count growing level after level, is a slot not given back */
+enum { kAnimPool = 0x507828, kAnimFree = 0x507838, kAnimUsed = 0x507844 };
+extern void sub_00020D30_gen(void);
+extern void sub_00020D90_gen(void);
+static uint32_t g_anim_level = 0xFFFFFFFFu, g_anim_taken, g_anim_fails, g_anim_min_free = 0xFFFFFFFFu, g_anim_empty;
+
+/* the game's own return addresses above sp (below the XDK's libraries), as [GEO] lists them, onto line */
+static int anim_callers(char *line, int n, int size, uint32_t sp)
+{
+    n += snprintf(line + n, (size_t)(size - n), ", from");
+    for (uint32_t i = 0, k = 0; i < 1024 && k < 10 && n < size - 12; i++) {
+        uint32_t v = MEM32(sp + 4 * i);
+        if (v < 0x11005 || v >= 0x10C000) continue;
+        if (MEM8(v - 5) == 0xE8 || MEM8(v - 2) == 0xFF || MEM8(v - 3) == 0xFF || MEM8(v - 6) == 0xFF)
+            n += snprintf(line + n, (size_t)(size - n), " %08X", v), k++;
+    }
+    return n;
+}
+
+static void anim_pool_level(void)
+{
+    uint32_t lv = MEM32(kProgress);
+    if (lv == g_anim_level) return;
+    uint32_t total = MEM32(kAnimPool), fr = MEM32(kAnimFree), used = MEM32(kAnimUsed);
+    if (g_anim_level != 0xFFFFFFFFu)
+        fprintf(stderr, "[ANIM] level %d: %u slot(s) taken, fewest free %u, %u object(s) left without one, %u animation(s)"
+                " not found\n", (int)g_anim_level, g_anim_taken, g_anim_min_free == 0xFFFFFFFFu ? fr : g_anim_min_free,
+                g_anim_fails, g_anim_empty);
+    fprintf(stderr, "[ANIM] level %d -> %d: pool %u slots, %u free, %u in use%s\n", (int)g_anim_level, (int)lv, total,
+            fr, used, fr + used != total ? " (free and in use do not add up to the pool)" : "");
+    g_anim_level = lv, g_anim_taken = 0, g_anim_fails = 0, g_anim_min_free = 0xFFFFFFFFu, g_anim_empty = 0;
+}
+
+void sub_00020D30(void)
+{
+    /* on entry: +0 the return (0x20D9C in sub_00020D90), +4 the object; sub_00020D90's own return and its three
+     * arguments (the object, then two the animation's start is given) 0x10..0x1C up */
+    uint32_t sp = g_esp, obj = MEM32(sp + 4), had = obj ? MEM32(obj + 0x134) : 0;
+    anim_pool_level();
+    sub_00020D30_gen();
+    uint32_t slot = g_eax;
+    if (!obj || had) return;
+    if (slot) {
+        uint32_t fr = MEM32(kAnimFree);
+        g_anim_taken++;
+        if (fr < g_anim_min_free) g_anim_min_free = fr;
+        return;
+    }
+    if (++g_anim_fails > 20) return;
+    uint32_t ent = MEM32(kPlayer), hobj = ent ? MEM32(ent + 0xAC) : 0;
+    char line[512];
+    int n = snprintf(line, sizeof line,
+                     "[ANIM] level %d: object %08X left without an animation slot%s (pool %u, %u free, %u in use)",
+                     (int)MEM32(kProgress), obj, obj == ent || obj == hobj ? " - HARRY" : "", MEM32(kAnimPool),
+                     MEM32(kAnimFree), MEM32(kAnimUsed));
+    if (MEM32(sp) == 0x20D9Cu)
+        n += snprintf(line + n, sizeof line - n, ", start args %08X %08X", MEM32(sp + 0x18), MEM32(sp + 0x1C));
+    n = anim_callers(line, n, (int)sizeof line, sp);
+    fprintf(stderr, "%s\n", line);
+}
+
+/* sub_00020D90(object, a, b) (cdecl), start an animation on an object: with a slot (sub_00020D30 above) it sets the
+ * animation up (sub_00020A30(b, 0, a, object + 0xD0)) and marks the slot playing (+0 and +2 = 1) only when the slot's
+ * animation index (+0x84, 16 bits) is not 0xFFFF; at 0xFFFF the animation was not found (not loaded yet, say) and the
+ * object keeps a slot that plays nothing: the bind pose, the A-pose, with no "left without one" line (issue #21, the
+ * second way, 2026-11-10). Logged with the object's slot, the two arguments (the animation asked for) and the game's
+ * return addresses; the first 20 in a level, the rest counted in the level's line */
+void sub_00020D90(void)
+{
+    uint32_t sp = g_esp, obj = MEM32(sp + 4), a = MEM32(sp + 8), b = MEM32(sp + 12);
+    sub_00020D90_gen();
+    uint32_t slot = obj ? MEM32(obj + 0x134) : 0;
+    if (!slot || MEM16(slot + 0x84) != 0xFFFFu) return;
+    if (++g_anim_empty > 20) return;
+    uint32_t ent = MEM32(kPlayer), hobj = ent ? MEM32(ent + 0xAC) : 0;
+    char line[512];
+    int n = snprintf(line, sizeof line,
+                     "[ANIM] level %d: object %08X has slot %08X but no animation in it (index FFFF, not playing)%s,"
+                     " asked for %08X %08X",
+                     (int)MEM32(kProgress), obj, slot, obj == ent || obj == hobj ? " - HARRY" : "", a, b);
+    n = anim_callers(line, n, (int)sizeof line, sp);
+    fprintf(stderr, "%s\n", line);
+}
+
 /* RECOMP_TRIG_TRACE=1: the level's triggers against Harry, to find the grounds' borders (2026-10-28). The geo loader
  * (sub_00046BA0) copies each level slot's trigger records (0x88 bytes in the .geo) into 0x84-byte records: the list
  * at [0x52434C + 4 slot], its count at [0x52438C + 4 slot]; +8 the record's type (.geo +0x3C), +0x1C its flags (.geo
@@ -1029,14 +1124,103 @@ static void grounds_borders(void)
     }
 }
 
+/* debug, RECOMP_HANIM_TRACE=1: [HANIM] each time Harry's animation record ([0x530354], the table entry the game plays
+ * him through: sub_00059340 / sub_000593D0 -> sub_00044310 / sub_00044540) or his state ([0x530298]) changes: the record,
+ * its first animation ids (+0x04, +0x1C), the state and flags ([0x5302A0]), his position, and how long the one before
+ * lasted. To find the climb-up animations (slow) and the ledge catch (missed), 2026-11-14 */
+static void hanim_trace(uint32_t ent)
+{
+    static int on = -1;
+    static uint32_t last_rec, last_flags;
+    static int16_t last_state = -32768;
+    static ULONGLONG since;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_HANIM_TRACE");
+        on = e && *e && *e != '0';
+    }
+    if (!on) return;
+    uint32_t rec = MEM32(0x530354), flags = MEM32(0x5302A0);
+    int16_t state = (int16_t)MEM16(0x530298);
+    if (rec == last_rec && state == last_state) return;
+    ULONGLONG now = GetTickCount64();
+    uint32_t obj = MEM32(ent + 0xAC);
+    int table = rec >= 0x10000u && rec < 0x400000u;
+    fprintf(stderr, "[HANIM] %llu ms rec %08X ids %08X %08X state %d flags %08X pos %.3f %.3f %.3f (the one before: rec "
+            "%08X state %d for %llu ms)\n", now, rec, table ? MEM32(rec + 4) : 0, table ? MEM32(rec + 0x1C) : 0, state,
+            flags, obj ? MEMF(obj + 0x14) : 0.0f, obj ? MEMF(obj + 0x18) : 0.0f, obj ? MEMF(obj + 0x1C) : 0.0f, last_rec,
+            last_state, since ? now - since : 0ull);
+    last_rec = rec, last_state = state, last_flags = flags, since = now;
+}
+
+/* Harry's update (the game's), and while he climbs as many more as F10 > Enhancements > Ledge and climb speed asks:
+ * the game is frame-locked, one update a step, so each extra one plays the climb a step further, its rise with it. He
+ * takes no input in these states. The climbs: 51, pulling himself up onto a ledge he caught (ledge_catch_climb, about
+ * 4 s on the console, 2026-11-14); 41 and 44, the two climbs onto a 2 m block he walks into (about 1 s and 3.5 s,
+ * [HANIM] states read at the user's marks of 2026-11-15, the climb2mtr animations).
+ * The game's update pops its return address (ret); for another, it is put back first, so the stack ends as after one */
+static int climb_state(int16_t s) { return s == 51 || s == 41 || s == 44; }
+extern int app_LedgeClimbSpeed(void); /* renderer/app/app.cpp */
+extern int app_WiderLedgeCatch(void);
+
+/* Wider ledge catch (2026-11-14). In a jump (state 7, jump) the game catches a ledge (sub_00060B00, from the jump's
+ * update sub_00061050) only when a vertical ray 1.0 ahead of Harry, from 2.0 down to 1.6 over his feet, meets the
+ * ledge's top: a 0.4-high window at one distance, which a jump a little low or a little far passed through (he fell
+ * past the ledge he was meant to catch). When the game's own test missed this update, it is run again with Harry's
+ * place nudged (lower, higher, further ahead: 1.2 to 2.4 over him, up to 1.35 ahead) and his place put back unless a
+ * nudged test caught the ledge (state no longer 7): the game's catch then places him as it does */
+extern void sub_00060B00(void);
+static void wider_ledge_catch(uint32_t ent)
+{
+    static const float k_try[][2] = {{-0.4f, 0.0f}, {0.4f, 0.0f}, {0.0f, 0.35f}, {-0.4f, 0.35f}, {0.4f, 0.35f}};
+    uint32_t obj = ent ? MEM32(ent + 0xAC) : 0;
+    if (!obj || !app_WiderLedgeCatch() || (int16_t)MEM16(0x530298) != 7) return;
+    float x = MEMF(obj + 0x14), y = MEMF(obj + 0x18), z = MEMF(obj + 0x1C), yaw = MEMF(obj + 0x3C);
+    for (size_t i = 0; i < sizeof k_try / sizeof k_try[0]; i++) {
+        float nx = x + sinf(yaw) * k_try[i][1], ny = y + k_try[i][0], nz = z + cosf(yaw) * k_try[i][1];
+        MEMF(obj + 0x14) = nx, MEMF(obj + 0x18) = ny, MEMF(obj + 0x1C) = nz;
+        uint32_t a[1] = {ent};
+        call_guest(sub_00060B00, 1, a);
+        if ((int16_t)MEM16(0x530298) != 7) {
+            /* caught: the catch's own placing stands; one that left the nudged place gets his own back */
+            if (MEMF(obj + 0x14) == nx && MEMF(obj + 0x18) == ny && MEMF(obj + 0x1C) == nz)
+                MEMF(obj + 0x14) = x, MEMF(obj + 0x18) = y, MEMF(obj + 0x1C) = z;
+            fprintf(stderr, "[LEDGE] caught by the wider catch (try %u: %+.2f up, %+.2f ahead), state %d\n",
+                    (unsigned)i, k_try[i][0], k_try[i][1], (int16_t)MEM16(0x530298));
+            return;
+        }
+    }
+    MEMF(obj + 0x14) = x, MEMF(obj + 0x18) = y, MEMF(obj + 0x1C) = z;
+}
+
+static void harry_update(void)
+{
+    static int acc;  /* hundredths of an update carried over */
+    uint32_t ret = MEM32(g_esp), sp = g_esp, ent = MEM32(g_esp + 4);
+    sub_00053710_gen();
+    wider_ledge_catch(ent);
+    if (!climb_state((int16_t)MEM16(0x530298))) {
+        acc = 0;
+        return;
+    }
+    acc += app_LedgeClimbSpeed() - 100;
+    for (; acc >= 100 && climb_state((int16_t)MEM16(0x530298)); acc -= 100) {
+        uint32_t after = g_esp;
+        g_esp = sp;
+        MEM32(g_esp) = ret;
+        MEM32(g_esp + 4) = ent;  /* a callee may use its argument's slot */
+        sub_00053710_gen();
+        g_esp = after;
+    }
+}
+
 void sub_00053710(void)
 {
     HpcosTrainerShm *t = shm();
     uint32_t ent = ARG(0);
     give_card_key(ent);
-    if (ent && ent == MEM32(kPlayer)) hpcos_WideAspectTick(), harry_diff(ent), trig_trace(ent), grounds_borders(), lesson_arch(), lake_edge();
+    if (ent && ent == MEM32(kPlayer)) hpcos_WideAspectTick(), harry_diff(ent), trig_trace(ent), hanim_trace(ent), grounds_borders(), lesson_arch(), lake_edge();
     if (!t || !ent || ent != MEM32(kPlayer)) {
-        sub_00053710_gen();
+        harry_update();
         return;
     }
     static uint32_t seen;
@@ -1058,7 +1242,7 @@ void sub_00053710(void)
         fly(obj, t);
         g_esp += 4;  /* the update's ret */
     } else {
-        sub_00053710_gen();
+        harry_update();
     }
 
     t->noclip_on = (uint8_t)noclip;

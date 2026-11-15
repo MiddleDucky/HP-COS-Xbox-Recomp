@@ -41,6 +41,7 @@ extern "C" {
 #include "app/app.h"
 #include "core/log.h"
 #include "gpu/backend.h"
+#include "gpu/fsr_fg.h"
 #include "gpu/pipeline_cache.h"
 #include "gpu/shaders.h"
 #include "gpu/smaa_shader.h"
@@ -735,6 +736,7 @@ struct Tex {
     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
     bool norm = false;  // a normalization cube
     bool prompt_pic = false;  // xboxrecomp: the HUD's A B X Y picture (PromptPicture), by its contents
+    int prompt_font = -1;     // xboxrecomp: the text font with the button pictures (kPromptFonts index), by its contents
 };
 
 struct PsoKey {
@@ -1032,6 +1034,7 @@ private:
     uint64_t EnsurePixelShader(const PixelKey& pk, uint64_t pkey, const PerPixelSource* ppl = nullptr);
     bool PerPixel(const State& s, const Assembled& a, const DrawShaders& sh);
     std::unordered_map<uint64_t, bool> ppl_ok_;
+    std::string prompt_font_sig_[8];  // xboxrecomp: the key names each font's key icons were drawn with
     std::string prompt_sig_;  // xboxrecomp: the key names the keycap picture was drawn with  // xboxrecomp: per program and inputs, PerPixelLightable
     void BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k);
     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
@@ -1419,6 +1422,14 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     sd.BufferCount = kFrames;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    {   // xboxrecomp: FSR 3.1 frame generation (app fsr_frame_generation): FSR's swap chain in place of DXGI's
+        ComPtr<IDXGISwapChain4> fg;
+        if (fsr::CreateSwapChain(factory_.Get(), queue_.Get(), hwnd, sd, &fg)) {
+            factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+            fg.As(&swap_);
+            return true;
+        }
+    }
     ComPtr<IDXGISwapChain1> sc1;
     HRESULT hr = factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1);
     if (FAILED(hr)) {
@@ -3070,92 +3081,272 @@ void ReadStagePalette(const State& s, int stage, const TextureDesc& d, StagePale
 
 // a texture in guest memory: made again when its layout changed, uploaded again when its bytes did
 // xboxrecomp: key prompts (F10 Controls, Button prompts; app_KeyboardPrompts). The HUD's button cluster at the top
-// right is one 128x128 picture of the pad's Y X B A (panel.geo), known here by a hash of its texels; with key prompts on
-// it is drawn as four keycaps with the bound keys' names, where the buttons were (Y top, X left, B right, A bottom).
+// right is one 128x128 DXT3 picture of the pad's Y X B A (panel.geo 0x49080, the same bytes in every language's
+// panel_*.geo), known here by a hash of its texels; with key prompts on it is drawn as the bound keys, as PoA's HUD
+// buttons (2026-11-09): a round button of its colour with the key's name, or a mouse with that button lit for a mouse
+// button (DrawKeyIcon), each where that button's oval was (Y 64,34; X 34,64; B 94,64; A 64,94; 32x40 each). The spells' icons
+// are drawn over them as over the buttons. Made at 512x512 for sharp names; the draw's coordinates are normalized
 extern "C" int app_KeyboardPrompts(void);
 extern "C" const char* app_ButtonKeyLabel(int pad_input);
-constexpr uint64_t kPromptPicHash = 0;  // RECOMP_PROMPT_LOG prints the candidates' hashes
+constexpr uint64_t kPromptPicHash = 0x80725FFE086CB615ull;  // RECOMP_PROMPT_LOG prints the candidates' hashes
+constexpr int kPromptPicSize = 512;
 
 uint64_t FullHash(uint32_t data, uint32_t n) {
     return Hash(kernel::HostPtr(data), n);
 }
 
-// a label short enough for a keycap
+// a label short enough for a key cap
 std::string CapLabel(const char* name) {
     std::string n = name;
-    if (n == "Left Click") return "LMB";
-    if (n == "Right Click") return "RMB";
-    if (n == "Middle Click") return "MMB";
     if (n == "Mouse 4") return "M4";
     if (n == "Mouse 5") return "M5";
-    if (n == "Space") return "SPACE";
-    if (n == "Escape") return "ESC";
-    if (n == "Enter") return "ENTER";
-    if (n == "Backspace") return "BKSP";
+    if (n == "Escape") return "Esc";
+    if (n == "Backspace") return "Bksp";
+    if (n == "CapsLock" || n == "Caps Lock") return "Caps";
+    // the long names (input.cpp's kKeyNames) as their signs or short forms: a font cell is a button's size
+    static const struct { const char *from, *to; } kShort[] = {
+        {"PageUp", "PgUp"}, {"PageDown", "PgDn"}, {"Insert", "Ins"}, {"Delete", "Del"}, {"Pause", "Pse"},
+        {"Semicolon", ";"}, {"Equals", "="}, {"Comma", ","}, {"Minus", "-"}, {"Period", "."}, {"Slash", "/"},
+        {"Backquote", "`"}, {"LeftBracket", "["}, {"Backslash", "\\"}, {"RightBracket", "]"}, {"Quote", "'"},
+        {"NumMultiply", "N*"}, {"NumPlus", "N+"}, {"NumMinus", "N-"}, {"NumDecimal", "N."}, {"NumDivide", "N/"}};
+    for (const auto& k : kShort)
+        if (n == k.from) return k.to;
+    if (n.size() == 4 && !n.compare(0, 3, "Num")) return "N" + n.substr(3);
     return n;
 }
 
-// 128x128 BGRA, keycaps over transparency
-std::vector<uint8_t> PromptPicture(const std::string labels[4]) {
-    constexpr int W = 128;
-    std::vector<uint8_t> px(W * W * 4, 0);
-    struct Cap { int cx, cy; } caps[4] = {{64, 24}, {22, 64}, {106, 64}, {64, 104}};  // Y X B A
-    // the labels, white on black, through GDI: its coverage is the text's alpha
+// coverage of a rounded rectangle (centre cx cy, half sizes hx hy, corner radius r) at a pixel centre, anti-aliased
+float RoundRect(float x, float y, float cx, float cy, float hx, float hy, float r) {
+    float qx = std::fabs(x - cx) - (hx - r), qy = std::fabs(y - cy) - (hy - r);
+    float out = std::hypot(std::max(qx, 0.0f), std::max(qy, 0.0f)) + std::min(std::max(qx, qy), 0.0f) - r;
+    return std::clamp(0.5f - out, 0.0f, 1.0f);
+}
+
+void Over(uint8_t* px, float a, uint8_t r, uint8_t g, uint8_t b) {  // BGRA, straight alpha
+    if (a <= 0.0f) return;
+    float da = px[3] / 255.0f, oa = a + da * (1 - a);
+    auto mix = [&](uint8_t dst, uint8_t src) { return uint8_t((src * a + dst * da * (1 - a)) / oa + 0.5f); };
+    px[0] = mix(px[0], b), px[1] = mix(px[1], g), px[2] = mix(px[2], r), px[3] = uint8_t(oa * 255 + 0.5f);
+}
+
+// the label's coverage (white on black through GDI) in a w x h box, its font from pt points shrunk until it fits
+std::vector<uint8_t> LabelMask(const char* text, int w, int h, int start_pt) {
+    std::vector<uint8_t> m(size_t(w) * h);
     HDC dc = CreateCompatibleDC(nullptr);
     BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = W;
-    bi.bmiHeader.biHeight = -W;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader = {sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB};
     void* bits = nullptr;
-    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bm || !bits) {
-        if (bm) DeleteObject(bm);
-        DeleteDC(dc);
-        return px;
+    HBITMAP bmp = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (!dc || !bmp || !bits) {
+        if (bmp) DeleteObject(bmp);
+        if (dc) DeleteDC(dc);
+        return m;
     }
-    HGDIOBJ old = SelectObject(dc, bm);
-    std::memset(bits, 0, W * W * 4);
+    HGDIOBJ old = SelectObject(dc, bmp);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(255, 255, 255));
-    for (int i = 0; i < 4; i++) {
-        if (labels[i].empty()) continue;
-        int h = labels[i].size() <= 1 ? 26 : labels[i].size() <= 3 ? 18 : 13;
-        HFONT f = CreateFontA(-h, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Arial");
+    for (int pt = std::max(start_pt, 8);; pt = std::max(pt - 2, 8)) {
+        HFONT f = CreateFontA(-pt, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              ANTIALIASED_QUALITY, DEFAULT_PITCH, "Arial");
         HGDIOBJ of = SelectObject(dc, f);
-        RECT r{caps[i].cx - 30, caps[i].cy - 16, caps[i].cx + 30, caps[i].cy + 16};
-        DrawTextA(dc, labels[i].c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SIZE sz{};
+        GetTextExtentPoint32A(dc, text, int(std::strlen(text)), &sz);
+        if (sz.cx <= w || pt <= 8) {
+            std::memset(bits, 0, size_t(w) * h * 4);
+            RECT rc{0, 0, w, h};
+            DrawTextA(dc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            GdiFlush();
+            const uint8_t* b = static_cast<const uint8_t*>(bits);
+            for (size_t k = 0; k < m.size(); k++) m[k] = std::max({b[k * 4], b[k * 4 + 1], b[k * 4 + 2]});
+            SelectObject(dc, of);
+            DeleteObject(f);
+            break;
+        }
         SelectObject(dc, of);
         DeleteObject(f);
     }
-    GdiFlush();
-    const uint8_t* text = static_cast<const uint8_t*>(bits);
-    for (int y = 0; y < W; y++) {
-        for (int x = 0; x < W; x++) {
-            float a = 0, edge = 0;
-            for (int i = 0; i < 4; i++) {
-                if (labels[i].empty()) continue;
-                int hw = labels[i].size() <= 1 ? 19 : 28, hh = 17;  // a single letter's cap is near square
-                // rounded box distance, radius 7
-                float dx = std::max(std::fabs(float(x) + 0.5f - caps[i].cx) - (hw - 7), 0.0f);
-                float dy = std::max(std::fabs(float(y) + 0.5f - caps[i].cy) - (hh - 7), 0.0f);
-                float d = std::sqrt(dx * dx + dy * dy) - 7;
-                a = std::max(a, std::clamp(0.5f - d, 0.0f, 1.0f));
-                edge = std::max(edge, std::clamp(1.0f - std::fabs(d + 1.5f) / 1.5f, 0.0f, 1.0f));
-            }
-            uint8_t* o = &px[(y * W + x) * 4];
-            float t = text[(y * W + x) * 4 + 1] / 255.0f;  // green: GDI's grey coverage
-            float c = 0.18f + 0.62f * edge;                // dark cap, light rim
-            c = c * (1 - t) + 1.0f * t;
-            uint8_t v = uint8_t(std::clamp(c, 0.0f, 1.0f) * 255);
-            o[0] = o[1] = o[2] = v;
-            o[3] = uint8_t(std::clamp(a * 0.92f + t * 0.08f, 0.0f, 1.0f) * 255);
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    return m;
+}
+
+// one key drawn into px (n x n BGRA) centred at cx cy, half sizes hw hh, in pixels (S, pixels per game pixel, is
+// unused now). Round, as the Xbox's own buttons are (HP:PS's and HP:PoA's the same, 2026-11-10): a disc of radius
+// min(hw, hh) with a dark edge, a pale ring and a face of the button's colour lighter toward the top left, with the
+// key's name (white with a shadow, dark on a light colour), or for a mouse button a small mouse on the face with that
+// button lit in a darker shade of the colour. The shapes are given for a radius of 62 and scaled
+void DrawKeyIcon(std::vector<uint8_t>& px, int n, float cx, float cy, float hw, float hh, float S, const std::string& name,
+                 uint8_t r, uint8_t g, uint8_t b) {
+    (void)S;
+    const bool mouse = name == "Left Click" || name == "Right Click" || name == "Middle Click";
+    const float R = std::min(hw, hh), s = R / 62.0f, ms = s * 0.6f;  // the disc's and the mouse's scale
+    // a rounded rectangle about the disc's centre, its sizes given at scale 1 and drawn at k
+    auto rr = [&](float fx, float fy, float k, float hx, float hy, float rad) {
+        return RoundRect(fx, fy, cx, cy, hx * k, hy * k, rad * k);
+    };
+    auto lift = [](uint8_t c, float hl) { return uint8_t(c + (255 - c) * hl + 0.5f); };
+    const int x0 = std::max(0, int(cx - R - 2)), x1 = std::min(n, int(cx + R + 2));
+    const int y0 = std::max(0, int(cy - R - 2)), y1 = std::min(n, int(cy + R + 2));
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            uint8_t* o = &px[(size_t(y) * n + x) * 4];
+            const float fx = x + 0.5f, fy = y + 0.5f;
+            Over(o, rr(fx, fy, s, 62, 62, 62), 0x20, 0x1C, 0x18);
+            Over(o, rr(fx, fy, s, 58, 58, 58), 0xE8, 0xDC, 0xB0);
+            const float hl =
+                std::clamp(1.0f - std::hypot(fx - (cx - 18 * s), fy - (cy - 20 * s)) / (60 * s), 0.0f, 1.0f) * 0.45f;
+            Over(o, rr(fx, fy, s, 49, 49, 49), lift(r, hl), lift(g, hl), lift(b, hl));
+            if (!mouse) continue;
+            // its body, the button pressed, the lines between the buttons (at least a pixel wide however small)
+            const float u = 64 + (fx - cx) / ms, v = 64 + (fy - cy) / ms;
+            Over(o, rr(fx, fy, ms, 40, 58, 38), 0x20, 0x1C, 0x18);
+            Over(o, rr(fx, fy, ms, 34, 52, 32), 0xFF, 0xFC, 0xF4);
+            const bool lit = name == "Middle Click" ? std::fabs(u - 64) < 7 && v > 20 && v < 52
+                                                    : (name == "Left Click" ? u < 62 : u > 66) && v < 58;
+            if (lit) Over(o, rr(fx, fy, ms, 34, 52, 32), uint8_t(r * 0.6f), uint8_t(g * 0.6f), uint8_t(b * 0.6f));
+            if (std::fabs(fy - (cy - 4 * ms)) < std::max(2.5f * ms, 0.75f) && std::fabs(u - 64) < 34)
+                Over(o, 1.0f, 0x20, 0x1C, 0x18);
+            if (std::fabs(fx - cx) < std::max(2.0f * ms, 0.75f) && v > 12 && v < 60) Over(o, 1.0f, 0x20, 0x1C, 0x18);
         }
     }
-    SelectObject(dc, old);
-    DeleteObject(bm);
-    DeleteDC(dc);
+    if (mouse) return;
+    // the name in the face (a chord of it at the text's height), centred on the disc
+    const std::string label = CapLabel(name.c_str());
+    const int lw = std::max(4, int(78 * s)), lh = std::max(4, int(64 * s));
+    std::vector<uint8_t> m = LabelMask(label.c_str(), lw, lh, int((label.size() == 1 ? 60 : 34) * s));
+    const int ox = int(cx) - lw / 2, oy = int(cy) - lh / 2;
+    const bool light = 0.299f * r + 0.587f * g + 0.114f * b > 160;
+    const int sh = std::max(1, int(3 * s + 0.5f));
+    for (int pass = light ? 1 : 0; pass < 2; pass++)  // the shadow down and to the right, then the name
+        for (int y = 0; y < lh; y++)
+            for (int x = 0; x < lw; x++) {
+                const uint8_t c = m[size_t(y) * lw + x];
+                const int qx = ox + x + (pass ? 0 : sh), qy = oy + y + (pass ? 0 : sh);
+                if (!c || qx < 0 || qy < 0 || qx >= n || qy >= n) continue;
+                uint8_t* o = &px[(size_t(qy) * n + qx) * 4];
+                if (!pass) Over(o, c / 255.0f * 0.8f, 0x20, 0x1C, 0x18);
+                else if (light) Over(o, c / 255.0f, 0x22, 0x1E, 0x18);
+                else Over(o, c / 255.0f, 0xFF, 0xFF, 0xFF);
+            }
+}
+
+// kPromptPicSize square BGRA: Y X B A as their keys over transparency; an unbound button keeps nothing drawn
+std::vector<uint8_t> PromptPicture(const std::string names[4]) {
+    constexpr int N = kPromptPicSize;
+    constexpr float S = N / 128.0f;  // the game's picture's pixels to these
+    std::vector<uint8_t> px(size_t(N) * N * 4, 0);
+    static const struct { float cx, cy; uint8_t r, g, b; } kCaps[4] = {
+        {64, 34, 0xE8, 0xC0, 0x20},  // Y, yellow
+        {34, 64, 0x2C, 0x58, 0xD0},  // X, blue
+        {94, 64, 0xD0, 0x2C, 0x2C},  // B, red
+        {64, 94, 0x4C, 0xB0, 0x2C},  // A, green
+    };
+    for (int i = 0; i < 4; i++) {
+        const std::string& n = names[i];
+        if (n.empty()) continue;
+        const auto& k = kCaps[i];
+        // a disc as wide as the oval (its 16 half width; 2026-11-10, round): the four stay apart on the diagonals
+        const float rad = 16.0f * S;
+        DrawKeyIcon(px, N, k.cx * S, k.cy * S, rad, rad, S, n, k.r, k.g, k.b);
+    }
+    return px;
+}
+
+// The text font's button pictures as keys (2026-11-10). The game's text writes a button as a character drawn from its
+// font's picture (panel.geo's first texture, 256x256 DXT3 at 0xE80 in each language's panel_*.geo; the glyph table's
+// cells below); with key prompts on the font is drawn from a copy at twice the size whose cells for A X B Y, the
+// triggers and BACK hold the bound keys as icons. The text draw lights a button character whatever the text's colour
+// (sub_00033870: colour | 0x808080), so the icons keep their colours in black text. Where the text names the keys in
+// words (hle_frontend.c) none of these characters is left; the inventory's text and the menus' own button legends keep
+// them, and show these
+struct PromptFont {
+    uint64_t hash;      // FullHash of level 0
+    uint16_t cell[7][4];  // x0 y0 x1 y1: 0x1701 A, 0x1702 X, 0x1703 B, 0x1704 Y, 0x1705 LT, 0x1706 RT, 0x1707 BACK
+};
+const PromptFont kPromptFonts[] = {
+    {0x1AC7F7D9DAF63A35ull, {{152, 116, 180, 144}, {180, 116, 208, 144}, {208, 116, 236, 144}, {0, 145, 28, 173}, {28, 145, 56, 173}, {56, 145, 84, 173}, {112, 145, 144, 173}}},  // panel.geo (US, UK)
+    {0x88DE5BE7943F69A0ull, {{60, 145, 88, 173}, {88, 145, 116, 173}, {116, 145, 144, 173}, {144, 145, 172, 173}, {172, 145, 200, 173}, {200, 145, 228, 173}, {0, 174, 32, 202}}},  // panel_FRA.geo
+    {0x4FB5D4BBDCB0F26Full, {{15, 145, 43, 173}, {43, 145, 71, 173}, {71, 145, 99, 173}, {99, 145, 127, 173}, {127, 145, 155, 173}, {155, 145, 183, 173}, {211, 145, 243, 173}}},  // panel_GER.geo
+    {0xA6DC4E81C30D5A92ull, {{48, 145, 76, 173}, {76, 145, 104, 173}, {104, 145, 132, 173}, {132, 145, 160, 173}, {160, 145, 188, 173}, {188, 145, 216, 173}, {0, 174, 32, 202}}},  // panel_ITA.geo
+    {0xE266DABF9A7081A0ull, {{124, 145, 152, 173}, {152, 145, 180, 173}, {180, 145, 208, 173}, {208, 145, 236, 173}, {0, 174, 28, 202}, {28, 174, 56, 202}, {84, 174, 116, 202}}},  // panel_SPA.geo
+    {0x15187EE938A7FE05ull, {{219, 145, 247, 173}, {0, 174, 28, 202}, {28, 174, 56, 202}, {56, 174, 84, 202}, {84, 174, 112, 202}, {112, 174, 140, 202}, {168, 174, 200, 202}}},  // panel_POR.geo
+};
+constexpr int kPromptFontScale = 2;
+// each cell's pad input (A B X Y LT RT Back as input.cpp numbers them) and colour
+const struct { int input; uint8_t r, g, b; } kFontCellKeys[7] = {
+    {0, 0x4C, 0xB0, 0x2C}, {2, 0x2C, 0x58, 0xD0}, {1, 0xD0, 0x2C, 0x2C}, {3, 0xE8, 0xC0, 0x20},
+    {6, 0x80, 0x80, 0x80}, {7, 0x80, 0x80, 0x80}, {13, 0x80, 0x80, 0x80}};
+
+int PromptFontIndex(uint64_t hash) {
+    for (size_t i = 0; i < std::size(kPromptFonts); i++)
+        if (kPromptFonts[i].hash == hash) return int(i);
+    return -1;
+}
+
+// DXT3 level 0 (w x h) to BGRA
+std::vector<uint8_t> DecodeDxt3(const uint8_t* src, int w, int h) {
+    std::vector<uint8_t> out(size_t(w) * h * 4);
+    for (int by = 0; by < h; by += 4)
+        for (int bx = 0; bx < w; bx += 4, src += 16) {
+            uint64_t a;
+            std::memcpy(&a, src, 8);
+            uint16_t c0 = uint16_t(src[8] | src[9] << 8), c1 = uint16_t(src[10] | src[11] << 8);
+            uint32_t idx = uint32_t(src[12] | src[13] << 8 | src[14] << 16 | uint32_t(src[15]) << 24);
+            int pal[4][3];
+            auto unpack = [](uint16_t c, int* o) {
+                o[0] = (c & 31) * 255 / 31, o[1] = ((c >> 5) & 63) * 255 / 63, o[2] = (c >> 11) * 255 / 31;  // B G R
+            };
+            unpack(c0, pal[0]);
+            unpack(c1, pal[1]);
+            for (int k = 0; k < 3; k++) {
+                pal[2][k] = (2 * pal[0][k] + pal[1][k]) / 3;
+                pal[3][k] = (pal[0][k] + 2 * pal[1][k]) / 3;
+            }
+            for (int i = 0; i < 16; i++) {
+                uint8_t* o = &out[(size_t(by + i / 4) * w + bx + i % 4) * 4];
+                const int* c = pal[(idx >> (2 * i)) & 3];
+                o[0] = uint8_t(c[0]), o[1] = uint8_t(c[1]), o[2] = uint8_t(c[2]);
+                o[3] = uint8_t(((a >> (4 * i)) & 15) * 17);
+            }
+        }
+    return out;
+}
+
+// the font at kPromptFontScale times its size (bilinear, alpha premultiplied for the filter), its button cells as keys
+std::vector<uint8_t> PromptFontPicture(const uint8_t* dxt3, int font, const std::string names[7]) {
+    constexpr int W = 256, K = kPromptFontScale, N = W * K;
+    std::vector<uint8_t> src = DecodeDxt3(dxt3, W, W), px(size_t(N) * N * 4);
+    for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++) {
+            const float fx = std::clamp((x + 0.5f) / K - 0.5f, 0.0f, W - 1.0f),
+                        fy = std::clamp((y + 0.5f) / K - 0.5f, 0.0f, W - 1.0f);
+            const int ix = std::min(int(fx), W - 2), iy = std::min(int(fy), W - 2);
+            const float tx = fx - ix, ty = fy - iy;
+            float acc[4] = {}, wsum = 0;
+            for (int j = 0; j < 4; j++) {
+                const int sx = ix + (j & 1), sy = iy + (j >> 1);
+                const float wgt = ((j & 1) ? tx : 1 - tx) * ((j >> 1) ? ty : 1 - ty);
+                const uint8_t* q = &src[(size_t(sy) * W + sx) * 4];
+                const float al = q[3] / 255.0f * wgt;
+                for (int k = 0; k < 3; k++) acc[k] += q[k] * al;
+                acc[3] += al;
+                wsum += wgt;
+            }
+            uint8_t* o = &px[(size_t(y) * N + x) * 4];
+            for (int k = 0; k < 3; k++) o[k] = uint8_t(acc[3] > 0 ? std::clamp(acc[k] / acc[3], 0.0f, 255.0f) : 0);
+            o[3] = uint8_t(std::clamp(acc[3] / std::max(wsum, 1e-6f) * 255.0f, 0.0f, 255.0f));
+        }
+    const PromptFont& f = kPromptFonts[font];
+    for (int c = 0; c < 7; c++) {
+        if (names[c].empty()) continue;  // unbound: the button's own picture
+        const uint16_t* r = f.cell[c];
+        for (int y = r[1] * K; y < r[3] * K; y++) std::memset(&px[(size_t(y) * N + r[0] * K) * 4], 0, size_t(r[2] - r[0]) * K * 4);
+        const float cx = (r[0] + r[2]) * 0.5f * K, cy = (r[1] + r[3]) * 0.5f * K;
+        const float hw = (r[2] - r[0]) * 0.5f * K - 0.5f * K, hh = (r[3] - r[1]) * 0.5f * K - 1.0f * K;
+        const auto& k = kFontCellKeys[c];
+        DrawKeyIcon(px, N, cx, cy, hw, hh, float(K) * 0.85f, names[c], k.r, k.g, k.b);
+    }
     return px;
 }
 
@@ -3180,6 +3371,11 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
             UploadTexture(tx, d, fi, p, palette.va ? palette.colours : nullptr, same);
             // xboxrecomp: the HUD's button picture, by its texels (key prompts)
             tx.prompt_pic = false;
+            tx.prompt_font = -1;
+            if (d.width == 256 && d.height == 256 && d.format == 0x0E && !d.cube && d.depth == 1) {
+                tx.prompt_font = PromptFontIndex(FullHash(d.data, LevelSize(d, 0)));
+                if (tx.prompt_font >= 0) fprintf(stderr, "[PROMPTS] the text font (%d) at %08X\n", tx.prompt_font, d.data);
+            }
             if (d.width == 128 && d.height == 128 && !d.cube && d.depth == 1) {
                 uint64_t h = FullHash(d.data, LevelSize(d, 0));
                 tx.prompt_pic = h == kPromptPicHash;
@@ -3189,16 +3385,46 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
             }
         }
     }
+    if (tx.prompt_font >= 0 && app_KeyboardPrompts()) {
+        // the font with its buttons as keys, remade when a key name or the font changes
+        static const int kInputs[7] = {0, 2, 1, 3, 6, 7, 13};
+        std::string names[7], sig;
+        for (int c = 0; c < 7; c++) sig += (names[c] = app_ButtonKeyLabel(kInputs[c])) + "|";
+        sig += std::to_string(tx.sig);
+        const int f = tx.prompt_font;
+        TextureDesc kd;
+        kd.data = 0xFFFF1000u + uint32_t(f);
+        kd.format = 0x12;  // LIN_A8R8G8B8
+        kd.width = kd.height = 256 * kPromptFontScale;
+        kd.pitch = kd.width * 4;
+        kd.linear = true;
+        const FormatInfo& kfi = Format(kd.format);
+        const uint64_t kkey = 0xFFFFFFFFFFFF1000ull + uint64_t(f);
+        Tex& kt = textures_[kkey];
+        bool ksame = SameTexture(kt, kd);
+        if (!ksame && !CreateTexture(kt, kd, kfi, kkey)) return nullptr;
+        if (!ksame || prompt_font_sig_[f] != sig) {
+            prompt_font_sig_[f] = sig;
+            std::vector<uint8_t> pic =
+                PromptFontPicture(static_cast<const uint8_t*>(kernel::HostPtr(d.data)), f, names);
+            UploadTexture(kt, kd, kfi, pic.data(), nullptr, ksame);
+            fprintf(stderr, "[PROMPTS] the font's buttons drawn as keys: A %s, X %s, B %s, Y %s, LT %s, RT %s, Back %s\n",
+                    names[0].c_str(), names[1].c_str(), names[2].c_str(), names[3].c_str(), names[4].c_str(),
+                    names[5].c_str(), names[6].c_str());
+        }
+        FillTextureView(kt, kd, stages.sv[stage]);
+        return kt.res.Get();
+    }
     if (tx.prompt_pic && app_KeyboardPrompts()) {
         // the keycaps instead, remade when a key name changes
-        std::string labels[4] = {CapLabel(app_ButtonKeyLabel(3)), CapLabel(app_ButtonKeyLabel(2)),
-                                 CapLabel(app_ButtonKeyLabel(1)), CapLabel(app_ButtonKeyLabel(0))};
+        std::string labels[4] = {app_ButtonKeyLabel(3), app_ButtonKeyLabel(2), app_ButtonKeyLabel(1),
+                                 app_ButtonKeyLabel(0)};
         std::string sig = labels[0] + "|" + labels[1] + "|" + labels[2] + "|" + labels[3];
         TextureDesc kd;
         kd.data = 0xFFFF0000u;
         kd.format = 0x12;  // LIN_A8R8G8B8
-        kd.width = kd.height = 128;
-        kd.pitch = 128 * 4;
+        kd.width = kd.height = kPromptPicSize;
+        kd.pitch = kPromptPicSize * 4;
         kd.linear = true;
         const FormatInfo& kfi = Format(kd.format);
         Tex& kt = textures_[0xFFFFFFFFFFFF0000ull];
@@ -3208,6 +3434,8 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
             prompt_sig_ = sig;
             std::vector<uint8_t> pic = PromptPicture(labels);
             UploadTexture(kt, kd, kfi, pic.data(), nullptr, ksame);
+            fprintf(stderr, "[PROMPTS] HUD buttons drawn as keys: Y %s, X %s, B %s, A %s\n", labels[0].c_str(),
+                    labels[1].c_str(), labels[2].c_str(), labels[3].c_str());
         }
         FillTextureView(kt, kd, stages.sv[stage]);
         return kt.res.Get();
@@ -3355,7 +3583,7 @@ bool D3D12Backend::BloomForScene(const State& s, const Assembled& a) {
                 scene_vp_ = s.viewport;
                 scene_rt_ = s.rt;
                 scene_zs_ = s.zs;
-                scene_fog_[0] = s.rs[kRsFogEnable];
+                scene_fog_[0] = s.rs[kRsFogEnable] && !app::Get().fog_disabled;  // occlusion fades with the fog shown
                 scene_fog_[1] = s.rs[kRsFogTableMode];
                 scene_fog_[2] = s.rs[kRsFogStart];
                 scene_fog_[3] = s.rs[kRsFogEnd];
@@ -3601,7 +3829,8 @@ void FillSurfaceConstants(const State& s, GuestSize size, DrawConstants& c) {
     c.surf[0] = float(size.w);
     c.surf[1] = float(size.h);
     c.surf[2] = 1.0f / s.zscale;
-    if (s.rs[kRsFogEnable]) {
+    // xboxrecomp: Enhancements > Disable fog: the draw as if the game had fog off (the factor stays 1: no haze)
+    if (s.rs[kRsFogEnable] && !app::Get().fog_disabled) {
         c.fog[0] = Bits(s.rs[kRsFogStart]);
         c.fog[1] = Bits(s.rs[kRsFogEnd]);
         c.fog[2] = Bits(s.rs[kRsFogDensity]);
@@ -4470,6 +4699,24 @@ void CountDrop(int why) {
 }
 }  // namespace
 
+// xboxrecomp: 16:9 cutscenes without their letterbox (F10 Enhancements, cutscene_bars_hidden; as the PoA port,
+// 2026-11-10). A cutscene draws two untextured strips across the frame, rows 0 to 71 and 381 to 481 (every F12 of
+// one: 154507, 224312, 233152); the scene is drawn behind them, so left out the picture reaches the screen's edges.
+// This title has no cutscene test, so the strips are told by their shape: 2D, no texture, the frame's whole width,
+// against its top or bottom edge, 40 to 120 rows tall (fades cover the frame; the menus' strips are pictures)
+static bool CutsceneBar(const State& s, const Assembled& a, const DrawShaders& sh, uint32_t gw, uint32_t gh) {
+    if (!app::Get().cutscene_bars_hidden || app::BootAspect() != app::AspectMode::Wide || s.textures[0] || !gw || !gh)
+        return false;
+    int reg = -1;
+    if (sh.prog) reg = CopiedTexcoords(s, a, sh)[4];
+    else if (a.pretransformed) reg = 0;
+    float r[4];
+    if (reg < 0 || !RegisterRect(a, reg, r)) return false;
+    const float fw = float(gw), fh = float(gh), h = r[3] - r[1];
+    if (r[0] > 1.0f || r[2] < fw - 1.0f || h < 40.0f || h > 120.0f) return false;
+    return r[1] <= 1.0f || r[3] >= fh - 1.0f;
+}
+
 void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     if (cap_) CapStep(s.rt);
     g_ls_draws++;
@@ -4492,6 +4739,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     sh.ppl = PerPixel(s, a, sh);
     sh.vkey = VertexKey(s, a, sh);
     sh.vh = EnsureVertexShader(s, a, sh);
+    if (bound_rt_ && bound_rt_->gw == guest_w_ && bound_rt_->gh == guest_h_ && CutsceneBar(s, a, sh, guest_w_, guest_h_))
+        return;
 
     // stage textures, then the pixel shader made for them
     DrawTextures stages;
@@ -5082,7 +5331,22 @@ void D3D12Backend::DrawSdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3
     cl_->ClearRenderTargetView(bb, black, 0, nullptr);
     cl_->OMSetRenderTargets(1, &bb, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
-    if (t) BlitFrame(*t, r, pillarbox);
+    // xboxrecomp: a movie over the whole frame (the intro's): the game's frame under it is the last one it drew (the
+    // title's mist, spread over 16:9, showed as a blue bar left of the 4:3 movie); left out, the sides stay black
+    xbox_FramebufferWindowOverlayRead(
+        [](const XboxPresentInfo* pi, void* self) { static_cast<D3D12Backend*>(self)->OverlayLatch(*pi); }, this);
+    const bool movie_covers = ov_shown_ && ov_tex_ && ov_rect_[0] <= 0.0f && ov_rect_[1] <= 0.0f &&
+                              ov_rect_[2] >= float(ov_fb_w_) && ov_rect_[3] >= float(ov_fb_h_);
+    if (t && !movie_covers) BlitFrame(*t, r, pillarbox);
+    if (g_black_sides.exchange(false) && !pillarbox) {
+        // xboxrecomp: a loading screen kept 4:3 (hle_hud.c): its picture squeezed to the frame's middle 3/4, starting
+        // 81 px of 640 in; the rest of the frame was whatever the game had there, black instead
+        const float aspect = app::Aspect(), w = float(bb_w_), h = float(bb_h_);
+        const float vw = std::min(w, h * aspect), x0 = (w - vw) / 2;
+        const LONG a = LONG(std::ceil(x0 + vw * (81.0f / 640.0f))), b = LONG(std::floor(x0 + vw * (559.0f / 640.0f)));
+        const D3D12_RECT sides[2] = {{0, 0, a, LONG(bb_h_)}, {b, 0, LONG(bb_w_), LONG(bb_h_)}};
+        if (a > 0 && b < LONG(bb_w_)) cl_->ClearRenderTargetView(bb, black, 2, sides);
+    }
     RenderUi();
 }
 
@@ -5342,6 +5606,7 @@ void D3D12Backend::Present(const Surface& front, bool pillarbox) {
     LogCopies();
     GpuTimestamp(1);
     if (!hold) DrawFrame(t, pillarbox, bi);
+    if (!hold) fsr::Frame(dev_.Get(), cl_.Get(), swap_.Get(), bb_w_, bb_h_);  // xboxrecomp: FSR frame generation
     GpuTimestamp(2);
     auto perf_t1 = std::chrono::steady_clock::now();
     Submit(false);

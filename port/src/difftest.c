@@ -364,9 +364,22 @@ static int auto_toggle(DWORD now)
     return 0;
 }
 
+static void sweep_toggle(void);
+
 static void sweep_key(DWORD now)
 {
     if (!(GetAsyncKeyState(VK_F5) & 1) && !auto_toggle(now)) return;
+    sweep_toggle();
+}
+
+/* a sweep started or ended from host code (hle_video.c: RECOMP_DIFF_XMV, a range of one movie's frames) */
+void recomp_difftest_sweep(int on)
+{
+    if (!!on != !!g_sweep) sweep_toggle();
+}
+
+static void sweep_toggle(void)
+{
     if (!load_unicorn()) return;
     g_sweep = !g_sweep;
     if (g_sweep) {

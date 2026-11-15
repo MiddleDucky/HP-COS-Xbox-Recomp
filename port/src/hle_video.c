@@ -49,6 +49,7 @@ extern void hle_d3d8_overlay_present(void);  /* renderer/xdk/hle_d3d8.cpp */
 #define XFMT_UYVY  0x25
 
 static int g_hle = -1, g_trace;
+static int g_movies, g_movie_frames;  /* movies started (EnableOverlay(1)), new frames of the one playing */
 
 static int hle_on(void)
 {
@@ -207,6 +208,7 @@ void sub_001366A0(void)
 {
     if (!hle_on()) { sub_001366A0_gen(); return; }
     if (g_trace) fprintf(stderr, "[OVERLAY] EnableOverlay(%u)\n", ARG(0));
+    if (ARG(0)) { g_movies++; g_movie_frames = 0; }
     if (!ARG(0)) xbox_FramebufferWindowOverlayOff();
     ret_stdcall(0, 1);
 }
@@ -216,14 +218,90 @@ void sub_001366A0(void)
 /* XMVDecoder_GetNextFrame(pDecoder, pSurface, pResult, prtTimestamp):
  * XMV_NOFRAME 0, XMV_NEWFRAME 1, XMV_ENDOFFILE 2, XMV_FAIL 3. Logs each
  * change of result and, while it stays put, a count once a second. */
+/* RECOMP_XMV_CHECK=movie,frames.txt,file.xmv (debug): before each new frame of the movie'th movie is decoded, find
+ * its compressed bytes in guest memory and compare them with the file. frames.txt is ffprobe's "size,pos" per video
+ * packet (-select_streams v -show_entries packet=size,pos -of csv=p=0). A difference means the bitstream was
+ * overwritten before the decoder read it (a read buffer handed back too early), not a decoder bug. */
+static void xmv_check_frame(int k)
+{
+    static int movie = -1, nframes, done;
+    static uint32_t *fsize, *fpos;
+    static uint8_t *file;
+    if (movie < 0) {
+        const char *e = getenv("RECOMP_XMV_CHECK");
+        char list[512], path[512];
+        FILE *f;
+        movie = 0;
+        if (!e || sscanf(e, "%d,%511[^,],%511s", &movie, list, path) != 3) { movie = 0; return; }
+        if ((f = fopen(path, "rb"))) {
+            long n;
+            fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+            file = malloc((size_t)n);
+            if (file && fread(file, 1, (size_t)n, f) != (size_t)n) { free(file); file = NULL; }
+            fclose(f);
+        }
+        fsize = calloc(4096, 4); fpos = calloc(4096, 4);
+        if ((f = fopen(list, "r"))) {
+            unsigned s, p;
+            while (nframes < 4096 && fscanf(f, "%u,%u", &s, &p) == 2) { fsize[nframes] = s; fpos[nframes++] = p; }
+            fclose(f);
+        }
+        fprintf(stderr, "[XMVCHK] movie %d: %d frames listed, file %s\n", movie, nframes, file ? "read" : "MISSING");
+        if (!file || !nframes) movie = 0;
+    }
+    if (!movie || g_movies != movie || k < 1 || k > nframes || k <= done) return;
+    done = k;
+    {
+        const uint8_t *want = file + fpos[k - 1];
+        uint32_t size = fsize[k - 1], need = size < 32 ? size : 32, at = 0, best = 0, best_diff = 0xFFFFFFFFu;
+        const uint8_t *ram = (const uint8_t *)XBOX_PTR(XBOX_CONTIG_BASE);
+        /* every place the frame's first bytes appear; the one closest to the file wins */
+        for (uint32_t a = 0; a + size <= XBOX_RAM_SIZE; a++) {
+            if (ram[a] != want[0] || memcmp(ram + a, want, need)) continue;
+            uint32_t diff = 0;
+            for (uint32_t i = 0; i < size; i++) diff += ram[a + i] != want[i];
+            if (diff < best_diff) { best_diff = diff; best = a; at = 1; }
+            if (!diff) break;
+        }
+        if (!at)
+            fprintf(stderr, "[XMVCHK] frame %d (%u bytes at file %u): its start is nowhere in memory\n", k, size,
+                    fpos[k - 1]);
+        else if (best_diff) {
+            uint32_t first = 0;
+            while (ram[best + first] == want[first]) first++;
+            fprintf(stderr, "[XMVCHK] frame %d (%u bytes at file %u) at %08X: %u bytes differ, the first at +%u\n", k,
+                    size, fpos[k - 1], XBOX_CONTIG_BASE + best, best_diff, first);
+        } else
+            fprintf(stderr, "[XMVCHK] frame %d at %08X intact\n", k, XBOX_CONTIG_BASE + best);
+    }
+}
+
 extern void sub_0014ED3D_gen(void);
 void sub_0014ED3D(void)
 {
     static uint32_t last = 0xFFFFFFFF, calls, frames;
     static DWORD t0;
     uint32_t presult = ARG(2);
+#ifdef RECOMP_DIFFTEST
+    /* RECOMP_DIFF_XMV=movie,first,last: the differential test (difftest.c) runs only while the movie'th movie (1 the
+     * first played) decodes its frames first..last (1 based), the frames a bad decode was seen on */
+    {
+        extern void recomp_difftest_sweep(int on);
+        static int movie = -1, first, last;
+        if (movie < 0) {
+            const char *e = getenv("RECOMP_DIFF_XMV");
+            if (!e || sscanf(e, "%d,%d,%d", &movie, &first, &last) != 3) movie = 0;
+        }
+        if (movie > 0 && g_movies == movie && presult) {
+            if (g_movie_frames + 1 == first) recomp_difftest_sweep(1);
+            if (g_movie_frames == last) recomp_difftest_sweep(0);
+        }
+    }
+#endif
+    xmv_check_frame(g_movie_frames + 1);
     sub_0014ED3D_gen();
     hle_on();
+    if (presult && MEM32(presult) == 1) g_movie_frames++;
     if (!g_trace) return;
     {
         uint32_t r = presult ? MEM32(presult) : 0xFFFFFFFF;
@@ -239,6 +317,39 @@ void sub_0014ED3D(void)
             t0 = now;
         }
     }
+}
+
+/* The movie player's loop (sub_00018D40) goes round again at once on XMV_NOFRAME,
+ * millions of calls a second. GetNextFrame polls the field status first thing (its
+ * call returns to 0x14F063), so a poll that sees the field it saw last time cannot
+ * have a new frame due: wait for the next field there. The kernel timer thread that
+ * counts the fields shares the guest core, so spinning can starve the movie's own
+ * clock, as it did on PS on Windows. It must stay parked for the whole field: a single
+ * Sleep(1) per poll made PS's movies slow again. RECOMP_XMV_WAIT=0: spin as before. */
+#define XMV_FIELD_POLL_RET 0x0014F063u
+
+static int xmv_wait_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_XMV_WAIT");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+static uint32_t xmv_field_wait(void)
+{
+    static uint32_t last = 0xFFFFFFFFu;
+    uint32_t v = xbox_Nv2aVblankCount();
+    int ms;
+    /* bounded: with no vblank clock (RECOMP_VBLANK unset) the count never moves */
+    for (ms = 0; v == last && ms < 20; ms++) {
+        Sleep(1);
+        v = xbox_Nv2aVblankCount();
+    }
+    last = v;
+    return v;
 }
 
 /* D3DDevice_GetDisplayFieldStatus(pFieldStatus): { Field, VBlankCount } */
@@ -258,7 +369,8 @@ void sub_00133790(void)
          * +0x1980 stays 0: the XMV player waits for the next field forever.
          * Report the runtime's 60 Hz count, progressive (as the XDK does when
          * the mode is not interlaced). */
-        MEM32(p + 4) = xbox_Nv2aVblankCount();
+        MEM32(p + 4) = MEM32(g_esp) == XMV_FIELD_POLL_RET && xmv_wait_on()
+                           ? xmv_field_wait() : xbox_Nv2aVblankCount();
         MEM32(p) = 3;
         g_esp += 8;
     } else {

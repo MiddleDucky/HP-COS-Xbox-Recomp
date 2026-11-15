@@ -67,9 +67,24 @@ const Entry kEntries[] = {
     {"brightness", nullptr, Kind::U32, FIELD(brightness), 0, 100, "0 to 100, 50 leaves the picture alone"},
     {"contrast", nullptr, Kind::U32, FIELD(contrast), 0, 100, nullptr},
     {"vsync", "RECOMP_VSYNC", Kind::Bool, FIELD(vsync), 0, 0, nullptr},
+    {"fsr_frame_generation", "RECOMP_FSR_FRAMEGEN", Kind::Bool, FIELD(fsr_frame_generation), 0, 0,
+     "AMD FSR 3.1 frame generation: a generated frame between each two of the game's (about 120 a second from its 60; the game itself still at 60). Needs amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_framegeneration_dx12.dll beside hpcos.exe. Takes effect at the next start"},
     {"fps_counter", nullptr, Kind::Bool, FIELD(fps_counter), 0, 0, nullptr},
     {"per_pixel_lighting", "RECOMP_PER_PIXEL_LIGHTING", Kind::Bool, FIELD(per_pixel_lighting), 0, 0,
      "lighting worked out for every pixel instead of at the corners of each triangle (the console's way): lights such as Lumos light the floor round them smoothly"},
+    {"skip_intro", "RECOMP_SKIP_INTRO", Kind::Bool, FIELD(skip_intro), 0, 0,
+     "the Warner Bros. and EA logo movies at start skipped; false: played, as the console does"},
+    {"cutscene_bars_hidden", "RECOMP_CUTSCENE_BARS_HIDDEN", Kind::Bool, FIELD(cutscene_bars_hidden), 0, 0,
+     "16:9: cutscenes fill the screen, the black bars at the top and bottom left out; false: the bars as the game"},
+    {"loading_screens_4_3", "RECOMP_LOADING_4_3", Kind::Bool, FIELD(loading_screens_4_3), 0, 0,
+     "16:9: the loading screens' pictures kept 4:3 in the middle (black at the sides, as the movies); false: stretched over 16:9"},
+    {"wider_ledge_catch", "RECOMP_WIDER_LEDGE_CATCH", Kind::Bool, FIELD(wider_ledge_catch), 0, 0,
+     "a jump catches a ledge whose top is a little lower, higher or further than the game's narrow window (1.6 to 2.0 over Harry, 1.0 ahead): 1.2 to 2.4, up to 1.35 ahead; false: as the game"},
+    {"ledge_climb_speed", "RECOMP_LEDGE_CLIMB_SPEED", Kind::U32, FIELD(ledge_climb_speed), 100, 300,
+     "Harry pulling himself up onto a ledge (about 4 s at 100) and climbing onto a 2 m block (1 s and 3.5 s), % of the "
+     "game's speed: 100 as the game"},
+    {"fog_disabled", "RECOMP_FOG_DISABLED", Kind::Bool, FIELD(fog_disabled), 0, 0,
+     "the game's distance fog left out: far scenery in full colour instead of fading into the haze; false: as the game"},
     {"bloom", "RECOMP_BLOOM", Kind::Bool, FIELD(bloom), 0, 0,
      "a glow round bright parts of the 3D scene (not the HUD)"},
     {"bloom_strength", nullptr, Kind::U32, FIELD(bloom_strength), 0, 100, nullptr},
@@ -344,6 +359,10 @@ void Init(State& st) {
     st.boot_aspect = st.cur.aspect;
     // the kernel answers the title's language query (XC_LANGUAGE) from this; read once, as the title starts
     SetEnvDefault("RECOMP_LANGUAGE", kLanguageNames[std::min(st.cur.language, kLanguages - 1)]);
+    // xboxrecomp: the speakers for the kernel's EEPROM audio setting (XC_AUDIO): 6 is the dashboard's Dolby Digital,
+    // with which this title pans its sounds over five speakers and plays its music as six channels, as on a console
+    // (read from the console's APU voice table, 2026-11-02); hle_dsound.c mixes them to the six outputs
+    SetEnvDefault("RECOMP_SPEAKERS", st.cur.speakers == 6 ? "6" : "2");
     if (!had) WriteFile(st.file);
     std::error_code ec;
     st.stamp = std::filesystem::last_write_time(FilePath(), ec);
@@ -501,6 +520,26 @@ extern "C" int app_Speakers(void) { return app::Get().speakers == 6 ? 6 : 2; }
 extern "C" int app_DrawAll(void) { return app::Get().draw_all; }
 extern "C" int app_GroundsWarps(void) { return app::Get().grounds_warps; }
 extern "C" int app_BroomLandFlat(void) { return app::Get().broom_land_flat; }
+extern "C" int app_LoadingScreens43(void) { return app::Get().loading_screens_4_3; }
+// the movie player (sub_00018D40, patch_gen.py): the boot's logo movies, D:\\warner.xmv and D:\\ea_logo_<language>.xmv,
+// not played with skip_intro
+extern "C" int hpcos_SkipMovie(const char* name) {
+    if (!name || !app::Get().skip_intro) return 0;
+    const char* b = std::strrchr(name, '\\');
+    b = b ? b + 1 : name;
+    const bool skip = !_stricmp(b, "warner.xmv") || !_strnicmp(b, "ea_logo_", 8);
+    if (skip) std::fprintf(stderr, "[XMV] skipped %s (skip_intro)\n", name);
+    return skip;
+}
+// the ledge and climb enhancements (hle_trainer.c) are left out of releases for now (v0.4.0, the user's call): a release
+// build plays them as the console does, whatever the toml says, and F10 and the launcher don't offer them
+#ifdef HPCOS_RELEASE
+extern "C" int app_WiderLedgeCatch(void) { return 0; }
+extern "C" int app_LedgeClimbSpeed(void) { return 100; }
+#else
+extern "C" int app_WiderLedgeCatch(void) { return app::Get().wider_ledge_catch; }
+extern "C" int app_LedgeClimbSpeed(void) { return int(std::clamp<uint32_t>(app::Get().ledge_climb_speed, 100, 300)); }
+#endif
 
 extern "C" void hpcos_SettingsInit(void) {
     const app::Settings& s = app::Get();

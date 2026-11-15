@@ -1829,6 +1829,20 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+/* The XBE as the caller gave it, for a section's first load: XeLoadSection reads it from disc. */
+static uint8_t *s_xbe_copy;
+static size_t s_xbe_copy_size;
+
+void xbox_section_reload(uint32_t va, uint32_t size, uint32_t raw_off, uint32_t raw_size)
+{
+    uint32_t copy = raw_size < size ? raw_size : size;
+    if (!s_xbe_copy || !size || va < XBOX_BASE_ADDRESS || (uint64_t)va + size > XBOX_TOTAL_RAM ||
+        (uint64_t)raw_off + copy > s_xbe_copy_size)
+        return;
+    memset((void *)((uintptr_t)va + g_memory_offset), 0, size);
+    memcpy((void *)((uintptr_t)va + g_memory_offset), s_xbe_copy + raw_off, copy);
+}
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
@@ -2072,6 +2086,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         if (header_size > xbe_size)
             header_size = (DWORD)xbe_size;
         memcpy(XBOX_VA(XBOX_BASE_ADDRESS), xbe, header_size);
+        /* Kept for xbox_section_reload: the caller's buffer need not outlive this */
+        s_xbe_copy = (uint8_t *)malloc(xbe_size);
+        if (s_xbe_copy) { memcpy(s_xbe_copy, xbe, xbe_size); s_xbe_copy_size = xbe_size; }
         fprintf(stderr, "  XBE header: %u bytes at %p (Xbox VA 0x%08X)\n",
                 header_size, XBOX_VA(XBOX_BASE_ADDRESS), XBOX_BASE_ADDRESS);
     }
@@ -2183,6 +2200,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             if (have_data) {
                 sections_loaded++;
                 total_bytes += copy_size;
+            }
+
+            /* A preload section counts as loaded once, in the title's copy of the header */
+            if (*(const DWORD *)(sh + SECTHDR_FLAGS) & 0x00000002u) {
+                DWORD count_va = sect_headers_va + si * SECTHDR_SIZE + 0x18;
+                *(DWORD *)XBOX_VA(count_va) = 1;
             }
 
             fprintf(stderr, "  [%2u] %-12s VA=0x%08X vsize=%-8u raw=0x%08X rsize=%-8u%s\n",
@@ -3083,7 +3106,6 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 #define XBOX_THREAD_STACK_SIZE  (512 * 1024)
-#define XBOX_MAX_THREAD_STACKS  8
 
 static int g_thread_stacks_used = 0;
 
@@ -3135,13 +3157,16 @@ uint32_t xbox_AllocThreadTib(void)
     #undef TIB_VA
 }
 
-uint32_t xbox_AllocThreadStack(void)
+/* Stacks at least this big, or what the title asks for when that's more. */
+struct stack_size { uint32_t top, bytes; struct stack_size *next; };
+static struct stack_size *s_big_stacks;
+
+uint32_t xbox_AllocThreadStackSized(uint32_t bytes)
 {
     uint32_t base;
 
-    if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
-        return 0;
-    }
+    bytes = (bytes + 0xFFFu) & ~0xFFFu;
+    if (bytes < XBOX_THREAD_STACK_SIZE) bytes = XBOX_THREAD_STACK_SIZE;
 
     /* From the heap, not from XBOX_STACK_BASE.
      *
@@ -3157,13 +3182,27 @@ uint32_t xbox_AllocThreadStack(void)
      * taking slices from it is correct for any image size instead of only
      * for small ones.
      */
-    base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
+    base = xbox_HeapAlloc(bytes, 4096);
     if (!base)
         return 0;
     g_thread_stacks_used++;
 
+    if (bytes != XBOX_THREAD_STACK_SIZE) {
+        struct stack_size *b = (struct stack_size *)malloc(sizeof *b);
+        if (b) {
+            b->top = base + bytes - 16;
+            b->bytes = bytes;
+            b->next = s_big_stacks;
+            s_big_stacks = b;
+        }
+    }
     /* Top of the slice, 16-byte aligned, growing down. */
-    return base + XBOX_THREAD_STACK_SIZE - 16;
+    return base + bytes - 16;
+}
+
+uint32_t xbox_AllocThreadStack(void)
+{
+    return xbox_AllocThreadStackSized(XBOX_THREAD_STACK_SIZE);
 }
 
 /* Give a worker's stack back when the worker ends.
@@ -3184,7 +3223,19 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 {
     if (!stack_top)
         return;
-    xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
+    {
+        uint32_t bytes = XBOX_THREAD_STACK_SIZE;
+        struct stack_size **p;
+        for (p = &s_big_stacks; *p; p = &(*p)->next)
+            if ((*p)->top == stack_top) {
+                struct stack_size *b = *p;
+                bytes = b->bytes;
+                *p = b->next;
+                free(b);
+                break;
+            }
+        xbox_HeapFree(stack_top + 16 - bytes);
+    }
     if (g_thread_stacks_used > 0)
         g_thread_stacks_used--;
 }

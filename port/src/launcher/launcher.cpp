@@ -1,5 +1,5 @@
-// hpcos_launcher.exe: picks 4:3 or 16:9 and the graphics settings, writes them to hpcos.toml beside it and starts
-// hpcos.exe with the environment run_win.sh gives it. Behind the page the title as text over a dark backdrop (no
+// hpcos_launcher.exe: picks 4:3 or 16:9 and the graphics settings, writes them to bin\hpcos.toml and starts
+// bin\hpcos.exe with the environment run_win.sh gives it (it runs hpcos_ntsc.dll or hpcos_pal.dll by the disc). Behind the page the title as text over a dark backdrop (no
 // game art: the exes carry the port's own icon only). Dear ImGui over Direct3D 11.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -11,6 +11,7 @@
 #include <d3d11.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
@@ -43,6 +44,7 @@ struct Settings {
     uint32_t internal_height = 0;
     uint32_t msaa = 0, aniso = 0;
     bool smaa = false, vsync = true;
+    bool fsr = false;             // fsr_frame_generation: AMD FSR 3.1 frame generation (gpu/fsr_fg.cpp)
     bool show = true;             // show_launcher: false starts the game without this page
     int fps = 0;                  // fps_limit: 0 the game's, 1 30 fps
     int colorblind = 0;           // 'off', 'protanopia', 'deuteranopia', 'tritanopia'
@@ -52,7 +54,76 @@ struct Settings {
     bool vibration = true, invert_x = false, invert_y = false;
     bool controller = true;  // the in-game F10 option of the same name
     int language = 0;        // 'english' (US), 'english_uk', 'french', 'german', 'spanish', 'italian': the language the game starts in
+    int speakers = 0;        // speakers: 0 stereo (2), 1 5.1 surround (6), as F10 > Audio > Speakers
+    int opt[64] = {};        // the rest of F10's settings, by kOpts (each its own toml key)
 };
+
+// xboxrecomp: the rest of the game's settings (F10's, renderer/app/app.cpp's keys and defaults), so this page has them
+// all (2026-11-14): each a toml key with its control. kHeader: a heading over the next ones; kCheckNot: a checkbox that
+// is on when the key is false (Explore the grounds = no path warps)
+enum OptType { kHeader, kCheck, kCheckNot, kSlider, kChoice };
+const char* const kPromptNames[] = {"Follow the last input", "Controller buttons", "Keyboard keys"};
+const char* const kMoveNames[] = {"Slow walk", "Walk", "Run"};
+struct Opt {
+    const char* tab;
+    const char* key;  // null for a heading
+    const char* label;
+    OptType type;
+    int def, lo, hi;
+    const char* fmt;               // a slider's
+    const char* const* names;      // a choice's
+    const char* note;              // under it, greyed
+};
+const Opt kOpts[] = {
+    {"Game", nullptr, "Enhancements", kHeader, 0, 0, 0, nullptr, nullptr, nullptr},
+    {"Game", "grounds_warps", "Explore Hogwarts Grounds (experimental)", kCheckNot, 0, 0, 0, nullptr, nullptr,
+     "On: walk the whole grounds. Off: a path's end fades to its other end, as the game does."},
+    {"Game", "broom_land_flat", "Land the broom on any flat surface (experimental)", kCheck, 0, 0, 0, nullptr, nullptr,
+     nullptr},
+    {"Game", "per_pixel_lighting", "Per-pixel lighting", kCheck, 1, 0, 0, nullptr, nullptr,
+     "Smooth light round Lumos and lamps. Off: per vertex, as the console."},
+    {"Game", "cutscene_bars_hidden", "Cutscenes without black bars (16:9)", kCheck, 0, 0, 0, nullptr, nullptr, nullptr},
+    {"Game", "skip_intro", "Skip the Warner Bros. and EA logos", kCheck, 0, 0, 0, nullptr, nullptr, nullptr},
+    {"Game", "fog_disabled", "Disable fog", kCheck, 0, 0, 0, nullptr, nullptr, nullptr},
+    {"Game", "loading_screens_4_3", "Keep loading screens 4:3 (16:9)", kCheck, 0, 0, 0, nullptr, nullptr, nullptr},
+#ifndef HPCOS_RELEASE  // not in releases yet (v0.4.0, the user's call): the game plays them as the console does
+    {"Game", "wider_ledge_catch", "Wider ledge catch", kCheck, 1, 0, 0, nullptr, nullptr,
+     "A jump catches a ledge a little lower, higher or further than the game's narrow window."},
+    {"Game", "ledge_climb_speed", "Ledge and climb speed %", kSlider, 150, 100, 300, "%d %%", nullptr,
+     "How quickly Harry pulls himself up onto a ledge he caught; 100 as the game (about 4 s)."},
+#endif
+    {"Display", "fps_counter", "FPS counter", kCheck, 0, 0, 0, nullptr, nullptr, nullptr},
+    {"Graphics", "render_percent", "Render scale %", kSlider, 100, 25, 200, "%d %%", nullptr,
+     "Render scale and its limit apply with Internal resolution set to follow the window."},
+    {"Graphics", "render_max_height", "Max render height", kSlider, 1080, 0, 4320, "%d lines", nullptr, nullptr},
+    {"Graphics", "brightness", "Brightness", kSlider, 50, 0, 100, "%d", nullptr, nullptr},
+    {"Graphics", "contrast", "Contrast", kSlider, 50, 0, 100, "%d", nullptr, nullptr},
+    {"Graphics", "draw_all_objects", "Draw everything in view (no doorway culling)", kCheck, 1, 0, 0, nullptr, nullptr,
+     nullptr},
+    {"Graphics", "async_shaders", "Build shaders in the background", kCheck, 1, 0, 0, nullptr, nullptr,
+     "A draw whose shader is still building is left out for a moment instead of waited for."},
+    {"Post-processing", "bloom", "Bloom", kCheck, 0, 0, 0, nullptr, nullptr, "A glow round bright lights, not the HUD."},
+    {"Post-processing", "bloom_strength", "Bloom strength", kSlider, 40, 0, 100, "%d", nullptr, nullptr},
+    {"Post-processing", "sharpen", "Sharpening", kSlider, 0, 0, 100, "%d", nullptr, nullptr},
+    {"Post-processing", "saturation", "Saturation", kSlider, 100, 0, 200, "%d %%", nullptr, nullptr},
+    {"Post-processing", "vibrance", "Vibrance", kSlider, 0, 0, 100, "%d", nullptr, nullptr},
+    {"Post-processing", "warmth", "Warmth", kSlider, 50, 0, 100, "%d", nullptr, "50 as the game, lower cooler, higher warmer."},
+    {"Post-processing", "vignette", "Vignette", kSlider, 0, 0, 100, "%d", nullptr, nullptr},
+    {"Post-processing", "grain", "Film grain", kSlider, 0, 0, 100, "%d", nullptr, nullptr},
+    {"Post-processing", "fov", "Field of view % (experimental)", kSlider, 100, 80, 130, "%d %%", nullptr,
+     "100 as the game."},
+    {"Controls", "button_prompts", "Button prompts", kChoice, 0, 0, 2, nullptr, kPromptNames, nullptr},
+    {"Controls", "mouse_invert_y", "Invert mouse Y", kCheck, 0, 0, 0, nullptr, nullptr, nullptr},
+    {"Controls", "move_mode", "Movement keys (mouse wheel)", kChoice, 2, 0, 2, nullptr, kMoveNames, nullptr},
+    {"Controls", nullptr, "Controller", kHeader, 0, 0, 0, nullptr, nullptr, nullptr},
+    {"Controls", "deadzone_left", "Left stick deadzone %", kSlider, 10, 0, 50, "%d", nullptr, nullptr},
+    {"Controls", "sensitivity_left", "Left stick sensitivity %", kSlider, 100, 25, 200, "%d", nullptr, nullptr},
+    {"Controls", "deadzone_right", "Right stick deadzone %", kSlider, 10, 0, 50, "%d", nullptr, nullptr},
+    {"Controls", "sensitivity_right", "Right stick sensitivity %", kSlider, 100, 25, 200, "%d", nullptr, nullptr},
+    {"Controls", "vibration_strength", "Vibration strength %", kSlider, 100, 0, 100, "%d", nullptr, nullptr},
+};
+constexpr int kOptCount = int(sizeof(kOpts) / sizeof(kOpts[0]));
+static_assert(kOptCount <= 64, "Settings::opt");
 
 const char* const kColorBlindKeys[] = {"off", "protanopia", "deuteranopia", "tritanopia"};
 const char* const kColorBlindNames[] = {"Off", "Protanopia (red-weak)", "Deuteranopia (green-weak)", "Tritanopia (blue-weak)"};
@@ -60,11 +131,10 @@ const char* const kColorBlindNames[] = {"Off", "Protanopia (red-weak)", "Deutera
 const char* const kLanguageKeys[] = {"english", "english_uk", "french", "german", "spanish", "italian"};
 const char* const kLanguageNames[] = {"English (US)", "English (UK)", "Fran\xC3\xA7" "ais", "Deutsch", "Espa\xC3\xB1ol", "Italiano"};
 
+const char* const kSpeakerNames[] = {"Stereo", "5.1 surround"};
+
 const char* const kDisplayKeys[] = {"windowed", "borderless", "fullscreen"};
 const char* const kDisplayNames[] = {"Windowed", "Borderless", "Fullscreen"};
-constexpr uint32_t kInternalValues[] = {0, 480, 720, 960, 1080, 1440, 1920, 2160};
-const char* const kInternalNames[] = {"Follow window",  "480 (Xbox, 1x)", "720 (1.5x)", "960 (2x)",
-                                      "1080 (2.25x)",   "1440 (3x)",      "1920 (4x)",  "2160 (4.5x, 4K)"};
 constexpr uint32_t kMsaaValues[] = {0, 2, 4, 8};
 const char* const kMsaaNames[] = {"Off", "2x", "4x", "8x"};
 constexpr uint32_t kAnisoValues[] = {0, 2, 4, 8, 16};
@@ -75,6 +145,41 @@ std::wstring ExeDir() {
     DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
     std::wstring p(buf, n);
     return p.substr(0, p.find_last_of(L"\\/") + 1);
+}
+
+// bin\ beside this launcher: the game (hpcos.exe, its DLLs and the FSR ones) and everything it keeps for itself,
+// hpcos.toml, shadercache\, logs\ and the file check's game_check.txt. game\, saves\ and licenses\ stay up here
+std::wstring BinDir() { return ExeDir() + L"bin\\"; }
+
+// a folder from before bin\ (everything beside the launcher): its settings, shader cache and file check moved in once,
+// so an update keeps them and does not read the whole disc again. Something already in bin\ is left as it is
+void MoveIntoBin() {
+    std::wstring top = ExeDir(), bin = BinDir();
+    CreateDirectoryW(bin.c_str(), nullptr);
+    for (const wchar_t* name : {L"hpcos.toml", L"shadercache", L"game_check.txt", L"debug.env"}) {
+        std::wstring from = top + name, to = bin + name;
+        if (GetFileAttributesW(from.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(to.c_str()) == INVALID_FILE_ATTRIBUTES)
+            MoveFileW(from.c_str(), to.c_str());
+    }
+    // a release unpacked over an old folder already brings bin\shadercache (its base_*.bin), so the old cache was not
+    // moved above: what the player's PC prepared (shaders.bin, the pipeline lists, a driver cache folder) goes in
+    // entry by entry; the release's own base files win over the old ones, and the emptied old folder goes
+    std::wstring old_cache = top + L"shadercache\\", new_cache = bin + L"shadercache\\";
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((old_cache + L"*").c_str(), &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            std::wstring n = fd.cFileName;
+            if (n == L"." || n == L"..") continue;
+            std::wstring from = old_cache + n, to = new_cache + n;
+            if (GetFileAttributesW(to.c_str()) == INVALID_FILE_ATTRIBUTES) MoveFileW(from.c_str(), to.c_str());
+            else if (n.rfind(L"base_", 0) == 0 && !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                DeleteFileW(from.c_str());  // the release's copy is newer
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+        RemoveDirectoryW((top + L"shadercache").c_str());  // only once empty
+    }
 }
 
 std::string Narrow(const std::wstring& w) {
@@ -119,7 +224,7 @@ void SetValue(const std::string& key, const std::string& v) {
     g_lines.push_back(key + " = " + v);
 }
 
-std::string TomlPath() { return Narrow(ExeDir()) + "hpcos.toml"; }
+std::string TomlPath() { return Narrow(BinDir()) + "hpcos.toml"; }
 
 Settings Load() {
     Settings s;
@@ -138,6 +243,7 @@ Settings Load() {
     s.aniso = u(Value("anisotropic_filtering"), 0);
     s.smaa = Value("smaa") == "true";
     s.vsync = Value("vsync") != "false";
+    s.fsr = Value("fsr_frame_generation") == "true";
     s.show = Value("show_launcher") != "false";
     s.fps = u(Value("fps_limit"), 0) == 30 ? 1 : 0;
     std::string cb = Value("colorblind");
@@ -153,10 +259,24 @@ Settings Load() {
     std::string lang = Value("language");
     for (int i = 0; i < 6; i++)
         if (lang == kLanguageKeys[i]) s.language = i;
+    s.speakers = u(Value("speakers"), 2) == 6 ? 1 : 0;
+    for (int i = 0; i < kOptCount; i++) {
+        const Opt& o = kOpts[i];
+        if (!o.key) continue;
+        std::string v = Value(o.key);
+        if (o.type == kCheck || o.type == kCheckNot) s.opt[i] = v.empty() ? o.def : v == "true";
+        else s.opt[i] = v.empty() ? o.def : std::clamp(int(std::strtol(v.c_str(), nullptr, 10)), o.lo, o.hi);
+    }
     return s;
 }
 
 void Save(const Settings& s) {
+    for (int i = 0; i < kOptCount; i++) {
+        const Opt& o = kOpts[i];
+        if (!o.key) continue;
+        if (o.type == kCheck || o.type == kCheckNot) SetValue(o.key, s.opt[i] ? "true" : "false");
+        else SetValue(o.key, std::to_string(s.opt[i]));
+    }
     auto q = [](const char* v) { return std::string("'") + v + "'"; };
     SetValue("display_mode", q(kDisplayKeys[s.display]));
     SetValue("width", std::to_string(s.width));
@@ -167,6 +287,7 @@ void Save(const Settings& s) {
     SetValue("smaa", s.smaa ? "true" : "false");
     SetValue("anisotropic_filtering", std::to_string(s.aniso));
     SetValue("vsync", s.vsync ? "true" : "false");
+    SetValue("fsr_frame_generation", s.fsr ? "true" : "false");
     SetValue("show_launcher", s.show ? "true" : "false");
     SetValue("start_menu", "false");  // this page instead of the in-game one
     SetValue("fps_limit", "0");  // the 30 fps cap was removed: the game's own rate only
@@ -179,6 +300,7 @@ void Save(const Settings& s) {
     SetValue("invert_camera_x", s.invert_x ? "true" : "false");
     SetValue("invert_camera_y", s.invert_y ? "true" : "false");
     SetValue("language", q(kLanguageKeys[s.language]));
+    SetValue("speakers", s.speakers ? "6" : "2");
     std::ofstream f(TomlPath(), std::ios::trunc);
     for (const auto& l : g_lines) f << l << "\n";
 }
@@ -189,28 +311,87 @@ bool Shaped(uint32_t w, uint32_t h, bool wide) {
     return r > want - 0.02f && r < want + 0.02f;
 }
 
+// the monitor's biggest size. EnumDisplaySettings lists the real modes; GetSystemMetrics is scaled by Windows' DPI
+// setting for a program that is not DPI-aware (a 4K screen at 150% reads 2560 x 1440 there), so it only stands in
+std::pair<uint32_t, uint32_t> ScreenMax() {
+    static const std::pair<uint32_t, uint32_t> max = [] {
+        uint32_t w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+        DEVMODEA dm{};
+        dm.dmSize = sizeof(dm);
+        auto take = [&] {
+            if (uint64_t(dm.dmPelsWidth) * dm.dmPelsHeight > uint64_t(w) * h) {
+                w = dm.dmPelsWidth;
+                h = dm.dmPelsHeight;
+            }
+        };
+        for (DWORD i = 0; EnumDisplaySettingsA(nullptr, i, &dm); i++) take();
+        if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm)) take();
+        return std::pair<uint32_t, uint32_t>{w, h};
+    }();
+    return max;
+}
+
+// internal resolution: the lines the 3D is drawn at, 0 follows the window. Steps of the Xbox's 480 up to the screen's
+// height, and that height itself; a saved value off the list (set in the toml) stays on it
+struct InternalChoice {
+    uint32_t lines;
+    std::string name;
+};
+
+std::vector<InternalChoice> InternalChoices(uint32_t screen_h, uint32_t cur) {
+    static const uint32_t kSteps[] = {480, 720, 960, 1080, 1440, 1920, 2160, 2880, 3240, 3840, 4320};
+    std::vector<uint32_t> v;
+    for (uint32_t l : kSteps)
+        if (l <= screen_h) v.push_back(l);
+    if (screen_h >= 480) v.push_back(screen_h);
+    if (cur) v.push_back(cur);
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    std::vector<InternalChoice> out{{0, "Follow window"}};
+    for (uint32_t l : v) {
+        uint32_t x = (l * 100 + 240) / 480;  // the scale over the Xbox's lines, in hundredths
+        std::string scale = std::to_string(x / 100);
+        if (x % 100) scale += "." + std::to_string(x % 100 / 10) + (x % 10 ? std::to_string(x % 10) : "");
+        std::string name = std::to_string(l) + " (" + (l == 480 ? "Xbox, " : "") + scale + "x";
+        if (l == screen_h) name += ", screen";
+        out.push_back({l, name + ")"});
+    }
+    return out;
+}
+
+// the biggest size of a shape inside w x h, even on both sides (a 3440 x 1440 screen holds 2560 x 1440 at 16:9)
+std::pair<uint32_t, uint32_t> FitShape(uint32_t w, uint32_t h, bool wide) {
+    uint32_t rw = wide ? 16 : 4, rh = wide ? 9 : 3, k = std::min(w / rw, h / rh) & ~1u;
+    return {k * rw, k * rh};
+}
+
+// up to the screen's biggest mode: its own modes of the shape, the biggest of the shape it holds, the common ones it
+// holds; the screen's own size on top when it has another shape (16:10, ultrawide), the picture keeping its shape in it
 std::vector<std::pair<uint32_t, uint32_t>> Sizes(bool wide) {
     static const std::pair<uint32_t, uint32_t> kCommon[] = {
         {640, 480},   {800, 600},   {1024, 768},  {1280, 960},  {1440, 1080}, {1600, 1200}, {1920, 1440},
         {2048, 1536}, {2880, 2160}, {1280, 720},  {1600, 900},  {1920, 1080}, {2560, 1440}, {3200, 1800},
-        {3840, 2160}};
-    uint32_t dw = GetSystemMetrics(SM_CXSCREEN), dh = GetSystemMetrics(SM_CYSCREEN);
+        {3840, 2160}, {5120, 2880}, {7680, 4320}, {3840, 2880}, {5760, 4320}};
+    auto [sw, sh] = ScreenMax();
     std::vector<std::pair<uint32_t, uint32_t>> m;
     DEVMODEA dm{};
     dm.dmSize = sizeof(dm);
     for (DWORD i = 0; EnumDisplaySettingsA(nullptr, i, &dm); i++)
         if (dm.dmPelsWidth >= 640 && Shaped(dm.dmPelsWidth, dm.dmPelsHeight, wide))
             m.emplace_back(dm.dmPelsWidth, dm.dmPelsHeight);
+    auto fit = FitShape(sw, sh, wide);
+    if (fit.first >= 640) m.push_back(fit);
     for (auto [w, h] : kCommon)
-        if (Shaped(w, h, wide) && w <= dw && h <= dh) m.emplace_back(w, h);
+        if (Shaped(w, h, wide) && w <= sw && h <= sh) m.emplace_back(w, h);
     std::sort(m.begin(), m.end(), [](auto a, auto b) { return a.first * a.second > b.first * b.second; });
     m.erase(std::unique(m.begin(), m.end()), m.end());
+    if (!Shaped(sw, sh, wide)) m.insert(m.begin(), {sw, sh});
     return m;
 }
 
-// the size kept when it has the shape, otherwise the biggest that has
+// the size kept when it has the shape or is the screen's own, otherwise the biggest that has
 void FitSize(Settings& s) {
-    if (s.width && s.height && Shaped(s.width, s.height, s.wide)) return;
+    if (s.width && s.height && (Shaped(s.width, s.height, s.wide) || std::pair{s.width, s.height} == ScreenMax())) return;
     auto m = Sizes(s.wide);
     if (m.empty()) return;
     s.width = m.front().first;
@@ -266,7 +447,31 @@ std::string D3D12Note() {
 
 std::string FilesLogLine();
 
-// hpcos.exe beside this one, with run_win.sh's environment
+// ── the edition in game\ ────────────────────────────────────────────────────────────────────────────────────────────
+// Both editions run from this folder: game\default.xbe says which (gamefiles_DetectEdition), read at start, before
+// every check (after an unpack too) and before the game starts: bin\hpcos.exe loads hpcos_ntsc.dll for NTSC-US,
+// hpcos_pal.dll for PAL, by the same check; each edition has its own list of the disc's files. Before there is a default.xbe (an image still to unpack) it reads as NTSC-US.
+// The two discs carry the same six languages, so the Language list is the same for both.
+int g_edition = GAME_EDITION_NONE;
+
+void DetectEdition() {
+    g_edition = gamefiles_DetectEdition((ExeDir() + L"game").c_str());
+    gamefiles_SetEdition(g_edition);
+}
+bool Pal() { return g_edition == GAME_EDITION_PAL; }
+// hpcos.exe for both editions (src/stub/stub.c); another edition goes to the NTSC-US DLL, whose edition check names
+// what it found and what it needs
+const wchar_t* GameExe() { return L"hpcos.exe"; }
+const char* EditionLabel() {
+    switch (g_edition) {
+        case GAME_EDITION_NTSC: return "NTSC-US";
+        case GAME_EDITION_PAL: return "PAL (Europe)";
+        case GAME_EDITION_OTHER: return "not a supported edition";
+        default: return "no default.xbe";
+    }
+}
+
+// bin\\hpcos.exe with run_win.sh's environment, in this folder: the game finds game\\ and saves\\ from its working folder
 bool StartGame() {
     // one started from elsewhere while this page was open: the log below would be truncated under it
     if (hpcos_GameRunning()) {
@@ -280,9 +485,10 @@ bool StartGame() {
     };
     for (auto [k, v] : kEnv)
         if (!GetEnvironmentVariableW(k, nullptr, 0)) SetEnvironmentVariableW(k, v);
-    // hpcos.exe refuses to start without it (single_instance.h)
+    // the game refuses to start without it (single_instance.h)
     SetEnvironmentVariableW(HPCOS_LAUNCHER_ENV, L"1");
-    std::wstring dir = ExeDir(), exe = dir + L"hpcos.exe";
+    DetectEdition();
+    std::wstring dir = ExeDir(), exe = BinDir() + GameExe();
     std::wstring cmd = L"\"" + exe + L"\"";
     // the game's console output (its [CRASH] reports among it) to logs\runs\hpcos_run_<date_time>.log: a windowed
     // launcher has no console to hand down. One file per run, kept; the kernel's log beside it under the same time
@@ -292,11 +498,13 @@ bool StartGame() {
     wchar_t stamp[32];
     swprintf(stamp, 32, L"%04u%02u%02u_%02u%02u%02u", now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
              now.wSecond);
-    CreateDirectoryW((dir + L"logs").c_str(), nullptr);
-    CreateDirectoryW((dir + L"logs\\runs").c_str(), nullptr);
-    PruneLogs(dir + L"logs\\runs\\");
-    std::wstring run_log = L"logs\\runs\\hpcos_run_" + std::wstring(stamp) + L".log";
-    std::wstring kernel_log = L"logs\\runs\\xbox_kernel_" + std::wstring(stamp) + L".log";
+    // in bin\\logs\\runs, named from this folder (the game's working folder)
+    CreateDirectoryW(BinDir().c_str(), nullptr);
+    CreateDirectoryW((BinDir() + L"logs").c_str(), nullptr);
+    CreateDirectoryW((BinDir() + L"logs\\runs").c_str(), nullptr);
+    PruneLogs(BinDir() + L"logs\\runs\\");
+    std::wstring run_log = L"bin\\logs\\runs\\hpcos_run_" + std::wstring(stamp) + L".log";
+    std::wstring kernel_log = L"bin\\logs\\runs\\xbox_kernel_" + std::wstring(stamp) + L".log";
     SetEnvironmentVariableW(L"HPCOS_RUN_LOG", run_log.c_str());
     SetEnvironmentVariableW(L"XBOX_KERNEL_LOG", kernel_log.c_str());
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
@@ -397,7 +605,7 @@ struct Check {
 Check g_check;
 
 std::wstring GameDir() { return ExeDir() + L"game"; }
-std::wstring StampPath() { return ExeDir() + L"game_check.txt"; }
+std::wstring StampPath() { return BinDir() + L"game_check.txt"; }
 
 std::string Today() {
     SYSTEMTIME t;
@@ -448,6 +656,7 @@ DWORD WINAPI CheckThread(void*) {
 }
 
 bool StartCheck(bool contents) {
+    DetectEdition();  // a fresh unpack or a swapped folder: the list of the edition now there
     g_check.c = GameCheck{};
     g_check.contents = contents;
     g_check.finished = FALSE;
@@ -458,6 +667,34 @@ bool StartCheck(bool contents) {
 bool FilesWhole() {
     return g_check.c.missing + g_check.c.wrong_size + g_check.c.wrong_content == 0;
 }
+
+// xboxrecomp: the player knows about these files (2026-11-14): the problems found, as the check names them, kept in the
+// toml (files_problems_hidden) when they tick "I know about these files"; while the folder has exactly those, the report
+// stays folded and the page does not open for them. Anything new (another file, another fault) brings it back
+std::string ProblemSig() {
+    char buf[64];
+    snprintf(buf, sizeof buf, "%08lX:%d:%d:%d", (unsigned long)gamefiles_ListId(), g_check.c.missing,
+             g_check.c.wrong_size, g_check.c.wrong_content);
+    std::string sig = buf;
+    for (int k = 0; k < g_check.c.listed; k++)
+        sig += "," + std::to_string(g_check.c.index[k]) + "/" + std::to_string(g_check.c.kind[k]);
+    return sig;
+}
+
+bool ProblemsHidden() {
+    if (FilesWhole() || !g_check.finished) return false;
+    const std::string v = Value("files_problems_hidden");
+    return !v.empty() && v == ProblemSig();
+}
+
+// at once, not only with Play: a player who ticks it and quits finds it so next time
+void HideProblems(bool hide) {
+    SetValue("files_problems_hidden", hide ? "'" + ProblemSig() + "'" : std::string("''"));
+    std::ofstream f(TomlPath(), std::ios::trunc);
+    for (const auto& l : g_lines) f << l << "\n";
+}
+
+bool FilesOk() { return FilesWhole() || ProblemsHidden(); }
 
 // after a check: a full one recorded; a size check gets the damage the last full one found added, the stamp kept
 void FinishCheck(const Stamp* st = nullptr) {
@@ -479,13 +716,14 @@ const char* KindName(int kind) {
 // the run log's first line
 std::string FilesLogLine() {
     char head[200];
-    if (!g_check.ran) return "[FILES] game folder not checked\r\n";
+    std::string ed = std::string("[FILES] edition: ") + EditionLabel() + "\r\n";
+    if (!g_check.ran) return ed + "[FILES] game folder not checked\r\n";
     if (!g_check.finished) {
-        return "[FILES] game folder check stopped: " + Narrow(g_check.c.error) + "\r\n";
+        return ed + "[FILES] game folder check stopped: " + Narrow(g_check.c.error) + "\r\n";
     }
     std::snprintf(head, sizeof head, "[FILES] game folder: %d files listed, contents checked %s%s: ", gamefiles_Count(),
                   g_check.date.empty() ? "never" : g_check.date.c_str(), g_check.contents ? "" : ", sizes now");
-    std::string line = head;
+    std::string line = ed + head;
     if (FilesWhole()) return line + "all match the disc\r\n";
     std::snprintf(head, sizeof head, "%d missing, %d wrong size, %d damaged:", g_check.c.missing, g_check.c.wrong_size,
                   g_check.c.wrong_content);
@@ -529,7 +767,7 @@ enum class FilesAction { None, Verify, Repair };
 // the page's game files part: a line when all is well, the files named and what to do when not
 FilesAction DrawFiles(float sc) {
     FilesAction act = FilesAction::None;
-    if (g_check.ran && g_check.finished && !FilesWhole()) {
+    if (g_check.ran && g_check.finished && !FilesWhole() && !ProblemsHidden()) {
         int bad = g_check.c.missing + g_check.c.wrong_size + g_check.c.wrong_content;
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.45f, 0.4f, 1));
         if (g_check.c.missing == gamefiles_Count())
@@ -554,6 +792,14 @@ FilesAction DrawFiles(float sc) {
                                    "'game' folder and the launcher writes them again from it.");
             }
         }
+    }
+    if (g_check.ran && g_check.finished && !FilesWhole()) {
+        bool hidden = ProblemsHidden();
+        if (hidden) {
+            int bad = g_check.c.missing + g_check.c.wrong_size + g_check.c.wrong_content;
+            ImGui::TextDisabled("%d known file problem%s hidden (untick to see them).", bad, bad == 1 ? "" : "s");
+        }
+        if (ImGui::Checkbox("I know about these files: don't show this again", &hidden)) HideProblems(hidden);
     }
     if (ImGui::Button("Verify game files", ImVec2(200 * sc, 0))) act = FilesAction::Verify;
     ImGui::SameLine();
@@ -674,75 +920,152 @@ bool DrawPage(Settings& s, std::string& error, FilesAction& files) {
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
 
-    // the shape, two big choices
+    // xboxrecomp: the settings in tabs, as F10's (2026-11-14): Game first (its language, the enhancements, the game
+    // files), every setting the game has; the tabs' contents in a fixed height so the page keeps its place
     float bw = (pw - ImGui::GetStyle().WindowPadding.x * 2 - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-    for (int i = 0; i < 2; i++) {
-        bool on = s.wide == (i == 1);
-        if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.55f, 0.15f, 1.0f));
-        if (ImGui::Button(i ? "16:9  widescreen" : "4:3  original", ImVec2(bw, 44 * sc))) {
-            s.wide = i == 1;
-            FitSize(s);
+    // the tabs fill what is left between the title (DrawBackground's two lines) and the page's foot, whose height is
+    // taken from the frame before (the Play row, notes and messages under the tabs)
+    static float foot = 260.0f * sc;
+    const float big = std::min(io.DisplaySize.y * 0.15f, io.DisplaySize.x * 0.13f);
+    const float title_end = io.DisplaySize.y * 0.05f + big * 0.9f + big * 0.62f * 0.9f + 16.0f * sc;
+    const float tab_h = std::max(160.0f * sc, io.DisplaySize.y * 0.97f - title_end - foot);
+    // a tab's own rows from kOpts
+    auto opts = [&](const char* tab) {
+        for (int i = 0; i < kOptCount; i++) {
+            const Opt& o = kOpts[i];
+            if (std::strcmp(o.tab, tab)) continue;
+            switch (o.type) {
+                case kHeader:
+                    ImGui::Spacing();
+                    ImGui::SeparatorText(o.label);
+                    break;
+                case kCheck: {
+                    bool v = s.opt[i] != 0;
+                    if (ImGui::Checkbox(o.label, &v)) s.opt[i] = v;
+                    break;
+                }
+                case kCheckNot: {
+                    bool v = s.opt[i] == 0;
+                    if (ImGui::Checkbox(o.label, &v)) s.opt[i] = !v;
+                    break;
+                }
+                case kSlider:
+                    ImGui::SliderInt(o.label, &s.opt[i], o.lo, o.hi, o.fmt);
+                    break;
+                case kChoice:
+                    ImGui::Combo(o.label, &s.opt[i], o.names, o.hi - o.lo + 1);
+                    break;
+            }
+            if (o.note) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+                ImGui::TextWrapped("%s", o.note);
+                ImGui::PopStyleColor();
+            }
         }
-        if (on) ImGui::PopStyleColor();
-        if (!i) ImGui::SameLine();
-    }
-    ImGui::Spacing();
+    };
     ImGui::PushItemWidth(pw * 0.5f);
-
-    ImGui::Combo("Display mode", &s.display, kDisplayNames, 3);
-    {
-        auto sizes = Sizes(s.wide);
-        std::string cur = std::to_string(s.width) + " x " + std::to_string(s.height);
-        if (ImGui::BeginCombo(s.display == 0 ? "Window size" : "Resolution", cur.c_str())) {
-            for (auto [w, h] : sizes) {
-                std::string name = std::to_string(w) + " x " + std::to_string(h);
-                if (ImGui::Selectable(name.c_str(), w == s.width && h == s.height)) {
-                    s.width = w;
-                    s.height = h;
+    if (ImGui::BeginTabBar("##tabs")) {
+        auto tab = [&](const char* name) {
+            if (!ImGui::BeginTabItem(name)) return false;
+            ImGui::BeginChild("##tab", ImVec2(0, tab_h), false);
+            return true;
+        };
+        auto end_tab = [] {
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        };
+        if (tab("Game")) {
+            ImGui::TextDisabled("Game disc: %s", EditionLabel());
+            ImGui::Combo("Language", &s.language, kLanguageNames, 6);
+            opts("Game");
+            ImGui::Spacing();
+            ImGui::SeparatorText("Game files");
+            files = DrawFiles(sc);
+            end_tab();
+        }
+        if (tab("Display")) {
+            static const char* const kAspectNames[] = {"4:3 (original)", "16:9 (widescreen)"};
+            int aspect = s.wide ? 1 : 0;
+            if (ImGui::Combo("Aspect ratio", &aspect, kAspectNames, 2) && (aspect == 1) != s.wide) {
+                s.wide = aspect == 1;
+                FitSize(s);
+            }
+            ImGui::Combo("Display mode", &s.display, kDisplayNames, 3);
+            {
+                auto sizes = Sizes(s.wide);
+                std::string cur = std::to_string(s.width) + " x " + std::to_string(s.height);
+                if (ImGui::BeginCombo(s.display == 0 ? "Window size" : "Resolution", cur.c_str())) {
+                    for (auto [w, h] : sizes) {
+                        std::string name = std::to_string(w) + " x " + std::to_string(h);
+                        if (std::pair{w, h} == ScreenMax()) name += "  (screen)";
+                        if (ImGui::Selectable(name.c_str(), w == s.width && h == s.height)) {
+                            s.width = w;
+                            s.height = h;
+                        }
+                    }
+                    ImGui::EndCombo();
                 }
             }
-            ImGui::EndCombo();
+            ImGui::Checkbox("Vsync", &s.vsync);
+            ImGui::Checkbox("FSR 3.1 frame generation", &s.fsr);
+            if (s.fsr) ImGui::TextDisabled("A generated frame between each two of the game's (about 120 shown from its 60).");
+            opts("Display");
+            end_tab();
         }
+        if (tab("Graphics")) {
+            auto choices = InternalChoices(ScreenMax().second, s.internal_height);
+            const InternalChoice* cur = &choices.front();
+            for (const auto& c : choices)
+                if (c.lines == s.internal_height) cur = &c;
+            if (ImGui::BeginCombo("Internal resolution", cur->name.c_str())) {
+                for (const auto& c : choices)
+                    if (ImGui::Selectable(c.name.c_str(), &c == cur)) s.internal_height = c.lines;
+                ImGui::EndCombo();
+            }
+            int ms = IndexOf(kMsaaValues, s.msaa);
+            if (ImGui::Combo("MSAA", &ms, kMsaaNames, int(std::size(kMsaaNames)))) s.msaa = kMsaaValues[ms];
+            ImGui::Checkbox("SMAA", &s.smaa);
+            int an = IndexOf(kAnisoValues, s.aniso);
+            if (ImGui::Combo("Anisotropic filtering", &an, kAnisoNames, int(std::size(kAnisoNames)))) s.aniso = kAnisoValues[an];
+            opts("Graphics");
+            end_tab();
+        }
+        if (tab("Post-processing")) {
+            opts("Post-processing");
+            end_tab();
+        }
+        if (tab("Audio")) {
+            ImGui::Combo("Speakers", &s.speakers, kSpeakerNames, 2);
+            if (s.speakers) ImGui::TextDisabled("5.1 needs Windows' speaker setup set to 5.1 (or a 5.1 HDMI receiver).");
+            end_tab();
+        }
+        if (tab("Controls")) {
+            ImGui::Checkbox("Keyboard and mouse", &s.kbm);
+            int sens = int(s.mouse_sens);
+            if (ImGui::SliderInt("Mouse sensitivity", &sens, 1, 100)) s.mouse_sens = uint32_t(sens);
+            ImGui::Checkbox("Use controller", &s.controller);
+            ImGui::Checkbox("Invert camera X", &s.invert_x);
+            ImGui::SameLine(0, 30 * sc);
+            ImGui::Checkbox("Invert camera Y", &s.invert_y);
+            ImGui::Checkbox("Vibration", &s.vibration);
+            opts("Controls");
+            end_tab();
+        }
+        if (tab("Accessibility")) {
+            ImGui::Combo("Colour-blind filter", &s.colorblind, kColorBlindNames, 4);
+            if (s.colorblind) {
+                int st = int(s.cb_strength);
+                if (ImGui::SliderInt("Filter strength %", &st, 0, 100)) s.cb_strength = uint32_t(st);
+            }
+            end_tab();
+        }
+        ImGui::EndTabBar();
     }
-    int ir = IndexOf(kInternalValues, s.internal_height);
-    if (ImGui::Combo("Internal resolution", &ir, kInternalNames, int(std::size(kInternalNames))))
-        s.internal_height = kInternalValues[ir];
-    int ms = IndexOf(kMsaaValues, s.msaa);
-    if (ImGui::Combo("MSAA", &ms, kMsaaNames, int(std::size(kMsaaNames)))) s.msaa = kMsaaValues[ms];
-    int an = IndexOf(kAnisoValues, s.aniso);
-    if (ImGui::Combo("Anisotropic filtering", &an, kAnisoNames, int(std::size(kAnisoNames)))) s.aniso = kAnisoValues[an];
-    ImGui::Checkbox("SMAA", &s.smaa);
-    ImGui::SameLine(0, 30 * sc);
-    ImGui::Checkbox("Vsync", &s.vsync);
-    ImGui::Combo("Language", &s.language, kLanguageNames, 6);
-    ImGui::Combo("Colour-blind filter", &s.colorblind, kColorBlindNames, 4);
-    if (s.colorblind) {
-        int st = int(s.cb_strength);
-        if (ImGui::SliderInt("Filter strength %", &st, 0, 100)) s.cb_strength = uint32_t(st);
-    }
-    ImGui::Checkbox("Keyboard and mouse", &s.kbm);
-    if (s.kbm) {
-        ImGui::SameLine(0, 30 * sc);
-        ImGui::SetNextItemWidth(pw * 0.3f);
-        int ms = int(s.mouse_sens);
-        if (ImGui::SliderInt("Mouse sensitivity", &ms, 1, 100)) s.mouse_sens = uint32_t(ms);
-    }
-    ImGui::Checkbox("Use controller", &s.controller);
-    ImGui::SameLine(0, 30 * sc);
-    ImGui::Checkbox("Vibration", &s.vibration);
-    ImGui::SameLine(0, 30 * sc);
-    ImGui::Checkbox("Invert camera X", &s.invert_x);
-    ImGui::SameLine(0, 30 * sc);
-    ImGui::Checkbox("Invert camera Y", &s.invert_y);
-    ImGui::TextDisabled("Key bindings, button remapping and stick settings: F10 > Controls in the game.");
     ImGui::PopItemWidth();
-
-    ImGui::Spacing();
-    files = DrawFiles(sc);
     ImGui::Spacing();
     bool skip = !s.show;
     if (ImGui::Checkbox("Don't show this at the next startup", &skip)) s.show = !skip;
-    if (skip) ImGui::TextDisabled("Play starts the game directly. Hold Shift while starting, or use F10 in the game, to bring this back.");
+    if (skip) ImGui::TextDisabled("Play starts the game directly. Hold Shift while starting to bring this back.");
     ImGui::Spacing();
     bool play = false;
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.15f, 1.0f));
@@ -759,7 +1082,11 @@ bool DrawPage(Settings& s, std::string& error, FilesAction& files) {
         ImGui::TextWrapped("%s", d3d12_note.c_str());
         ImGui::PopStyleColor();
     }
-    ImGui::TextDisabled("Saved to hpcos.toml. F10 in the game changes the picture settings too.");
+    {   // this frame's own layout (where the last item ends, less the tabs' area): the window's height is a frame
+        // late (it sizes to its contents), and following it made the page bounce
+        const float f = ImGui::GetCursorPosY() + ImGui::GetStyle().WindowPadding.y - tab_h;
+        if (std::fabs(f - foot) > 1.0f) foot = f;
+    }
     ImGui::End();
 
     if (play) Save(s);
@@ -775,12 +1102,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
         return 0;
     }
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    MoveIntoBin();
     // xboxrecomp: a disc image to unpack first shows its progress page even with the settings page turned off
     bool unpacking = StartUnpack();
     // xboxrecomp: then the game files: read through when never checked whole under this list (a page with its
     // progress), otherwise their sizes only, here (a few ms)
     bool checking = false;
     if (!unpacking) {
+        DetectEdition();  // the list the stamp and the check below are made under
         Stamp st = ReadStamp();
         if (!st.valid) {
             checking = StartCheck(true);  // a fresh start: every byte, once
@@ -793,7 +1122,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     }
     // the page was turned off: straight to the game with the saved settings, unless Shift is held or a file is wrong
     bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-    if (!unpacking && !checking && FilesWhole() && !Load().show && !shift && StartGame()) {
+    if (!unpacking && !checking && !Load().show && FilesOk() && !shift && StartGame()) {
         CoUninitialize();
         return 0;
     }
@@ -871,14 +1200,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
                 checking = false;
                 FinishCheck();
                 // the page was turned off: on to the game as before, when every file is whole
-                if (g_check.finished && FilesWhole() && !s.show && !shift && StartGame()) started = true;
+                if (g_check.finished && FilesOk() && !s.show && !shift && StartGame()) started = true;
             }
         } else if (FilesAction files = FilesAction::None; DrawPage(s, error, files)) {
             WCHAR image[MAX_PATH];
             if (xiso_Find((ExeDir() + L"game").c_str(), image))  // stopped part-way: not playable yet
                 error = "The game files are not unpacked yet. Open the launcher again to carry on.";
             else if (StartGame()) started = true;
-            else error = "hpcos.exe could not be started (it must sit beside the launcher).";
+            else error = Narrow(GameExe()) + " could not be started (it must be in the bin folder beside the launcher).";
         } else if (files == FilesAction::Verify) {
             error.clear();
             checking = StartCheck(true);

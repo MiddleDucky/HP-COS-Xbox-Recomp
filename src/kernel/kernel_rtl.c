@@ -136,9 +136,21 @@ BOOLEAN __stdcall xbox_RtlEqualString(
         return FALSE;
 
     if (CaseInSensitive)
-        return _strnicmp(String1->Buffer, String2->Buffer, String1->Length) == 0;
+        {
+            /* By RtlUpperChar's table, as the console: Latin-1, not the PC's locale. */
+            USHORT i;
+            for (i = 0; i < String1->Length; i++) {
+                unsigned char a = (unsigned char)String1->Buffer[i], b = (unsigned char)String2->Buffer[i];
+                if (a != b) {
+                    int ua = a >= 'a' && a <= 'z' ? a - 0x20 : a >= 0xE0 && a <= 0xFE && a != 0xF7 ? a - 0x20 : a == 0xFF ? '?' : a;
+                    int ub = b >= 'a' && b <= 'z' ? b - 0x20 : b >= 0xE0 && b <= 0xFE && b != 0xF7 ? b - 0x20 : b == 0xFF ? '?' : b;
+                    if (ua != ub) return FALSE;
+                }
+            }
+            return TRUE;
+        }
     else
-        return strncmp(String1->Buffer, String2->Buffer, String1->Length) == 0;
+        return memcmp(String1->Buffer, String2->Buffer, String1->Length) == 0;
 }
 
 /*
@@ -560,6 +572,17 @@ void xbox_DumpHeldLocks(FILE* f)
     fprintf(f, "locks: enters=%ld leaves=%ld\n", g_cs_enters, g_cs_leaves);
 }
 
+/* Through the same host lock as Enter and Leave, so the three exclude each other */
+BOOLEAN xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    if (!cs || !TryEnterCriticalSection(cs))
+        return FALSE;
+    InterlockedIncrement(&g_cs_enters);
+    xbox_cs_note_owner(cs);
+    return TRUE;
+}
+
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     /* Creating the shadow here is not required -- Enter does it -- but doing
@@ -571,35 +594,25 @@ VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalS
  * NTSTATUS → Win32 Error Code Mapping
  * ============================================================================ */
 
+#include "kernel_ntstatus_dos.h"
+
+/* As the console: customer codes and FACILITY_WIN32 carry the error themselves,
+ * class D codes count as class C, facility 1 carries it in the low word. */
 ULONG __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status)
 {
-    switch (Status) {
-        case STATUS_SUCCESS:                    return ERROR_SUCCESS;
-        case STATUS_INVALID_PARAMETER:          return ERROR_INVALID_PARAMETER;
-        case STATUS_NO_MEMORY:                  return ERROR_NOT_ENOUGH_MEMORY;
-        case STATUS_INSUFFICIENT_RESOURCES:     return ERROR_NO_SYSTEM_RESOURCES;
-        case STATUS_ACCESS_DENIED:              return ERROR_ACCESS_DENIED;
-        case STATUS_OBJECT_NAME_NOT_FOUND:      return ERROR_FILE_NOT_FOUND;
-        case STATUS_OBJECT_PATH_NOT_FOUND:      return ERROR_PATH_NOT_FOUND;
-        case STATUS_OBJECT_NAME_COLLISION:      return ERROR_ALREADY_EXISTS;
-        case STATUS_NO_SUCH_FILE:               return ERROR_FILE_NOT_FOUND;
-        case STATUS_END_OF_FILE:                return ERROR_HANDLE_EOF;
-        case STATUS_INVALID_HANDLE:             return ERROR_INVALID_HANDLE;
-        case STATUS_NOT_IMPLEMENTED:            return ERROR_CALL_NOT_IMPLEMENTED;
-        case STATUS_UNSUCCESSFUL:               return ERROR_GEN_FAILURE;
-        case STATUS_PENDING:                    return ERROR_IO_PENDING;
-        case STATUS_BUFFER_OVERFLOW:            return ERROR_MORE_DATA;
-        case STATUS_NO_MORE_FILES:              return ERROR_NO_MORE_FILES;
-        case STATUS_NOT_SUPPORTED:              return ERROR_NOT_SUPPORTED;
-        case STATUS_CANCELLED:                  return ERROR_CANCELLED;
-        case STATUS_ALREADY_COMMITTED:          return ERROR_COMMITMENT_LIMIT;
-        case STATUS_CONFLICTING_ADDRESSES:      return ERROR_INVALID_ADDRESS;
-        default:
-            /* Fall back to RtlNtStatusToDosError from ntdll if available */
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_RTL,
-                "RtlNtStatusToDosError: unmapped status 0x%08X", Status);
-            return ERROR_MR_MID_NOT_FOUND;
+    uint32_t s = (uint32_t)Status;
+    int lo = 0, hi = (int)(sizeof s_ntstatus_dos / sizeof s_ntstatus_dos[0]) - 1;
+
+    if (s & 0x20000000u) return s;
+    if ((s & 0xFFFF0000u) == 0x00070000u) return s & 0xFFFFu;
+    if ((s & 0xF0000000u) == 0xD0000000u) s &= 0xCFFFFFFFu;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (s_ntstatus_dos[mid].status == s) return s_ntstatus_dos[mid].dos;
+        if (s_ntstatus_dos[mid].status < s) lo = mid + 1; else hi = mid - 1;
     }
+    if ((s & 0xFFFF0000u) == 0xC0010000u) return s & 0xFFFFu;
+    return 317;   /* ERROR_MR_MID_NOT_FOUND */
 }
 
 /* ============================================================================

@@ -49,7 +49,8 @@ static inline int hpcos_StartedByLauncher(void)
     return GetEnvironmentVariableW(HPCOS_LAUNCHER_ENV, NULL, 0) != 0;
 }
 
-/* hpcos.exe started on its own: says to use the launcher and offers to open it (beside this exe) */
+/* hpcos.exe started on its own: says to use the launcher and offers to open it (in the folder above bin\, where
+ * this exe is; beside it in a folder from before bin\) */
 static inline void hpcos_OfferLauncher(void)
 {
     int r = MessageBoxW(NULL, L"Please start the game with hpcos_launcher.exe.\n\nOpen the launcher now?", HPCOS_TITLE,
@@ -62,6 +63,15 @@ static inline void hpcos_OfferLauncher(void)
     slash[1] = 0;
     lstrcpyW(exe, dir);
     lstrcatW(exe, L"hpcos_launcher.exe");
+    if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES && slash > dir) {
+        wchar_t *up = slash - 1;  /* the folder above */
+        while (up > dir && *up != L'\\') up--;
+        if (*up == L'\\') {
+            up[1] = 0;
+            lstrcpyW(exe, dir);
+            lstrcatW(exe, L"hpcos_launcher.exe");
+        }
+    }
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof si);
@@ -70,7 +80,7 @@ static inline void hpcos_OfferLauncher(void)
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     } else {
-        MessageBoxW(NULL, L"hpcos_launcher.exe was not found beside hpcos.exe.", HPCOS_TITLE,
+        MessageBoxW(NULL, L"hpcos_launcher.exe was not found.", HPCOS_TITLE,
                     MB_OK | MB_ICONWARNING | MB_TOPMOST);
     }
 }

@@ -1,9 +1,10 @@
 // gamefiles.c - checking the game folder against the known-good list of the disc's files (gamefiles.h)
 //
-// The list (game_files.inc) was made from a folder that plays the whole game; this edition's files are the same bytes
-// in every copy, so anything else is damage (a bad copy, a disc read error, a failed download) or a file someone
-// changed. A sizes-only pass costs one directory lookup a file and runs on every start; reading every byte (2.6 GB)
-// runs once, after unpacking, and when asked.
+// Two lists, one per edition the port runs (game_files_ntsc.inc, game_files_pal.inc, made by tools/make_game_files.py
+// from folders that play the whole game); the folder's default.xbe says which one applies (gamefiles_DetectEdition).
+// An edition's files are the same bytes in every copy, so anything else is damage (a bad copy, a disc read error, a
+// failed download) or a file someone changed. A sizes-only pass costs one directory lookup a file and runs on every
+// start; reading every byte (2.6 GB) runs once, after unpacking, and when asked.
 #include "gamefiles.h"
 
 #include <stdint.h>
@@ -17,10 +18,52 @@ typedef struct {
     uint32_t size, crc;
 } GameFile;
 
-static const GameFile kFiles[] = {
-#include "game_files.inc"
+static const GameFile kFilesNtsc[] = {
+#include "game_files_ntsc.inc"
 };
-#define FILE_COUNT ((int)(sizeof kFiles / sizeof kFiles[0]))
+static const GameFile kFilesPal[] = {
+#include "game_files_pal.inc"
+};
+
+static int g_edition = GAME_EDITION_NTSC;
+static const GameFile* kFiles = kFilesNtsc;
+static int g_count = (int)(sizeof kFilesNtsc / sizeof kFilesNtsc[0]);
+#define FILE_COUNT g_count
+
+int gamefiles_DetectEdition(const WCHAR* dir) {
+    WCHAR path[MAX_PATH];
+    swprintf_s(path, MAX_PATH, L"%ls\\default.xbe", dir);
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return GAME_EDITION_NONE;
+    static uint8_t x[0x10000];  // the image header, certificate and section headers sit in the first pages
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, x, sizeof x, &got, NULL);
+    CloseHandle(h);
+#define XBE32(o) (*(const uint32_t*)(x + (o)))
+    if (!ok || got < 0x180 || XBE32(0) != 0x48454258u) return GAME_EDITION_OTHER;  // "XBEH"
+    uint32_t base = XBE32(0x104), cert = XBE32(0x118) - base, sh = XBE32(0x120) - base;
+    if (cert + 12 > got || sh + 12 > got) return GAME_EDITION_OTHER;
+    uint32_t tid = XBE32(cert + 8), sections = XBE32(0x11C), text_va = XBE32(sh + 4), text_size = XBE32(sh + 8);
+#undef XBE32
+    // the two share title ID, file size and section count; PAL's code is 0x260 bytes longer (main.c's edition check)
+    if (tid != 0x4541000Eu || sections != 13 || text_va != 0x11000u) return GAME_EDITION_OTHER;
+    if (text_size == 1177120u) return GAME_EDITION_NTSC;
+    if (text_size == 1177728u) return GAME_EDITION_PAL;
+    return GAME_EDITION_OTHER;
+}
+
+void gamefiles_SetEdition(int edition) {
+    g_edition = edition == GAME_EDITION_PAL ? GAME_EDITION_PAL : GAME_EDITION_NTSC;
+    if (g_edition == GAME_EDITION_PAL) {
+        kFiles = kFilesPal;
+        g_count = (int)(sizeof kFilesPal / sizeof kFilesPal[0]);
+    } else {
+        kFiles = kFilesNtsc;
+        g_count = (int)(sizeof kFilesNtsc / sizeof kFilesNtsc[0]);
+    }
+}
+
+int gamefiles_Edition(void) { return g_edition; }
 #define READ_BUF   (4u << 20)
 
 // CRC-32 as zlib computes it (reflected, polynomial 0xEDB88320), eight bytes a step

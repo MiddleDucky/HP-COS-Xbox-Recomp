@@ -78,6 +78,32 @@ static int decode_modrm_len(const uint8_t *ip, int has_rex_b)
  * Instruction decoder for APU MMIO access
  * ============================================================ */
 
+/* The compare and logic instructions a compiler folds a register read into. op is the x86 group number:
+ * 0 add, 1 or, 4 and, 5 sub, 6 xor, 7 cmp. Sets CF, ZF, SF and OF; PF and AF are left alone, as in the forms below. */
+static uint64_t apu_alu(PCONTEXT ctx, int op, uint64_t a, uint64_t b, int size)
+{
+    uint64_t mask = size >= 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
+    uint64_t sign = 1ULL << (size * 8 - 1);
+    uint64_t r = 0;
+    int cf = 0, of = 0;
+
+    a &= mask;
+    b &= mask;
+    switch (op) {
+    case 0: r = (a + b) & mask; cf = r < a; of = !!(~(a ^ b) & (a ^ r) & sign); break;
+    case 1: r = a | b; break;
+    case 4: r = a & b; break;
+    case 6: r = a ^ b; break;
+    default: r = (a - b) & mask; cf = a < b; of = !!((a ^ b) & (a ^ r) & sign); break;   /* 5 sub, 7 cmp */
+    }
+    ctx->EFlags &= ~(0x0001u | 0x0040u | 0x0080u | 0x0800u);
+    if (cf) ctx->EFlags |= 0x0001u;
+    if (r == 0) ctx->EFlags |= 0x0040u;
+    if (r & sign) ctx->EFlags |= 0x0080u;
+    if (of) ctx->EFlags |= 0x0800u;
+    return r;
+}
+
 static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
@@ -209,6 +235,60 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         if (result == 0) ctx->EFlags |= 0x0040;
         if (mem_val < reg_val) ctx->EFlags |= 0x0001;
         if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080;
+        ctx->Rip += prefix_len + 1 + modrm_len;
+        g_apu_mmio_read_count++;
+        return true;
+    }
+
+    /* TEST r/m, imm (F6 /0, F7 /0) */
+    if ((opcode[0] == 0xF6 || opcode[0] == 0xF7) && ((opcode[1] >> 3) & 7) == 0) {
+        if (opcode[0] == 0xF6) access_size = 1;
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        const uint8_t *immp = opcode + 1 + modrm_len;
+        int imm_len = access_size == 1 ? 1 : access_size == 2 ? 2 : 4;
+        uint64_t imm = imm_len == 1 ? *immp : imm_len == 2 ? *(const uint16_t *)immp
+                     : (uint64_t)(int64_t)*(const int32_t *)immp;
+        apu_alu(ctx, 4, mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size), imm, access_size);
+        ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
+        g_apu_mmio_read_count++;
+        return true;
+    }
+
+    /* ADD/OR/AND/SUB/XOR/CMP r/m, imm (80, 81, 83) */
+    if ((opcode[0] == 0x80 || opcode[0] == 0x81 || opcode[0] == 0x83)) {
+        int op = (opcode[1] >> 3) & 7;
+        if (op != 2 && op != 3) {   /* adc, sbb: not worth modelling until something uses them */
+            if (opcode[0] == 0x80) access_size = 1;
+            int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+            const uint8_t *immp = opcode + 1 + modrm_len;
+            int imm_len = opcode[0] != 0x81 ? 1 : access_size == 2 ? 2 : 4;
+            uint64_t imm = imm_len == 1 ? (uint64_t)(int64_t)*(const int8_t *)immp
+                         : imm_len == 2 ? (uint64_t)(int64_t)*(const int16_t *)immp
+                         : (uint64_t)(int64_t)*(const int32_t *)immp;
+            uint64_t r = apu_alu(ctx, op, mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size), imm, access_size);
+            if (op != 7) {
+                mcpx_apu_mmio_write(g_apu_state, mmio_offset, r, access_size);
+                g_apu_mmio_write_count++;
+            }
+            ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
+            g_apu_mmio_read_count++;
+            return true;
+        }
+    }
+
+    /* ADD/OR/AND/SUB/XOR/CMP r, r/m (02/03, 0A/0B, 22/23, 2A/2B, 32/33, 3A/3B) */
+    if ((opcode[0] & 0xC6) == 0x02 && ((opcode[0] >> 3) & 7) != 2 && ((opcode[0] >> 3) & 7) != 3) {
+        int op = (opcode[0] >> 3) & 7;
+        if (!(opcode[0] & 1)) access_size = 1;
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
+        uint64_t *dst = ctx_reg64(ctx, reg);
+        uint64_t r = apu_alu(ctx, op, *dst, mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size), access_size);
+        if (op != 7) {
+            if (access_size == 1) *dst = (*dst & ~0xFFULL) | r;
+            else if (access_size == 2) *dst = (*dst & ~0xFFFFULL) | r;
+            else *dst = r;   /* 32-bit results zero-extend */
+        }
         ctx->Rip += prefix_len + 1 + modrm_len;
         g_apu_mmio_read_count++;
         return true;

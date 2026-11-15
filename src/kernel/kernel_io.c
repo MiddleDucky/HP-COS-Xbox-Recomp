@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdlib.h>   /* realloc returns a pointer: an implicit int would cut it to 32 bits */
 #include <string.h>
 
 /* ============================================================================
@@ -324,7 +325,6 @@ NTSTATUS __stdcall xbox_IoInvalidDeviceRequest(PVOID DeviceObject, PVOID Irp)
  * creating a duplicate must collide, and deleting an unknown link must fail.
  * ============================================================================ */
 
-#define XBOX_MAX_SYMLINKS 32
 
 typedef struct _XBOX_SYMLINK {
     char link[64];
@@ -332,7 +332,9 @@ typedef struct _XBOX_SYMLINK {
     BOOL used;
 } XBOX_SYMLINK;
 
-static XBOX_SYMLINK g_symlinks[XBOX_MAX_SYMLINKS];
+/* Entries stay put, as lookups hand out their target strings. No limit on the console. */
+static XBOX_SYMLINK **g_symlinks;
+static int g_symlink_count;
 
 /* Copy a counted, non-NUL-terminated ANSI_STRING into a C buffer. */
 static void xbox_copy_ansi(char* dst, size_t dst_size, PXBOX_ANSI_STRING src)
@@ -355,9 +357,9 @@ static void xbox_copy_ansi(char* dst, size_t dst_size, PXBOX_ANSI_STRING src)
 static XBOX_SYMLINK* xbox_find_symlink(const char* name)
 {
     int i;
-    for (i = 0; i < XBOX_MAX_SYMLINKS; i++) {
-        if (g_symlinks[i].used && strcmp(g_symlinks[i].link, name) == 0)
-            return &g_symlinks[i];
+    for (i = 0; i < g_symlink_count; i++) {
+        if (g_symlinks[i]->used && strcmp(g_symlinks[i]->link, name) == 0)
+            return g_symlinks[i];
     }
     return NULL;
 }
@@ -370,6 +372,13 @@ const char* xbox_LookupSymbolicLink(const char* link)
         return NULL;
     entry = xbox_find_symlink(link);
     return entry ? entry->target : NULL;
+}
+
+/* The device a link names, for NtQuerySymbolicLinkObject; NULL if no such link was created */
+const char *xbox_SymlinkTarget(const char *link)
+{
+    XBOX_SYMLINK *e = xbox_find_symlink(link);
+    return e ? e->target : NULL;
 }
 
 NTSTATUS __stdcall xbox_IoCreateSymbolicLink(
@@ -394,21 +403,31 @@ NTSTATUS __stdcall xbox_IoCreateSymbolicLink(
         return STATUS_OBJECT_NAME_COLLISION;
     }
 
-    for (i = 0; i < XBOX_MAX_SYMLINKS; i++) {
-        if (!g_symlinks[i].used) {
-            g_symlinks[i].used = TRUE;
-            strcpy(g_symlinks[i].link, link);
-            strcpy(g_symlinks[i].target, target);
+    for (i = 0; i < g_symlink_count; i++) {
+        if (!g_symlinks[i]->used) {
+            g_symlinks[i]->used = TRUE;
+            strcpy(g_symlinks[i]->link, link);
+            strcpy(g_symlinks[i]->target, target);
             xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_IO,
                 "IoCreateSymbolicLink: '%s' -> '%s'", link, target);
             return STATUS_SUCCESS;
         }
     }
 
-    xbox_log(XBOX_LOG_ERROR, XBOX_LOG_IO,
-        "IoCreateSymbolicLink: table full (%d), dropping '%s'",
-        XBOX_MAX_SYMLINKS, link);
-    return STATUS_INSUFFICIENT_RESOURCES;
+    {
+        XBOX_SYMLINK **grown = (XBOX_SYMLINK **)realloc(g_symlinks, (g_symlink_count + 1) * sizeof *grown);
+        XBOX_SYMLINK *e = (XBOX_SYMLINK *)calloc(1, sizeof *e);
+        if (grown) g_symlinks = grown;
+        if (!grown || !e) {
+            free(e);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        e->used = TRUE;
+        strcpy(e->link, link);
+        strcpy(e->target, target);
+        g_symlinks[g_symlink_count++] = e;
+        return STATUS_SUCCESS;
+    }
 }
 
 NTSTATUS __stdcall xbox_IoDeleteSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName)

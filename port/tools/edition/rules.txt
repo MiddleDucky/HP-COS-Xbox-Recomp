@@ -1,0 +1,66 @@
+# ntsc2pal.py rules: the NTSC -> PAL literals the map cannot decide (ntsc2pal.py translate --rules).
+# The build runs the translation with --strict: a literal it can't place stops the build until it is added here.
+#
+#   keep 0xV         left as it is in the PAL copy (not an address, or the same in both editions)
+#   map  0xNTSC 0xPAL
+#
+# Found 2026-11-14: functions by their bytes near their neighbours' shift (masked, side by side in the disassembly),
+# look-alikes by the string each one pushes (+0x250, the data shift there).
+
+# .text's start and the lowest return address (a call at its first byte): the same VA in both
+keep 0x11000
+keep 0x11005
+# sizes, flags and masks that fall in the image's range: not addresses
+keep 0x20000       # hle_debug.c: a physics body's hit bit
+keep 0x40000       # hle_frontend.c pad bits, hle_d3d8.cpp resource type (texture)
+keep 0x50000       # hle_d3d8.cpp resource type (surface), hle_trainer.c dump size
+keep 0x60000       # hle_trainer.c dump size
+keep 0x70000       # hle_d3d8.cpp resource type mask
+keep 0x80000       # hle_d3d8.cpp reference count step
+keep 0xD0001       # hle_d3d8.cpp surface header
+keep 0x100000      # pad bits, a descriptor's no-collision bit
+keep 0x200000      # pad bits; hle_debug.c a loose "inside the image" bound for a name pointer
+keep 0x400000      # pad bits, table sizes, a loose upper bound
+keep 0x180000      # hle_debug.c: a loose upper bound for code-looking stack values
+keep 0x134000      # hle_d3d8.cpp kDestroyResource: a D3D section function, the same in both (D3D's code is identical)
+# hle_trainer.c's memory-diff ranges (0x1D0000..0x220000, 0x500000..0x560000): broad windows, not exact addresses
+keep 0x1D0000
+keep 0x220000
+keep 0x500000
+# offsets inside panel.geo (a game file), not guest addresses
+keep 0x6CAC4
+keep 0x49080
+# recomp_manual.c's commented-out example
+keep 0x12345
+
+# the rain function (hle_rain.c, sub_000387F0..0x38931): at the same address in PAL
+keep 0x38931
+
+# address ranges named by their bounds: the PAL bounds sit in the same functions (+0x260 there)
+map 0xFF000 0xFF260      # the front end's code from (hle_hud.c); 0xFF000 is also a plain constant, so the exact table keeps it
+map 0x102000 0x102260    # ... to
+map 0x10C000 0x10C260    # the XDK libraries' start (hle_shots.c, hle_trainer.c)
+
+# functions the masked byte match leaves unpaired (their code differs a little between the editions)
+map 0xB4CE0 0xB4E80      # three look-alikes (icall seeds), told apart by their strings
+map 0xB5800 0xB59B0
+map 0xB5D30 0xB5F00
+map 0xDDC20 0xDDDE0      # icall seed
+map 0xFAD60 0xFAFC0      # icall seed
+map 0x5C000 0x5BF90      # icall seed (round number)
+map 0xCFA60 0xCFC40      # hle_video.c comment
+map 0x52D60 0x52D50      # hle_debug.c comment
+map 0x87D71 0x87D61      # hle_debug.c comment: the jingle's return address in sub_00087CE0 (PAL 0x87CD0)
+map 0xEBA50 0xEBCB0      # hle_trainer.c comment
+map 0xE64E0 0xE6710      # the warp table walker (hle_trainer.c, patch_gen.py)
+map 0xE65F0 0xE6820      # its lesson callback, compared as a value in hle_trainer.c
+map 0xC0001 0xC0211      # patch_gen.py's null check (same bytes, +0x210)
+map 0xC000E 0xC021E
+
+# hle_dsound.c default_headroom(): a DSBCAPS flag mask (flags & 0x382010), not an address
+keep 0x382010
+
+# patch_gen.py's grounds warp (sub_000E6860's exit after the warp): PAL adds `or byte [0x5305E0], 0x40` after the warp
+# call (0xE6C3E, 7 bytes), so the exit is +0x267, not the function's +0x260. A warp turned off skips the flag too,
+# as it skips the warp
+map 0xE69DE 0xE6C45

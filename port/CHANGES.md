@@ -1,5 +1,38 @@
 # Changes
 
+## v0.4.0 (2026-11-15), compared with v0.3.2
+
+### The PAL disc
+- **The European (PAL) Chamber of Secrets plays** as well as the North American one. The launcher tells the two discs apart, checks the game folder against the right one's files, and starts the matching game. Its Game page says which disc it found, and F10's title names the one being played.
+
+### A tidier folder
+- **Everything the port needs is now in `bin\`** beside the launcher: the game (`hpcos.exe`, which loads `hpcos_ntsc.dll` or `hpcos_pal.dll` for your disc), AMD's frame generation DLLs, your settings (`bin\hpcos.toml`), the shader cache and the logs. Only the launcher, `game\`, `saves\` and the licences stay at the top.
+- **Updating:** copy the new files over the old ones. The first time the new launcher starts it moves your old `hpcos.toml`, `shadercache\` and game file check into `bin\`, so your settings and prepared shaders are kept and the game files aren't read through again. Your saves stay where they are. The old `hpcos.exe` beside the launcher is no longer used and can be deleted.
+
+### Launcher
+- **All the settings in tabs:** the launcher's page has the F10 settings (Game, Display, Graphics, Controls, ...), not only the aspect ratio and display.
+- **Speakers:** Stereo, or 5.1 surround with the console's own speaker mix (also F10 > Audio).
+- **The resolution lists reach your screen's biggest mode** (launcher and F10).
+
+### In the game's own menus
+- **"PC Settings"** is the first row of the title screen's Options and of the pause menu: it opens the port's settings (Display, Graphics, Post-processing, Audio, Controls, Accessibility, Enhancements) drawn in the game's own menu style. Key bindings, button remapping and Debug stay in F10.
+- **Key prompts in brackets:** with keyboard and mouse, a button in the game's text is now your bound key in brackets, several side by side ("Equip to [E]/[Q]/[Right Click]"), and a tutorial already on screen switches when you change device. The HUD's button picture shows key caps, or the mouse with its button lit.
+- **The menus' A / B legend** shows your keys too while key prompts are on.
+
+### New options
+- **Skip the Warner Bros. and EA logos** (F10 > Enhancements > Startup, and the launcher; off by default).
+- **Cutscenes without black bars** (F10 > Enhancements; off by default): in 16:9 the cutscenes fill the screen.
+- **Disable fog** (F10 > Enhancements; off by default): far scenery in full colour, no distance haze.
+- **Keep loading screens 4:3** (F10 > Enhancements; off by default, issue #24): in 16:9 the loading picture stays in the middle with black sides, as the movies.
+- **FSR 3.1 frame generation** (F10 > Graphics > Display; off by default): AMD's frame generation puts a generated frame between each two of the game's. Applies at the next start.
+- **Show the launcher at startup** is now also at the top of F10 > Graphics, not only in F10's bottom bar.
+
+### Fixes
+- **The Warner Bros. logo movie no longer breaks up** (issue #10): a setting meant only for the emulated sound chip zeroed four bytes of the movie's data at a time, which smeared the picture until the next whole frame.
+- **No more music cue on every ghost hit** in the level with the ghosts: each hit started a short cue over the level's music; the level's own music now plays on.
+- **Movies use far less CPU:** the movie player waited for the next frame by spinning on the game's core; it now sleeps until the frame is due, with the same frame rate.
+- **More of the Xbox kernel works as on the console** (memory, files, threads and timers), so the game finds things as the original hardware gives them.
+
 ## v0.3.2 (2026-11-05), hotfix
 
 ### Fixes

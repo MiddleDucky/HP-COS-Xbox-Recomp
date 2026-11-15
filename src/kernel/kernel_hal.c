@@ -209,8 +209,32 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  *
  * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
  * DPC, the device level for an ISR -- and code checks: see irql_publish. */
+/* KeSynchronizeExecution's guarantee: a routine it runs and an interrupt routine
+ * never overlap. On the console the raised IRQL gives that; here interrupts come
+ * from other host threads, so a lock does. Taken for the length of every ISR. */
+static CRITICAL_SECTION s_isr_cs;
+static INIT_ONCE s_isr_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK isr_cs_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&s_isr_cs);
+    return TRUE;
+}
+
+void xbox_IsrLock(void)
+{
+    InitOnceExecuteOnce(&s_isr_once, isr_cs_init, NULL, NULL);
+    EnterCriticalSection(&s_isr_cs);
+}
+
+void xbox_IsrUnlock(void)
+{
+    LeaveCriticalSection(&s_isr_cs);
+}
+
 int xbox_IrqlEnterInterrupt(int level)
 {
+    xbox_IsrLock();
     int saved = (int)g_current_irql;
     if (g_current_irql != (KIRQL)level) {
         irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
@@ -227,6 +251,7 @@ void xbox_IrqlLeaveInterrupt(int saved)
         g_current_irql = (KIRQL)saved;
         irql_publish();
     }
+    xbox_IsrUnlock();
 }
 
 /*
@@ -288,6 +313,11 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 /*
  * KeRaiseIrqlToDpcLevel - Convenience function to raise to DISPATCH_LEVEL.
  */
+KIRQL xbox_CurrentIrql(void)
+{
+    return g_current_irql;
+}
+
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
@@ -399,6 +429,10 @@ static BOOL CALLBACK anchor_system_time(PINIT_ONCE once, PVOID param, PVOID *ctx
     return TRUE;
 }
 
+/* What a title set with NtSetSystemTime, as a distance from the PC's clock. The console writes it to its clock chip and
+ * keeps it; here it lasts for this run, and the PC's clock is left alone. */
+static volatile LONGLONG s_time_bias_100ns;
+
 VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
 {
     /* Anchored once to the wall clock, advanced by the performance counter.
@@ -427,7 +461,7 @@ VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
     InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
     QueryPerformanceCounter(&now);
     delta = now.QuadPart - s_time_anchor_counts;
-    CurrentTime->QuadPart = s_time_anchor_100ns
+    CurrentTime->QuadPart = s_time_anchor_100ns + s_time_bias_100ns
         + (delta / s_time_freq_counts) * 10000000LL
         + (delta % s_time_freq_counts) * 10000000LL / s_time_freq_counts;
 }
@@ -617,10 +651,12 @@ VOID __stdcall xbox_HalDisableSystemInterrupt(ULONG BusInterruptLevel, KIRQL Irq
 
 ULONG __stdcall xbox_HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql)
 {
-    (void)BusInterruptLevel;
+    ULONG vector = BusInterruptLevel + 0x30;  /* as bridge_HalGetInterruptVector */
+    if (vector < 0x30 || vector > 0x4A)
+        return 0;
     if (Irql)
-        *Irql = PASSIVE_LEVEL;
-    return 0;
+        *Irql = (KIRQL)(0x4A - vector);
+    return vector;
 }
 
 /* ============================================================================
@@ -714,14 +750,29 @@ VOID __stdcall xbox_WRITE_PORT_BUFFER_USHORT(PUSHORT Port, PUSHORT Buffer, ULONG
 
 NTSTATUS __stdcall xbox_NtSetSystemTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGER PreviousTime)
 {
+    /* As the kernel: a time with its high part negative or over 0x20000000 is refused, the previous time returned */
+    LARGE_INTEGER was;
+    LONGLONG want;
+
+    if (!SystemTime)
+        return STATUS_INVALID_PARAMETER;
+    want = SystemTime->QuadPart;
+    if (want < 0 || (LONG)(want >> 32) > 0x20000000)
+        return STATUS_INVALID_PARAMETER;
+    xbox_KeQuerySystemTime(&was);
+    InterlockedExchangeAdd64(&s_time_bias_100ns, want - was.QuadPart);
     if (PreviousTime)
-        GetSystemTimeAsFileTime((LPFILETIME)PreviousTime);
-
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
-        "NtSetSystemTime: ignored (not setting system clock)");
-
+        PreviousTime->QuadPart = was.QuadPart;
+    {
+        extern void xbox_state_save(void);
+        xbox_state_save();   /* the console's clock keeps running across runs */
+    }
     return STATUS_SUCCESS;
 }
+
+/* The title's clock as an offset from the PC's, for xbox_state_save */
+LONGLONG xbox_time_bias(void) { return s_time_bias_100ns; }
+void xbox_time_bias_set(LONGLONG bias) { s_time_bias_100ns = bias; }
 
 /* ============================================================================
  * Display / AV
@@ -748,6 +799,8 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
         "AvSendTVEncoderOption: option=0x%02X param=0x%X", Option, Param);
 
+    if (Option == 12)   /* forget the current mode; takes no result */
+        g_av_display_mode = 0;
     if (!Result)
         return;
 
@@ -770,46 +823,21 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
                 | AV_REFRESH_60Hz;
         break;
 
-    case AV_OPTION_QUERY_MODE:
-        /* Return current display mode */
+    /* The rest as the kernel numbers them. These used to be numbers of our own: mode at 1, encoder at 8, capabilities at
+     * 9 and 14, none of which a console answers. It leaves Result alone for options that only set something. */
+    case 13:   /* the current mode */
         *Result = g_av_display_mode;
         break;
-
-    case AV_OPTION_QUERY_AV_CAPABILITIES:
-        /* Report support for 480i, 480p, 720p, and widescreen */
-        *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
-                | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
-                | AV_FLAGS_60Hz;
-        break;
-
-    case AV_OPTION_QUERY_ENCODER_TYPE:
-        /* Conexant CX25871 (common in retail Xboxes) */
-        *Result = 4;
-        break;
-
-    case AV_OPTION_QUERY_MODE_CAPS:
-        /* Same as capabilities for our purposes */
-        *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
-                | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
-                | AV_FLAGS_60Hz;
-        break;
-
-    case AV_OPTION_SET_MODE:
-        g_av_display_mode = Param;
+    case 16:   /* encoder: 0 Conexant, 1 Focus, 2 Xcalibur */
         *Result = 0;
         break;
-
-    case AV_OPTION_BLANK_SCREEN:
-    case AV_OPTION_MACROVISION_MODE:
-    case AV_OPTION_FLICKER_FILTER:
-    case AV_OPTION_ZERO_MODE:
+    case 4: case 5: case 15: case 17: case 21:   /* read from the encoder or kept by it: nothing here */
         *Result = 0;
         break;
-
-    default:
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
-            "AvSendTVEncoderOption: unknown option 0x%02X", Option);
-        *Result = 0;
+    case 20:
+        *Result = 0x03010000;
+        break;
+    default:   /* options that set something on the encoder */
         break;
     }
 }

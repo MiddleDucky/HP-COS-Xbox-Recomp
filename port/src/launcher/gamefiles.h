@@ -1,5 +1,5 @@
 // gamefiles.h - checking the game folder against the known-good list of the disc's files (gamefiles.c,
-// game_files.inc from tools/make_game_files.py), for hpcos_launcher.exe
+// game_files_ntsc.inc / game_files_pal.inc from tools/make_game_files.py), for hpcos_launcher.exe
 #pragma once
 #include <windows.h>
 
@@ -8,6 +8,16 @@ extern "C" {
 #endif
 
 enum { GAMEFILE_OK, GAMEFILE_MISSING, GAMEFILE_SIZE, GAMEFILE_CONTENT };
+
+// The editions the port runs: NTSC-US (hpcos_ntsc.dll) and PAL, Europe En/Fr/De/Es/It (hpcos_pal.dll). NONE: no
+// default.xbe; OTHER: one that is neither.
+enum { GAME_EDITION_NONE, GAME_EDITION_OTHER, GAME_EDITION_NTSC, GAME_EDITION_PAL };
+
+// dir\default.xbe's edition, from its header
+int gamefiles_DetectEdition(const WCHAR* dir);
+// the list the calls below use: PAL's, otherwise NTSC-US's (the default)
+void gamefiles_SetEdition(int edition);
+int gamefiles_Edition(void);  // GAME_EDITION_NTSC or GAME_EDITION_PAL
 
 #define GAMEFILES_LISTED 32  // the files named in a report; the counts cover all of them
 

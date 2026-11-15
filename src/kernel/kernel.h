@@ -512,6 +512,9 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
 
+/* Whether the kernel bridge, which the title's imports actually call, implements this ordinal. */
+int xbox_bridge_has_ordinal(ULONG ordinal);
+
 /**
  * Per-title kernel ordinal remap.
  *
@@ -650,6 +653,7 @@ NTSTATUS __stdcall xbox_NtQueryVirtualMemory(PVOID BaseAddress, PVOID MemoryInfo
  * File I/O (kernel_file.c)
  * ============================================================================ */
 
+NTSTATUS xbox_RenameFile(HANDLE FileHandle, const char* xbox_path, HANDLE Root, BOOLEAN Replace);
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -747,6 +751,7 @@ NTSTATUS __stdcall xbox_NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHan
  * ============================================================================ */
 
 NTSTATUS __stdcall xbox_NtCreateEvent(PHANDLE EventHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, ULONG EventType, BOOLEAN InitialState);
+NTSTATUS __stdcall xbox_NtSignalAndWaitForSingleObjectEx(HANDLE SignalHandle, HANDLE WaitHandle, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState);
 NTSTATUS __stdcall xbox_NtCreateSemaphore(PHANDLE SemaphoreHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, LONG InitialCount, LONG MaximumCount);
 NTSTATUS __stdcall xbox_NtReleaseSemaphore(HANDLE SemaphoreHandle, LONG ReleaseCount, PLONG PreviousCount);
@@ -977,16 +982,7 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define AV_REFRESH_50Hz         0x00800000
 
 /* ---- AV option codes for AvSendTVEncoderOption ---- */
-#define AV_OPTION_QUERY_MODE            0x01
-#define AV_OPTION_SET_MODE              0x02
 #define AV_OPTION_QUERY_AVPACK          0x06
-#define AV_OPTION_QUERY_ENCODER_TYPE    0x08
-#define AV_OPTION_QUERY_AV_CAPABILITIES 0x09
-#define AV_OPTION_BLANK_SCREEN          0x0A
-#define AV_OPTION_MACROVISION_MODE      0x0C
-#define AV_OPTION_FLICKER_FILTER        0x0B
-#define AV_OPTION_ZERO_MODE             0x0D
-#define AV_OPTION_QUERY_MODE_CAPS       0x0E
 
 /* ---- AV flags (for capabilities / display mode) ---- */
 #define AV_FLAGS_HDTV_480i      0x00000001
@@ -1031,10 +1027,10 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
  */
 #define XC_TIMEZONE_BIAS          0x00
 #define XC_TZ_STD_NAME            0x01
-#define XC_TZ_DLT_NAME            0x02
-#define XC_TZ_STD_DATE            0x03
-#define XC_TZ_DLT_DATE            0x04
-#define XC_TZ_STD_BIAS            0x05
+#define XC_TZ_DLT_NAME            0x04
+#define XC_TZ_STD_DATE            0x02
+#define XC_TZ_DLT_DATE            0x05
+#define XC_TZ_STD_BIAS            0x03
 #define XC_TZ_DLT_BIAS            0x06
 #define XC_LANGUAGE               0x07
 #define XC_VIDEO                  0x08

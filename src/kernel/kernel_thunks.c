@@ -332,9 +332,7 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case 164: return (ULONG_PTR)&xbox_LaunchDataPage;
 
     default:
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THUNK,
-            "Unresolved kernel ordinal %u", ordinal);
-        return 0;
+        return 0;   /* the caller reports it, if the bridge lacks it too */
     }
 }
 
@@ -395,6 +393,8 @@ void xbox_kernel_init(void)
 {
     ULONG resolved = 0;
     ULONG unresolved = 0;
+    ULONG bridge_only = 0;
+    ULONG total = 0;
     uint32_t thunk_base = 0;
     uint32_t thunk_count = 0;
 
@@ -435,7 +435,10 @@ void xbox_kernel_init(void)
     for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
         ULONG ordinal;
 
-        if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
+        if (thunk_base && xbox_GetMemoryBase()) {
+            if (i >= thunk_count) {
+                break;  /* past the title's imports: the rest are not imports */
+            }
             uint32_t entry = *(volatile uint32_t *)
                 ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
             if (entry == 0) {
@@ -454,13 +457,22 @@ void xbox_kernel_init(void)
         } else {
             /* Point unresolved thunks to our error handler */
             xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
-            unresolved++;
+            /* The bridge is what the title actually calls: an ordinal only it
+             * implements is not missing, this table just has no entry for it. */
+            if (xbox_bridge_has_ordinal(ordinal)) {
+                bridge_only++;
+            } else {
+                xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THUNK,
+                    "Unresolved kernel ordinal %u", ordinal);
+                unresolved++;
+            }
         }
+        total++;
     }
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
-        "Thunk table: %u/%u resolved, %u unresolved",
-        resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, unresolved);
+        "Thunk table: %u imports: %u resolved, %u through the bridge only, %u unresolved",
+        total, resolved, bridge_only, unresolved);
 
     if (unresolved > 0) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,

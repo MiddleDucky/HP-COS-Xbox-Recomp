@@ -197,7 +197,7 @@ ULONG __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress)
         /* Return the Xbox-equivalent protection */
         return mbi.Protect;
     }
-    return PAGE_NOACCESS;
+    return 0;   /* no page there, as the kernel */
 }
 
 VOID __stdcall xbox_MmSetAddressProtect(PVOID BaseAddress, ULONG NumberOfBytes, ULONG NewProtect)

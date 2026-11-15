@@ -647,6 +647,8 @@ extern "C" void xbox_kernel_frame_stats(double* file_ms, double* other_ms, uint3
                                         char* worst, size_t worst_len, double* top_other_ms, char* top_other,
                                         size_t top_len);  // xboxrecomp kernel_bridge.c
 
+static std::atomic<uint32_t> g_video_frames{0};  // movie frames since the last Swap (hle_d3d8_overlay_present)
+
 // xboxrecomp debug: [HITCH], one line for every frame over 25 ms (a dropped 60 Hz frame), saying where its time went:
 // the game thread in file calls (how many, the slowest and its file) and in other kernel calls (waits, sleeps; the one
 // that took most of it), its
@@ -668,6 +670,15 @@ static void HitchFrame(double frame_ms, double work_ms) {
     xbox_kernel_frame_stats(&file_ms, &other_ms, &file_calls, &worst_ms, worst, sizeof worst, &top_ms, top,
                             sizeof top);
     static uint32_t lines;
+    // A movie shows its frames through the overlay, with no Swap: the time since the last Swap is the movie's
+    // length, not a hitch. A gap between its frames shows as a [STALL].
+    uint32_t video = g_video_frames.exchange(0);
+    if (video) {
+        if (frame_ms > 25.0)
+            std::fprintf(stderr, "[VIDEO] %.1f ms, %u movie frames (%.1f fps) since the last Swap\n", frame_ms, video,
+                         video * 1000.0 / frame_ms);
+        return;
+    }
     if (frame_ms <= 25.0 || lines >= 3000) return;
     lines++;
     double game = frame_ms - file_ms - other_ms - r[0];
@@ -694,15 +705,31 @@ static std::atomic<uint32_t> g_swaps{0};
 // A movie frame went up (hle_video.c's UpdateOverlay). The NV2A scans the overlay out by itself, so a title playing
 // an XMV need not Swap; when it has not swapped lately, present the last frame for the overlay to be drawn over.
 extern "C" void hle_d3d8_overlay_present(void) {
+    g_video_frames++;
+    {   // [STALL] (main.c) watches for frames being shown: a movie frame counts
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        hpcos_last_swap_qpc = now.QuadPart;
+    }
     if (!On() || GetTickCount64() - g_last_swap_ms.load() < 50) return;
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (g_backend && g_buffers[1]) g_backend->Present(SurfaceOf(g_buffers[1]), false);
 }
 
+// xboxrecomp: hle_hud.c drew a loading screen kept 4:3: its sides go black when the frame is shown
+extern "C" void hpcos_BlackSides(void) { gpu::g_black_sides = true; }
+
+// xboxrecomp: the button prompts' text copies follow the device in use now (hle_frontend.c)
+extern "C" void hpcos_PromptRefresh(void);
+// xboxrecomp: the title's Options > PC Settings scroll arrows, drawn over the frame before it goes out (hle_frontend.c)
+extern "C" void hpcos_FrontendSwap(void);
+
 HLE(00134D70, 1) {
+    hpcos_FrontendSwap();
     g_last_swap_ms.store(GetTickCount64());
     hpcos_draw_seq = 0;
     g_swaps++;
+    hpcos_PromptRefresh();
     if (app::BootAspect() == app::AspectMode::Wide) {
         // xboxrecomp: 16:9. The inventory's camera (sub_00028380) projects 4 / 3 into the frame's aspect (0x50C2B8 /
         // 0x50C2BC) and the title places its labels, counters and map icons by that projection: such a screen is
