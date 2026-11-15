@@ -1,4 +1,4 @@
-# Harry Potter and the Chamber of Secrets (PAL/NTSC-U) — Xbox PC port
+# Harry Potter and the Chamber of Secrets (PAL/NTSC) — Xbox PC Recomp
 
 A native Windows port of the original Xbox game *Harry Potter and the Chamber of Secrets* (2002), made by
 **static recompilation**: the game's x86 code is translated to C and compiled for Windows, with the Xbox kernel,
