@@ -95,7 +95,7 @@ const Opt kOpts[] = {
     {"Display", "fps_counter", "FPS counter", kCheck, 0, 0, 0, nullptr, nullptr, nullptr},
     {"Graphics", "render_percent", "Render scale %", kSlider, 100, 25, 200, "%d %%", nullptr,
      "Render scale and its limit apply with Internal resolution set to follow the window."},
-    {"Graphics", "render_max_height", "Max render height", kSlider, 1080, 0, 4320, "%d lines", nullptr, nullptr},
+    {"Graphics", "render_height_limit", "Max render height", kSlider, 0, 0, 4320, "%d lines", nullptr, nullptr},
     {"Graphics", "brightness", "Brightness", kSlider, 50, 0, 100, "%d", nullptr, nullptr},
     {"Graphics", "contrast", "Contrast", kSlider, 50, 0, 100, "%d", nullptr, nullptr},
     {"Graphics", "draw_all_objects", "Draw everything in view (no doorway culling)", kCheck, 1, 0, 0, nullptr, nullptr,
@@ -950,7 +950,8 @@ bool DrawPage(Settings& s, std::string& error, FilesAction& files) {
                     break;
                 }
                 case kSlider:
-                    ImGui::SliderInt(o.label, &s.opt[i], o.lo, o.hi, o.fmt);
+                    ImGui::SliderInt(o.label, &s.opt[i], o.lo, o.hi,
+                                     !s.opt[i] && !std::strcmp(o.key, "render_height_limit") ? "No limit" : o.fmt);
                     break;
                 case kChoice:
                     ImGui::Combo(o.label, &s.opt[i], o.names, o.hi - o.lo + 1);
