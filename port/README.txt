@@ -44,7 +44,7 @@ INSTALLING
 
 The port creates these itself on the first run:
     saves\             your saved games (beside the launcher)
-    bin\hpcos.toml     your settings (the launcher and F10 change them)
+    bin\hpcos.toml     your settings (the launcher and PC Settings change them)
     bin\shadercache\   shaders and pipelines built on your PC
     bin\logs\runs\     a log of each start (the newest 10 are kept)
 
@@ -61,8 +61,8 @@ Start the game with hpcos_launcher.exe. Opening bin\hpcos.exe directly only
 offers to open the launcher. Only one copy of the game runs at a time: starting it
 again brings the running game to the front.
 
-The launcher's page has the same settings as F10 in tabs (Game, Display,
-Graphics, Controls, ...): the aspect ratio, display, graphics, controls,
+The launcher's page has all the settings in tabs (Game, Display, Graphics,
+Controls, ...): the aspect ratio, display, graphics, controls,
 the enhancements and the language, then Play starts the game. Language: the
 game starts in English (US or UK), French, German, Spanish or Italian, the
 languages the disc carries. If you turn its page off, the
@@ -70,7 +70,7 @@ launcher starts the game straight away; hold Shift while opening it to see
 the page again.
 
 Keys that always work
-  F10          Options (see below)
+  F10          key bindings, button remapping and Debug (see Settings)
   Alt+Enter    switch between windowed and borderless
   Alt+F4       quit the game
 
@@ -78,7 +78,7 @@ Controller
   An Xbox 360 / One / Series controller plays like the original Xbox pad.
   The original pad's White and Black buttons are LB and RB.
   To play with keyboard and mouse while a controller is connected, turn
-  off "Use controller" (launcher or F10 > Controls).
+  off "Use controller" (launcher, or PC Settings > Controls).
 
 Keyboard and mouse (defaults; change them under F10 > Controls)
   Move                  W A S D
@@ -93,149 +93,16 @@ Keyboard and mouse (defaults; change them under F10 > Controls)
   Start / Back          Escape / Tab
   Stick clicks          C (left), middle mouse button (right)
   Pace of the keys      mouse wheel: down Slow walk < Walk < Run up (Run is
-                        the default; also F10 > Controls > Movement keys)
+                        the default; also Controls > Movement keys)
 
 
-OPTIONS (F10)
--------------
+SETTINGS
+--------
 
-F10 opens the options over the game; most changes apply at once and are saved
-to bin\hpcos.toml. Its title names the disc being played (NTSC-US or PAL).
-"Defaults (this page)" resets the page you are on (Graphics, Controls, ...)
-and leaves the others; the aspect ratio stays. The game's own Options menu
-and pause menu also have a "PC Settings" row that opens these settings.
-
-Graphics
-  Startup
-    Show the launcher at startup
-                         its settings page before the game starts (also at
-                         the bottom of F10; or hold Shift as the launcher
-                         starts)
-  Display
-    Aspect ratio         4:3, 16:9 (the game's camera widened; menus and the
-                         inventory keep 4:3) or Stretch. Applies at the next
-                         start.
-    Display mode         Windowed, Borderless (covers the monitor) or
-                         Fullscreen (switches the monitor's resolution)
-    Window size /
-    Resolution           the window's size, or the fullscreen mode; Desktop
-                         uses the monitor's own
-    Vsync                waits for the monitor's refresh (no tearing)
-    FSR 3.1 frame generation
-                         AMD's frame generation: a generated frame between
-                         each two of the game's, for a smoother picture (off
-                         by default; applies at the next start)
-  Resolution
-    Internal resolution  the lines the 3D is drawn at: 480 is the Xbox's own;
-                         720 to 2160 sharpen it; "Follow window" matches the
-                         window
-    Render scale %       with "Follow window": the render size as a share of
-                         the window's
-    Max render height    with "Follow window": the most lines it follows the
-                         window to (1080 by default)
-  Anti-aliasing and filtering
-    MSAA                 smooths polygon edges: off, 2x, 4x, 8x
-    SMAA                 smooths edges over the finished picture; combines
-                         with MSAA
-    Anisotropic filtering  sharper textures at an angle: the game's own, 2x,
-                         4x, 8x or 16x
-  Picture
-    Brightness, Contrast 50 leaves the picture as the game draws it
-    FPS counter          shows the frame rate
-    Draw everything in view
-                         objects at the screen's edges and behind doorways
-                         stay drawn (the Xbox left some out); on by default
-  Post-processing
-    Bloom, Bloom strength  a glow around bright parts of the 3D scene (not
-                         the HUD)
-    Sharpening           contrast-adaptive sharpening, off by default
-    Saturation, Vibrance, Warmth
-                         colour grading; 100 %, off and "as the game" leave
-                         the colours alone
-    Vignette, Film grain darkened corners and film grain, off by default
-    Field of view (experimental)
-                         80 to 130 % of the game's; 100 is the game's own
-
-Audio
-  Speakers               Stereo, or 5.1 surround: the console's own speaker
-                         mix, each channel to its own speaker. Needs Windows'
-                         speaker setup set to 5.1 (or a 5.1 HDMI receiver).
-                         Applies at the next start.
-
-Controls
-  Keyboard and mouse
-    Keyboard and mouse play as controller 1 - alongside a controller
-    Mouse sensitivity, Invert mouse Y
-    Movement keys        the pace W A S D move Harry at: Slow walk, Walk or
-                         Run; the mouse wheel steps it in game
-    Button prompts       the game's on-screen hints name your keys:
-                         Follow the last input (keys after keyboard and
-                         mouse, buttons after the controller), Controller
-                         buttons or Keyboard keys. The button picture in the
-                         corner still shows the pad's buttons.
-    Key bindings         click a binding, then press a key or mouse button
-                         (Escape clears it); "Default keys" restores them
-  Controller
-    Use controller       off: the game ignores the controller (and it does
-                         not vibrate); keyboard and mouse still play
-    Left / right stick deadzone %      how far a stick moves before it counts
-    Left / right stick sensitivity %   the response past the deadzone
-    Invert camera X / Y
-    Vibration, Vibration strength %
-    Button remapping     which pad button each game button reads;
-                         "Default buttons" restores them
-
-Accessibility
-  Colour blindness
-    Correction filter    Off, Protanopia (red-weak), Deuteranopia
-                         (green-weak) or Tritanopia (blue-weak): shifts the
-                         colours you confuse toward ones you can tell apart
-    Strength %
-
-Enhancements
-  Hogwarts grounds
-    Explore Hogwarts Grounds (experimental)
-                         walk the whole grounds without the paths' fades to
-                         their other end; every area is shown and the
-                         destination names are hidden. The story's cutscenes
-                         and lessons still play; flying practice can only be
-                         repeated by turning this off. At night the flying
-                         practice arch takes Harry to the field and its exit
-                         brings him back, and the broom is unavailable.
-  Broom
-    Land the broom on any flat surface (experimental)
-                         land over a flat roof or a wall's top as in a
-                         landing zone (not on the lake)
-  Lighting
-    Per-pixel lighting   smooth light round Lumos and lamps instead of the
-                         console's per-vertex patches (on by default); off
-                         looks exactly as on the console
-  Cutscenes
-    Cutscenes without black bars
-                         in 16:9 the cutscenes fill the screen, without the
-                         bars at the top and bottom (off by default)
-  Fog
-    Disable fog          far scenery in full colour, no distance haze (off
-                         by default)
-  Loading screens
-    Keep loading screens 4:3
-                         in 16:9 the loading picture stays in the middle with
-                         black sides, as the movies (off: stretched to fill
-                         the screen)
-  Startup
-    Skip the Warner Bros. and EA logos
-                         the logo movies before the title screen are not
-                         played (off by default)
-
-Debug
-  Logs                   "Open logs folder" shows bin\logs\runs; "Mark this
-                         moment in the log" notes the time, so a problem can
-                         be found in the log: send the log and the mark's
-                         number with your report
-  Shaders                how many pipelines are recorded and prepared ahead
-  Renderer               "Capture the next frame" (F12) saves a picture of
-                         the frame and how it was drawn under captures\, for
-                         reporting a drawing problem
+Every setting is on the launcher's page, and in the game under "PC Settings",
+the first row of the title screen's Options and of the pause menu. Most changes
+apply at once. Key bindings, button remapping and the Debug page (the logs
+folder, "Mark this moment in the log") are under F10 in the game.
 
 
 TROUBLESHOOTING
